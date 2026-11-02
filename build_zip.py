@@ -98,7 +98,7 @@ def main() -> None:
         shutil.copytree(assets, os.path.join(stage, "assets"))
 
     # SECURITY.md / NOTICE (可选但推荐)
-    for name in ("SECURITY.md", "NOTICE", "CONTRIBUTING.md"):
+    for name in ("SECURITY.md", "NOTICE", "CONTRIBUTING.md", "CHANGELOG.md"):
         src = os.path.join(ROOT, name)
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(stage, name))
