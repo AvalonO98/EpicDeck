@@ -4,16 +4,21 @@ EpicDeck 是一个本地运行的 Steam Deck 插件,不包含任何后端服务�
 
 ## 认证凭据
 
-`py_modules/epic_oauth.py` 中包含两个常量:
+插件中唯一硬编码的 Epic 相关常量是**公共客户端 ID**:
 
-- `DEVICE_CLIENT_ID`
-- `DEVICE_CLIENT_SECRET`
+- `EPIC_CLIENT_ID = "34a02cf8f4414e29b15921876da36f9a"`(`main.py`)
 
-**这两个值是 Epic Games 的公共客户端凭据**,对应 Fortnite Nintendo Switch 游戏客户端(`fortniteNewSwitchGameClient`)。它们是:
+这是 Epic Games 启动器客户端的公开标识,Legendary / Heroic 等开源项目同样使用。它是:
 
-1. **公开的、非机密的** —— 这些值广泛存在于多个知名开源项目(EpicResearch、epicgames-freegames-node、Legendary、Heroic 等)中,是 Epic 官方客户端反编译得到的公共常量。
-2. **不授予任何用户账号的访问权限** —— 它们仅用于向 Epic 的 OAuth 服务标识「这是一个 Epic 官方游戏客户端」,以便使用 device_code 授权流程。
-3. **不含任何个人信息** —— 它们不是你的账号、密码、token 或密钥。
+1. **公开的、非机密的** —— 该值本就是客户端公开标识,不含任何密钥。
+2. **不授予任何用户账号的访问权限** —— 它只用于把用户引导到 Epic 官方的授权页面。
+3. **不含任何个人信息** —— 它不是你的账号、密码、token 或密钥。
+
+**授权码是用户自己输入的**:登录时用户从 Epic 页面复制一次性授权码,插件把它交给
+`legendary auth --code`。授权码一次性有效、很快过期,插件不会保存它。
+
+> 早期版本曾使用 `fortniteNewSwitchGameClient` 的 device code 流程,但 Epic 的授权码
+> 与 client 绑定,无法交由 Legendary 兑换,该方案已移除。
 
 ## 用户凭证的存储
 

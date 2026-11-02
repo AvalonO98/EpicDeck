@@ -2,6 +2,7 @@
 # Copyright (c) 2026, EpicDeck Contributors
 
 import os
+import re
 import sys
 import asyncio
 import shutil
@@ -19,17 +20,43 @@ if _PLUGIN_DIR and _PLUGIN_DIR not in sys.path:
 from py_modules.config import Config
 from py_modules.legendary import Legendary, LegendaryError, LegendaryNotFound
 from py_modules.steam import SteamShortcuts, SteamError, open_steam_protocol
-from py_modules.epic_oauth import (
-    DeviceCodeFlow,
-    EpicOAuthError,
-    run_device_code_poll,
-)
 from py_modules.legendary_installer import (
     InstallerError,
     default_install_dir,
     download_legendary,
     is_legendary_installed,
 )
+
+# Epic's launcher client. Legendary authenticates as this client, so the
+# authorization code we hand to `legendary auth --code` must be issued for it.
+EPIC_CLIENT_ID = "34a02cf8f4414e29b15921876da36f9a"
+EPIC_LOGIN_URL = (
+    "https://www.epicgames.com/id/api/redirect"
+    "?clientId=%s&responseType=code" % EPIC_CLIENT_ID
+)
+
+# A pasted blob may be the raw code, the redirect URL, or the whole JSON page.
+# `authorizationCode` wins over `code=` in the URL, and both must be tried before
+# any loose 32-hex match (the URL also contains the 32-hex client id).
+_JSON_CODE_RE = re.compile(r'"authorizationCode"\s*:\s*"([0-9a-fA-F]{32})"')
+_URL_CODE_RE = re.compile(r"[?&]code=([0-9a-fA-F]{32})")
+_RAW_CODE_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def extract_authorization_code(raw: str) -> str:
+    """Pull the 32-hex authorization code out of whatever the user pasted."""
+    if not raw:
+        return ""
+    text = raw.strip().strip('"').strip()
+    for pattern in (_JSON_CODE_RE, _URL_CODE_RE):
+        m = pattern.search(text)
+        if m:
+            return m.group(1)
+    if _RAW_CODE_RE.match(text):
+        return text
+    # Last resort: take the last 32-hex run (the client id appears earlier).
+    hits = re.findall(r"[0-9a-fA-F]{32}", text)
+    return hits[-1] if hits else ""
 
 
 class Plugin:
@@ -50,13 +77,8 @@ class Plugin:
         # app_name -> asyncio.Task for active installs.
         self._install_tasks = {}
 
-        # Device code login state.
-        self._device_flow = DeviceCodeFlow()
-        self._device_poll_task = None
-        self._device_code_info = None
-
     async def _unload(self):
-        for task in self._install_tasks.values():
+        for task in getattr(self, "_install_tasks", {}).values():
             if not task.done():
                 task.cancel()
         decky.logger.info("EpicDeck unloaded")
@@ -73,7 +95,10 @@ class Plugin:
             return {"logged_in": False, "account_id": "", "display_name": ""}
 
     async def login(self):
-        """Start interactive browser login (opens Epic authorization page)."""
+        """Start interactive browser login (opens Epic authorization page).
+
+        Only usable in desktop mode; game mode has no browser to hand off to.
+        """
         try:
             # Browser login requires Legendary; give a clear error otherwise.
             if self.legendary._resolve() is None:
@@ -81,87 +106,63 @@ class Plugin:
             await asyncio.wait_for(self.legendary.auth_login(), timeout=60.0)
             return {"ok": True}
         except asyncio.TimeoutError:
-            return {"ok": False, "error": "浏览器登录超时。游戏模式下建议改用「扫码/验证码登录」"}
+            return {"ok": False, "error": "浏览器登录超时。游戏模式下请改用「手机/电脑授权码登录」"}
         except LegendaryError as e:
             return {"ok": False, "error": str(e)}
 
-    # -- device code login ------------------------------------------------
-    async def device_code_start(self):
-        """Begin the device code flow. Returns user_code + URL to show in UI."""
-        if self._device_poll_task and not self._device_poll_task.done():
-            return {"ok": False, "error": "已有登录流程在进行中"}
+    # -- authorization-code login -----------------------------------------
+    async def get_login_url(self):
+        """The Epic page that yields an authorization code usable by Legendary."""
+        return {"ok": True, "url": EPIC_LOGIN_URL}
 
-        loop = asyncio.get_running_loop()
+    async def login_with_code(self, raw: str = ""):
+        """Finish login with an authorization code obtained from the Epic page.
+
+        Why not the device-code flow: Epic binds an authorization code to the
+        client that requested it, and Legendary redeems with its own launcher
+        client. A code minted by `fortniteNewSwitchGameClient` is therefore
+        always rejected (`authorization_code_not_for_your_client`).
+        """
+        if self.legendary._resolve() is None:
+            return {"ok": False, "error": "Legendary 未安装,请先点击「一键安装 Legendary」"}
+
+        code = extract_authorization_code(raw)
+        if not code:
+            return {
+                "ok": False,
+                "error": "没有识别到授权码。请粘贴 authorizationCode 的值,或直接粘贴整段 JSON/网址。",
+            }
+
         try:
-            info = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, self._device_flow.start_device_code
-                ),
-                timeout=45.0,
+            await asyncio.wait_for(
+                self.legendary.auth_with_code(code), timeout=120.0
             )
         except asyncio.TimeoutError:
-            return {"ok": False, "error": "连接 Epic 服务器超时,请检查网络后重试"}
-        except EpicOAuthError as e:
-            return {"ok": False, "error": str(e)}
-        except Exception as e:
-            decky.logger.error("device_code_start: %s", e)
-            return {"ok": False, "error": "发起登录失败: %s" % e}
+            return {"ok": False, "error": "登录超时,请检查网络后重试"}
+        except LegendaryError as e:
+            msg = str(e)
+            low = msg.lower()
+            if "not_found" in low:
+                return {
+                    "ok": False,
+                    "error": "授权码已失效。它有效期很短且只能用一次,请重新打开登录页并立即粘贴。",
+                }
+            if "not_for_your_client" in low:
+                return {
+                    "ok": False,
+                    "error": "授权码不属于 EpicDeck 的客户端。请用插件里给出的那个链接登录。",
+                }
+            decky.logger.error("login_with_code: %s", msg)
+            return {"ok": False, "error": msg}
 
-        self._device_code_info = info
-
-        def on_pending():
-            decky.emit("device_code_status", "pending", "")
-
-        def on_success(result):
-            # Exchange the access_token for an authorization code, then hand
-            # it to Legendary via `legendary auth --code`.
-            async def _finish():
-                access_token = result.get("access_token", "")
-                code = result.get("code", "")
-                try:
-                    if not code and access_token:
-                        code = await asyncio.get_running_loop().run_in_executor(
-                            None, self._device_flow.exchange_for_code, access_token
-                        )
-                    if not code:
-                        await decky.emit("device_code_status", "error", "未获取到授权码")
-                        return
-                    await self.legendary.auth_with_code(code)
-                    await decky.emit("device_code_status", "success",
-                                     result.get("display_name", ""))
-                except (LegendaryError, EpicOAuthError) as e:
-                    await decky.emit("device_code_status", "error", str(e))
-
-            asyncio.get_running_loop().create_task(_finish())
-
-        def on_error(exc):
-            decky.emit("device_code_status", "error", str(exc))
-
-        self._device_poll_task = asyncio.get_running_loop().create_task(
-            run_device_code_poll(
-                self._device_flow,
-                info["device_code"],
-                on_pending=on_pending,
-                on_success=on_success,
-                on_error=on_error,
-                poll_interval=max(3.0, float(info.get("interval", 5))),
-                max_wait=float(info.get("expires_in", 600)),
-            )
-        )
-
+        status = await self.legendary.auth_status()
+        if not status.get("logged_in"):
+            return {"ok": False, "error": "登录命令已执行但未确认成功,请导出日志排查。"}
         return {
             "ok": True,
-            "user_code": info["user_code"],
-            "verification_uri": info["verification_uri"],
-            "verification_uri_complete": info.get("verification_uri_complete", ""),
-            "expires_in": info.get("expires_in", 600),
+            "display_name": status.get("display_name", ""),
+            "account_id": status.get("account_id", ""),
         }
-
-    async def device_code_cancel(self):
-        if self._device_poll_task and not self._device_poll_task.done():
-            self._device_poll_task.cancel()
-        self._device_code_info = None
-        return {"ok": True}
 
     async def logout(self):
         try:

@@ -6,6 +6,7 @@ import {
   PanelSection,
   PanelSectionRow,
   ProgressBar,
+  TextField,
   ToggleField,
   Dropdown,
   staticClasses,
@@ -52,15 +53,13 @@ interface InstallProgress {
 const authStatus = callable<[], AuthStatus>("auth_status");
 const login = callable<[], { ok: boolean; error?: string }>("login");
 const logout = callable<[], { ok: boolean; error?: string }>("logout");
-const deviceCodeStart = callable<[], {
+const getLoginUrl = callable<[], { ok: boolean; url: string }>("get_login_url");
+const loginWithCode = callable<[raw: string], {
   ok: boolean;
-  user_code?: string;
-  verification_uri?: string;
-  verification_uri_complete?: string;
-  expires_in?: number;
+  display_name?: string;
+  account_id?: string;
   error?: string;
-}>("device_code_start");
-const deviceCodeCancel = callable<[], { ok: boolean }>("device_code_cancel");
+}>("login_with_code");
 const listGames = callable<[], { ok: boolean; games?: Game[]; error?: string }>("list_games");
 const installGame = callable<[app_name: string], { ok: boolean; error?: string }>("install");
 const launchGame = callable<[app_name: string], { ok: boolean; error?: string }>("launch");
@@ -84,36 +83,27 @@ function fmtSize(bytes: number): string {
   return mb.toFixed(0) + " MB";
 }
 
-interface DeviceCodeInfo {
-  user_code: string;
-  verification_uri: string;
-  verification_uri_complete: string;
-  expires_in: number;
-}
+// Epic's launcher client: the authorization code must be issued for the same
+// client Legendary redeems it with, otherwise Epic rejects it with
+// `authorization_code_not_for_your_client`.
+const EPIC_LOGIN_URL =
+  "https://www.epicgames.com/id/api/redirect?clientId=34a02cf8f4414e29b15921876da36f9a&responseType=code";
 
-function QrLogin({ deviceInfo, deviceState, deviceMsg }: {
-  deviceInfo: DeviceCodeInfo;
-  deviceState: string;
-  deviceMsg: string;
-}) {
-  const [qrDataUrl, setQrDataUrl] = useState<string>("");
+function QrImage({ url }: { url: string }) {
+  const [dataUrl, setDataUrl] = useState<string>("");
   const [qrError, setQrError] = useState<string>("");
 
   useEffect(() => {
     let cancelled = false;
-    const url = deviceInfo.verification_uri_complete || deviceInfo.verification_uri;
     QRCode.toDataURL(url, {
-      width: 200,
+      width: 190,
       margin: 1,
       errorCorrectionLevel: "M",
-      color: {
-        dark: "#000000",
-        light: "#ffffff",
-      },
+      color: { dark: "#000000", light: "#ffffff" },
     })
-      .then((dataUrl) => {
+      .then((d) => {
         if (!cancelled) {
-          setQrDataUrl(dataUrl);
+          setDataUrl(d);
           setQrError("");
         }
       })
@@ -123,147 +113,176 @@ function QrLogin({ deviceInfo, deviceState, deviceMsg }: {
     return () => {
       cancelled = true;
     };
-  }, [deviceInfo.verification_uri_complete, deviceInfo.verification_uri]);
+  }, [url]);
 
+  if (qrError) {
+    return <div style={{ padding: "12px", opacity: 0.7 }}>二维码生成失败:{qrError}</div>;
+  }
+  if (!dataUrl) {
+    return <div style={{ padding: "12px", opacity: 0.7 }}>生成二维码中…</div>;
+  }
   return (
-    <div style={{ padding: "12px 0", textAlign: "center" }}>
-      <div style={{ fontSize: "0.95em", marginBottom: "10px" }}>
-        用手机扫描下方二维码,或手动打开网址输入验证码
-      </div>
-
-      {qrError ? (
-        <div style={{ padding: "16px", opacity: 0.7 }}>
-          二维码生成失败:{qrError}
-        </div>
-      ) : qrDataUrl ? (
-        <img
-          src={qrDataUrl}
-          alt="登录二维码"
-          style={{
-            width: "200px",
-            height: "200px",
-            background: "#ffffff",
-            borderRadius: "8px",
-            margin: "0 auto",
-            display: "block",
-          }}
-        />
-      ) : (
-        <div style={{ padding: "16px", opacity: 0.7 }}>生成二维码中…</div>
-      )}
-
-      <div style={{ margin: "14px 0 4px", fontSize: "0.85em", opacity: 0.75 }}>
-        验证码:
-      </div>
-      <div style={{ fontSize: "2em", fontWeight: 700, letterSpacing: "6px" }}>
-        {deviceInfo.user_code}
-      </div>
-      <div style={{ fontSize: "0.8em", opacity: 0.6, marginTop: "4px" }}>
-        {deviceInfo.verification_uri}
-      </div>
-
-      <div style={{ fontSize: "0.85em", opacity: 0.8, marginTop: "12px" }}>
-        {deviceState === "pending"
-          ? "等待授权中…(手机端完成登录后自动跳转)"
-          : deviceState === "error"
-            ? "错误: " + deviceMsg
-            : deviceMsg}
-      </div>
-    </div>
+    <img
+      src={dataUrl}
+      alt="登录二维码"
+      style={{
+        width: "190px",
+        height: "190px",
+        background: "#ffffff",
+        borderRadius: "8px",
+        display: "block",
+        margin: "0 auto",
+      }}
+    />
   );
 }
 
 function LoginView({ onLogin, onLoggedIn }: { onLogin: () => void; onLoggedIn: () => void }) {
-  const [deviceInfo, setDeviceInfo] = useState<DeviceCodeInfo | null>(null);
-  const [deviceState, setDeviceState] = useState<string>("");
-  const [deviceMsg, setDeviceMsg] = useState<string>("");
-  const [starting, setStarting] = useState<boolean>(false);
+  const [showCode, setShowCode] = useState<boolean>(false);
+  const [loginUrl, setLoginUrl] = useState<string>(EPIC_LOGIN_URL);
+  const [code, setCode] = useState<string>("");
+  const [busy, setBusy] = useState<boolean>(false);
+  const [msg, setMsg] = useState<string>("");
+  const [browserBusy, setBrowserBusy] = useState<boolean>(false);
 
   useEffect(() => {
-    const listener = addEventListener<[string, string]>(
-      "device_code_status",
-      (state, message) => {
-        setDeviceState(state);
-        setDeviceMsg(message);
-        if (state === "success") {
-          setDeviceInfo(null);
-          onLoggedIn();
-        }
-      }
-    );
-    return () => removeEventListener("device_code_status", listener);
-  }, [onLoggedIn]);
-
-  const startDeviceCode = async () => {
-    setStarting(true);
-    setDeviceMsg("正在连接 Epic 服务器…");
-    try {
-      const r = await deviceCodeStart();
-      if (!r.ok) {
-        toaster.toast({ title: "登录失败", body: r.error ?? "" });
-        setDeviceMsg("");
-        return;
-      }
-      setDeviceInfo({
-        user_code: r.user_code ?? "",
-        verification_uri: r.verification_uri ?? "",
-        verification_uri_complete: r.verification_uri_complete ?? "",
-        expires_in: r.expires_in ?? 600,
+    if (!showCode) return;
+    let cancelled = false;
+    getLoginUrl()
+      .then((r) => {
+        if (!cancelled && r?.url) setLoginUrl(r.url);
+      })
+      .catch(() => {
+        /* keep the built-in URL */
       });
-      setDeviceState("pending");
-      setDeviceMsg("");
+    return () => {
+      cancelled = true;
+    };
+  }, [showCode]);
+
+  const submitCode = async () => {
+    const raw = code.trim();
+    if (!raw) {
+      setMsg("请先粘贴授权码");
+      return;
+    }
+    setBusy(true);
+    setMsg("正在登录…");
+    try {
+      const r = await loginWithCode(raw);
+      if (r.ok) {
+        setMsg("");
+        setCode("");
+        setShowCode(false);
+        toaster.toast({ title: "登录成功", body: r.display_name || "" });
+        onLoggedIn();
+      } else {
+        setMsg(r.error ?? "登录失败");
+      }
+    } catch (e) {
+      setMsg("登录出错:" + String(e));
     } finally {
-      setStarting(false);
+      setBusy(false);
     }
   };
 
-  const cancelDeviceCode = async () => {
-    await deviceCodeCancel();
-    setDeviceInfo(null);
-    setDeviceState("");
-    setDeviceMsg("");
+  const doBrowserLogin = async () => {
+    setBrowserBusy(true);
+    try {
+      onLogin();
+    } finally {
+      setBrowserBusy(false);
+    }
   };
 
-  return (
-    <>
-      <PanelSection title="Epic Games 登录">
+  if (showCode) {
+    return (
+      <PanelSection title="授权码登录">
         <PanelSectionRow>
-          <div style={{ padding: "12px 0", color: "var(--decky-text-color)" }}>
-            登录后即可浏览你的 Epic 游戏库并下载游戏。
+          <div style={{ padding: "4px 0 2px", lineHeight: 1.5 }}>
+            1. 用手机或电脑打开下面的链接(也可扫码),登录你的 Epic 账号
           </div>
         </PanelSectionRow>
-
-        {!deviceInfo ? (
-          <>
-            <PanelSectionRow>
-              <ButtonItem layout="below" onClick={startDeviceCode} disabled={starting}>
-                {starting ? "正在连接 Epic…" : "扫码/验证码登录(推荐,无需浏览器)"}
-              </ButtonItem>
-            </PanelSectionRow>
-            <PanelSectionRow>
-              <ButtonItem layout="below" onClick={onLogin} disabled={starting}>
-                浏览器登录(需桌面模式)
-              </ButtonItem>
-            </PanelSectionRow>
-          </>
-        ) : (
-          <>
-            <PanelSectionRow>
-              <QrLogin
-                deviceInfo={deviceInfo}
-                deviceState={deviceState}
-                deviceMsg={deviceMsg}
-              />
-            </PanelSectionRow>
-            <PanelSectionRow>
-              <ButtonItem layout="below" onClick={cancelDeviceCode}>
-                取消
-              </ButtonItem>
-            </PanelSectionRow>
-          </>
-        )}
+        <PanelSectionRow>
+          <QrImage url={loginUrl} />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div
+            style={{
+              fontSize: "0.78em",
+              opacity: 0.75,
+              wordBreak: "break-all",
+              textAlign: "center",
+            }}
+          >
+            {loginUrl}
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ padding: "6px 0 2px", lineHeight: 1.5 }}>
+            2. 登录后页面会显示一段内容,复制其中 <b>authorizationCode</b> 的值
+            (只复制那 32 位字符也可以)
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ padding: "2px 0 6px", lineHeight: 1.5 }}>
+            3. 粘贴到下面,点「完成登录」。<b>授权码只能使用一次且很快过期</b>,请尽快粘贴。
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <TextField
+            label="授权码"
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            disabled={busy}
+            bShowClearAction
+          />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={submitCode} disabled={busy}>
+            {busy ? "正在登录…" : "完成登录"}
+          </ButtonItem>
+        </PanelSectionRow>
+        {msg ? (
+          <PanelSectionRow>
+            <div style={{ padding: "6px 0", fontSize: "0.85em", opacity: 0.9 }}>{msg}</div>
+          </PanelSectionRow>
+        ) : null}
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            onClick={() => {
+              setShowCode(false);
+              setMsg("");
+              setCode("");
+            }}
+            disabled={busy}
+          >
+            返回
+          </ButtonItem>
+        </PanelSectionRow>
       </PanelSection>
-    </>
+    );
+  }
+
+  return (
+    <PanelSection title="Epic Games 登录">
+      <PanelSectionRow>
+        <div style={{ padding: "12px 0" }}>
+          登录后即可浏览你的 Epic 游戏库并下载游戏。
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={() => setShowCode(true)}>
+          手机/电脑授权码登录(推荐)
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={doBrowserLogin} disabled={browserBusy}>
+          浏览器登录(需桌面模式)
+        </ButtonItem>
+      </PanelSectionRow>
+    </PanelSection>
   );
 }
 

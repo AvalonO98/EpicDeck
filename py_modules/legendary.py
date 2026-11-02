@@ -15,6 +15,7 @@ authorization page in a browser (web-style login) and stores tokens locally.
 import asyncio
 import json
 import os
+import re
 import shutil
 
 
@@ -24,6 +25,36 @@ class LegendaryError(Exception):
 
 class LegendaryNotFound(LegendaryError):
     pass
+
+
+def _loads_lenient(text: str):
+    """Parse the JSON payload out of legendary output.
+
+    Legendary mixes log lines into stdout (`[Core] WARNING: ...`), and those
+    lines can contain `[` (e.g. `[Core]`), so simply slicing at the first
+    bracket produces garbage. Instead, try the whole string, then attempt a
+    real decode at every `{` / `[` until one parses.
+    """
+    if text is None:
+        raise LegendaryError("legendary 没有输出")
+    stripped = text.strip()
+    if not stripped:
+        raise LegendaryError("legendary 输出为空")
+
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"[\[{]", stripped):
+        try:
+            obj, _ = decoder.raw_decode(stripped[match.start():])
+            return obj
+        except json.JSONDecodeError:
+            continue
+
+    raise LegendaryError("无法解析 legendary 输出: %s" % stripped[:200])
 
 
 class Legendary:
@@ -86,18 +117,7 @@ class Legendary:
 
     async def _run_json(self, *args, timeout: float = 120.0):
         text = await self._run(*args, "--json", timeout=timeout)
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            # Some legendary versions print warnings before the JSON payload.
-            # Grab the first '[' or '{' and parse from there.
-            start = min(
-                (i for i in (text.find("["), text.find("{")) if i != -1),
-                default=-1,
-            )
-            if start != -1:
-                return json.loads(text[start:])
-            raise LegendaryError("无法解析 legendary 输出: %s" % text[:200])
+        return _loads_lenient(text)
 
     # -- auth -------------------------------------------------------------
     async def auth_login(self):
@@ -134,23 +154,49 @@ class Legendary:
 
     # -- library ----------------------------------------------------------
     async def list_games(self, include_metadata: bool = True):
-        """Return the installed + owned game library, with cover art if present."""
+        """Return the owned game library, merged with install state.
+
+        `legendary list --json` yields a flat array whose title lives in
+        `app_title` (not `title`); Unreal Engine content is excluded so the
+        library only shows real games. Install state comes from a separate
+        `list-installed` call, since `list` does not report it.
+        """
         try:
-            games = await self._run_json("list", "--include-ue", timeout=60.0)
+            games = await self._run_json("list", timeout=90.0)
         except LegendaryError as e:
             raise LegendaryError("读取游戏库失败: %s" % e)
         if isinstance(games, dict):
             games = games.get("games", [])
+
+        installed = {}
+        try:
+            inst = await self._run_json("list-installed", timeout=45.0)
+            if isinstance(inst, dict):
+                inst = inst.get("games", [])
+            for item in inst or []:
+                if item.get("app_name"):
+                    installed[item["app_name"]] = item
+        except LegendaryError:
+            # A broken install manifest should never hide the whole library.
+            pass
+
         result = []
         for g in games or []:
+            metadata = g.get("metadata") or {}
+            app_name = g.get("app_name")
+            if not app_name:
+                continue
+            ins = installed.get(app_name) or {}
             result.append(
                 {
-                    "app_name": g.get("app_name"),
-                    "title": g.get("title") or g.get("app_name"),
-                    "version": g.get("version", ""),
-                    "is_installed": bool(g.get("is_installed")),
-                    "install_size": g.get("install_size", 0),
-                    "installed_size": g.get("installed_size", 0),
+                    "app_name": app_name,
+                    "title": g.get("app_title")
+                    or metadata.get("title")
+                    or app_name,
+                    "version": ins.get("version", "") or g.get("version", ""),
+                    "is_installed": bool(ins),
+                    "install_size": g.get("install_size", 0) or 0,
+                    "installed_size": ins.get("install_size", 0) or 0,
                     "cover_url": self._extract_cover(g),
                 }
             )

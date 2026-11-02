@@ -18,6 +18,7 @@ main.py               Python 后端(Decky 入口,暴露 callable 方法)
 py_modules/config.py  插件配置持久化(JSON)
 py_modules/legendary.py  Legendary CLI 封装(登录/库/下载/启动)
 py_modules/steam.py   Steam shortcuts.vdf 读写 + steam:// 协议
+py_modules/legendary_installer.py  Legendary 二进制自动下载(含镜像加速)
 ```
 
 ## 依赖
@@ -92,7 +93,9 @@ CI 会自动:构建前端 → 打包 zip → 创建 Release 并附上 `EpicDeck-
 | 前端 callable | 后端方法 | 说明 |
 |---|---|---|
 | `auth_status` | `auth_status()` | 登录状态 + 用户信息 |
-| `login` | `login()` | 触发 Legendary 网页授权 |
+| `get_login_url` | `get_login_url()` | 返回 Epic 授权码登录页地址 |
+| `login_with_code` | `login_with_code(raw)` | 用授权码完成登录(可粘贴整段 JSON) |
+| `login` | `login()` | 触发 Legendary 网页授权(需桌面模式) |
 | `logout` | `logout()` | 删除本地 token |
 | `list_games` | `list_games()` | 游戏库列表 |
 | `install` | `install(app_name)` | 后台下载(事件 `install_progress`) |
@@ -107,6 +110,20 @@ CI 会自动:构建前端 → 打包 zip → 创建 Release 并附上 `EpicDeck-
 后端事件:`install_progress` (app_name, state, percent, message),state 为
 `starting | downloading | done | error | cancelled`。
 
+## 为什么不用 device code 登录
+
+早期版本尝试过 Epic 的 device code 流程(`fortniteNewSwitchGameClient`),能拿到
+token,但**最后一步必然失败**:
+
+```
+errors.com.epicgames.account.oauth.authorization_code_not_for_your_client
+```
+
+Epic 把授权码绑定到签发它的 client,而 Legendary 用自己的启动器 client
+(`34a02cf8f4414e29b15921876da36f9a`)去兑换,两者不匹配。因此插件改为:
+用户在该 client 的授权页登录 → 复制 `authorizationCode` → 插件调用
+`legendary auth --code` 完成登录。授权码一次性有效且很快过期。
+
 ## 已知限制与待办
 
 - **下载进度解析**:依赖 Legendary 输出的 `Progress: xx%` 文本格式,版本差异可能导致进度条不准(不影响实际下载)
@@ -118,14 +135,15 @@ CI 会自动:构建前端 → 打包 zip → 创建 Release 并附上 `EpicDeck-
 本项目**不包含后端服务器**,所有数据存储在本地。详见 [SECURITY.md](./SECURITY.md)。
 
 要点:
-- `py_modules/epic_oauth.py` 中的 `DEVICE_CLIENT_ID` / `DEVICE_CLIENT_SECRET` 是 Epic 的**公开**客户端凭据(Fortnite Switch 客户端),非个人密钥,广泛存在于 Legendary/Heroic/EpicResearch 等开源项目。
+- 插件只硬编码 Epic 的**公开客户端 ID**(`34a02cf8...`),不含任何密钥。
+- 登录用的授权码由你从 Epic 页面复制,一次性有效,插件不保存。
 - Epic 登录 token 由 Legendary 存储在本地配置目录,不会提交到 Git。
 
 ## 参考项目
 
 - [decky-plugin-template](https://github.com/SteamDeckHomebrew/decky-plugin-template) — 插件脚手架
 - [Legendary](https://github.com/derrod/legendary) — Epic 命令行客户端
-- [EpicResearch](https://github.com/MixV2/EpicResearch) — Epic OAuth/API 研究(device code 流程参考)
+- [EpicResearch](https://github.com/MixV2/EpicResearch) — Epic OAuth/API 研究
 
 ## 开源协议
 
