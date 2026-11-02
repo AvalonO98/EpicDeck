@@ -31,6 +31,25 @@ class Legendary:
         self.binary = binary
         self.env_prefix = env_prefix
 
+    def _resolve(self):
+        """Locate the legendary binary: absolute path, then PATH, then bundled dir."""
+        # 1. Explicit absolute path.
+        if self.binary and os.path.isabs(self.binary) and os.path.isfile(self.binary):
+            return self.binary
+        # 2. Bundled user dir (where the installer puts it).
+        try:
+            from py_modules.legendary_installer import default_install_dir
+            bundled = os.path.join(default_install_dir(), "legendary")
+            if os.path.isfile(bundled):
+                return bundled
+        except Exception:
+            pass
+        # 3. On PATH.
+        exe = shutil.which(self.binary)
+        if exe:
+            return exe
+        return None
+
     def _env(self):
         env = os.environ.copy()
         if self.env_prefix:
@@ -38,11 +57,10 @@ class Legendary:
         return env
 
     async def _run(self, *args, timeout: float = 120.0):
-        exe = shutil.which(self.binary)
+        exe = self._resolve()
         if exe is None:
             raise LegendaryNotFound(
-                "Legendary 未安装。请在桌面模式运行:\n"
-                "pip install legendary-gl 或从 Heroic/Flatpak 安装。"
+                "Legendary 未安装。请在插件设置中点击「一键安装 Legendary」。"
             )
         cmd = [exe, *args]
         proc = await asyncio.create_subprocess_exec(

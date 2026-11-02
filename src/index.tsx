@@ -73,6 +73,7 @@ const getSettings = callable<[], Record<string, any>>("get_settings");
 const setSetting = callable<[key: string, value: any], { ok: boolean }>("set_setting");
 const getInstallDirOptions = callable<[], { options: string[] }>("get_install_dir_options");
 const checkEnvironment = callable<[], { legendary_installed: boolean; legendary_path: string }>("check_environment");
+const installLegendary = callable<[], { ok: boolean; path?: string; version?: string; error?: string }>("install_legendary");
 const exportLogs = callable<[], { ok: boolean; logs?: string; path?: string; error?: string }>("export_logs");
 
 function fmtSize(bytes: number): string {
@@ -504,6 +505,43 @@ function LibraryView({ games, error }: { games: Game[]; error?: string }) {
   );
 }
 
+function MissingDependency({ onInstalled }: { onInstalled: () => void }) {
+  const [installing, setInstalling] = useState(false);
+
+  const doInstall = async () => {
+    setInstalling(true);
+    const r = await installLegendary();
+    setInstalling(false);
+    if (r.ok) {
+      toaster.toast({
+        title: "安装成功",
+        body: `Legendary ${r.version ?? ""} 已安装`,
+      });
+      onInstalled();
+    } else {
+      toaster.toast({ title: "安装失败", body: r.error ?? "" });
+    }
+  };
+
+  return (
+    <PanelSection title="缺少依赖">
+      <PanelSectionRow>
+        <div style={{ padding: "12px 0" }}>
+          <p>未检测到 Legendary(SteamOS 无 pip,无法用 pip 安装)。</p>
+          <p style={{ opacity: 0.7, fontSize: "0.85em" }}>
+            点击下方按钮,将自动从 GitHub Releases 下载官方独立二进制(约 3 MB,无需 Python)。
+          </p>
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={doInstall} disabled={installing}>
+          {installing ? "正在下载…" : "一键安装 Legendary"}
+        </ButtonItem>
+      </PanelSectionRow>
+    </PanelSection>
+  );
+}
+
 function SettingsView() {
   const [settings, setSettings] = useState<Record<string, any>>({});
   const [dirs, setDirs] = useState<string[]>([]);
@@ -671,21 +709,7 @@ function Content() {
   }
 
   if (!env.legendary_installed) {
-    return (
-      <PanelSection title="缺少依赖">
-        <PanelSectionRow>
-          <div style={{ padding: "12px 0" }}>
-            <p>未检测到 Legendary。请先在桌面模式安装:</p>
-            <p style={{ fontFamily: "monospace", fontSize: "0.9em" }}>
-              pip install --user legendary-gl
-            </p>
-            <p style={{ opacity: 0.7, fontSize: "0.85em" }}>
-              或通过 Heroic Games Launcher / Flatpak 安装,然后重载本插件。
-            </p>
-          </div>
-        </PanelSectionRow>
-      </PanelSection>
-    );
+    return <MissingDependency onInstalled={refresh} />;
   }
 
   if (!auth?.logged_in) {

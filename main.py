@@ -16,6 +16,12 @@ from py_modules.epic_oauth import (
     EpicOAuthError,
     run_device_code_poll,
 )
+from py_modules.legendary_installer import (
+    InstallerError,
+    default_install_dir,
+    download_legendary,
+    is_legendary_installed,
+)
 
 
 class Plugin:
@@ -363,11 +369,38 @@ class Plugin:
     async def check_environment(self):
         """Report the runtime environment so the frontend can guide the user."""
         import shutil as _shutil
-        legendary_path = _shutil.which(self.legendary.binary)
+        resolved = self.legendary._resolve()
         return {
-            "legendary_installed": legendary_path is not None,
-            "legendary_path": legendary_path or "",
+            "legendary_installed": resolved is not None,
+            "legendary_path": resolved or "",
         }
+
+    async def install_legendary(self):
+        """Download the standalone Legendary binary into the user dir."""
+        try:
+            dest_dir = default_install_dir()
+            path, version = await asyncio.get_event_loop().run_in_executor(
+                None, download_legendary, dest_dir
+            )
+            decky.logger.info("legendary installed: %s (%s)", path, version)
+            # Update config so future launches use the bundled binary.
+            self.config.set("legendary_path", path)
+            self.legendary.binary = path
+            return {"ok": True, "path": path, "version": version}
+        except InstallerError as e:
+            decky.logger.error("install_legendary: %s", e)
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            decky.logger.error("install_legendary: %s", e)
+            return {"ok": False, "error": "下载失败: %s" % e}
+
+    async def get_legendary_version(self):
+        """Return the installed Legendary version string, if available."""
+        try:
+            out = await self.legendary._run("--version", timeout=30.0)
+            return {"ok": True, "version": out.strip()}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     # -- logs -------------------------------------------------------------
     async def export_logs(self):

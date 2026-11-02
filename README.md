@@ -25,13 +25,16 @@ py_modules/steam.py   Steam shortcuts.vdf 读写 + steam:// 协议
 - Decky Loader(前端)
 - [Legendary](https://github.com/derrod/legendary)(后端下载引擎)
 
-在 Steam Deck 桌面模式安装 Legendary:
+**Legendary 无需手动安装**:SteamOS 没有 `pip` 且文件系统只读,`pip install legendary-gl` 无法使用。EpicDeck 已内置自动安装——首次使用若未检测到 Legendary,会在界面显示「一键安装 Legendary」按钮,自动从 GitHub Releases 下载官方独立二进制(约 3 MB,无需 Python)到用户目录。
+
+如需手动安装(可选):
 
 ```bash
-# 方式一:pip
-pip install legendary-gl
+# 方式一:官方独立二进制(推荐,无需 pip)
+# 从 https://github.com/derrod/legendary/releases 下载 legendary_linux_x64,
+# 放到 ~/.local/bin/ 并 chmod +x
 
-# 方式二:通过 Heroic Games Launcher 安装(自带 legendary 二进制)
+# 方式二:通过 Heroic Games Launcher(自带 legendary)
 flatpak install flathub com.heroicgameslauncher.hgl
 ```
 

@@ -33,15 +33,15 @@ install_legendary() {
     return 0
   fi
 
-  # 常见位置: Heroic 自带 / flatpak / pip
+  # 常见位置: 用户目录 / Heroic 自带 / flatpak
   for p in \
     "${HOME}/.local/bin/legendary" \
+    "${HOME}/homebrew/data/EpicDeck/bin/legendary" \
     "${HOME}/Applications/Heroic/legendary" \
     "/app/bin/legendary" \
     "/var/lib/flatpak/app/com.heroicgameslauncher.hgl/current/active/files/bin/legendary"; do
     if [ -x "$p" ]; then
-      info "找到 Heroic 自带的 Legendary: $p"
-      # 建立软链到 PATH
+      info "找到 Legendary: $p"
       mkdir -p "${HOME}/.local/bin"
       ln -sf "$p" "${HOME}/.local/bin/legendary"
       info "已链接到 ~/.local/bin/legendary"
@@ -49,17 +49,27 @@ install_legendary() {
     fi
   done
 
-  warn "未找到 Legendary,尝试通过 pip 安装..."
-  if command -v pip >/dev/null 2>&1; then
-    pip install --user legendary-gl
-    info "Legendary 已通过 pip 安装到 ~/.local/bin/"
-    return 0
-  fi
+  # SteamOS 无 pip,直接下载官方独立二进制
+  warn "未找到 Legendary,从 GitHub Releases 下载独立二进制..."
+  local ARCH
+  ARCH="$(uname -m)"
+  local ASSET
+  case "$ARCH" in
+    x86_64|amd64) ASSET="legendary_linux_x64" ;;
+    aarch64|arm64) ASSET="legendary_linux_arm64" ;;
+    *) error "不支持的架构: $ARCH"; exit 1 ;;
+  esac
 
-  error "无法自动安装 Legendary。请手动安装:"
-  echo "  方式一: pip install --user legendary-gl"
-  echo "  方式二: flatpak install flathub com.heroicgameslauncher.hgl"
-  exit 1
+  mkdir -p "${HOME}/.local/bin"
+  local URL
+  URL="https://github.com/derrod/legendary/releases/latest/download/${ASSET}"
+  info "下载 $URL"
+  if ! curl -fL --retry 3 -o "${HOME}/.local/bin/legendary" "$URL"; then
+    error "下载失败。请手动从 https://github.com/derrod/legendary/releases 下载 ${ASSET} 放到 ~/.local/bin/ 并 chmod +x"
+    exit 1
+  fi
+  chmod +x "${HOME}/.local/bin/legendary"
+  info "Legendary 已安装到 ~/.local/bin/legendary"
 }
 
 # ---- 2. 安装插件文件 --------------------------------------------------------
