@@ -46,9 +46,14 @@ def run_build() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="打包 EpicDeck 为 Decky zip")
     parser.add_argument("--skip-build", action="store_true", help="跳过 pnpm build")
+    parser.add_argument(
+        "--version",
+        default=None,
+        help="覆盖 package.json 里的版本号(用于 CI 自动发版,与 tag 对齐)",
+    )
     args = parser.parse_args()
 
-    version = read_version()
+    version = args.version or read_version()
     plugin_name = "EpicDeck"
     zip_name = f"{plugin_name}-v{version}.zip"
     stage = os.path.join(ROOT, ".pkg", plugin_name)

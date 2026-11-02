@@ -1,9 +1,15 @@
 name: Build and Release
 
 on:
+  # 方案 A:每次 push 到 main 自动构建 + 打包验证(不发布),作为 CI 健康检查
+  # 打 v* tag 时:构建 + 打包 + 自动同步版本号 + 发布 Release
   push:
+    branches:
+      - main
     tags:
       - "v*"
+  # 手动触发(可选)
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -32,15 +38,59 @@ jobs:
       - name: Build frontend
         run: pnpm build
 
-      - name: Package plugin zip
+      - name: Package plugin zip (build check)
+        # push 到 main 时:只验证打包是否成功,产物仅供检查,不发布
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         run: python3 build_zip.py --skip-build
 
-      - name: Get version
+  release:
+    # 只在打 v* tag 时执行发布
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version from tag
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Sync package.json version to tag
+        run: |
+          python3 - "${{ steps.version.outputs.version }}" <<'PY'
+          import json, sys
+          v = sys.argv[1]
+          with open("package.json", encoding="utf-8") as f:
+              data = json.load(f)
+          data["version"] = v
+          with open("package.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2)
+              f.write("\n")
+          print(f"package.json version synced to {v}")
+          PY
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Package plugin zip
+        run: python3 build_zip.py --skip-build --version "${{ steps.version.outputs.version }}"
+
       - name: Create Release
-        id: create_release
         uses: softprops/action-gh-release@v2
         with:
           name: "EpicDeck v${{ steps.version.outputs.version }}"
@@ -48,5 +98,5 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            EpicDeck-v*.zip
+            EpicDeck-v${{ steps.version.outputs.version }}.zip
           generate_release_notes: true
