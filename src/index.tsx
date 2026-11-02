@@ -177,6 +177,7 @@ function LoginView({ onLogin, onLoggedIn }: { onLogin: () => void; onLoggedIn: (
   const [deviceInfo, setDeviceInfo] = useState<DeviceCodeInfo | null>(null);
   const [deviceState, setDeviceState] = useState<string>("");
   const [deviceMsg, setDeviceMsg] = useState<string>("");
+  const [starting, setStarting] = useState<boolean>(false);
 
   useEffect(() => {
     const listener = addEventListener<[string, string]>(
@@ -194,19 +195,26 @@ function LoginView({ onLogin, onLoggedIn }: { onLogin: () => void; onLoggedIn: (
   }, [onLoggedIn]);
 
   const startDeviceCode = async () => {
-    const r = await deviceCodeStart();
-    if (!r.ok) {
-      toaster.toast({ title: "登录失败", body: r.error ?? "" });
-      return;
+    setStarting(true);
+    setDeviceMsg("正在连接 Epic 服务器…");
+    try {
+      const r = await deviceCodeStart();
+      if (!r.ok) {
+        toaster.toast({ title: "登录失败", body: r.error ?? "" });
+        setDeviceMsg("");
+        return;
+      }
+      setDeviceInfo({
+        user_code: r.user_code ?? "",
+        verification_uri: r.verification_uri ?? "",
+        verification_uri_complete: r.verification_uri_complete ?? "",
+        expires_in: r.expires_in ?? 600,
+      });
+      setDeviceState("pending");
+      setDeviceMsg("");
+    } finally {
+      setStarting(false);
     }
-    setDeviceInfo({
-      user_code: r.user_code ?? "",
-      verification_uri: r.verification_uri ?? "",
-      verification_uri_complete: r.verification_uri_complete ?? "",
-      expires_in: r.expires_in ?? 600,
-    });
-    setDeviceState("pending");
-    setDeviceMsg("");
   };
 
   const cancelDeviceCode = async () => {
@@ -228,12 +236,12 @@ function LoginView({ onLogin, onLoggedIn }: { onLogin: () => void; onLoggedIn: (
         {!deviceInfo ? (
           <>
             <PanelSectionRow>
-              <ButtonItem layout="below" onClick={startDeviceCode}>
-                扫码/验证码登录(推荐,无需浏览器)
+              <ButtonItem layout="below" onClick={startDeviceCode} disabled={starting}>
+                {starting ? "正在连接 Epic…" : "扫码/验证码登录(推荐,无需浏览器)"}
               </ButtonItem>
             </PanelSectionRow>
             <PanelSectionRow>
-              <ButtonItem layout="below" onClick={onLogin}>
+              <ButtonItem layout="below" onClick={onLogin} disabled={starting}>
                 浏览器登录(需桌面模式)
               </ButtonItem>
             </PanelSectionRow>

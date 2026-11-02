@@ -2,11 +2,19 @@
 # Copyright (c) 2026, EpicDeck Contributors
 
 import os
+import sys
 import asyncio
 import shutil
 import shlex
 
 import decky
+
+# Decky does not add the plugin directory to sys.path, so `from py_modules...`
+# fails with ModuleNotFoundError. Add it explicitly (idempotent), mirroring
+# how other Decky plugins (e.g. decky-steamgriddb) handle this.
+_PLUGIN_DIR = getattr(decky, "DECKY_PLUGIN_DIR", os.path.dirname(os.path.abspath(__file__)))
+if _PLUGIN_DIR and _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
 
 from py_modules.config import Config
 from py_modules.legendary import Legendary, LegendaryError, LegendaryNotFound
@@ -28,8 +36,9 @@ class Plugin:
     async def _main(self):
         decky.logger.info("EpicDeck loaded")
 
+        settings_dir = getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", None) or getattr(decky, "DECKY_SETTINGS_DIR", None) or os.path.join(decky.HOME, ".epicdeck")
         self.config = Config(
-            os.path.join(decky.DECKY_SETTINGS_DIR, "epicdeck.json")
+            os.path.join(settings_dir, "epicdeck.json")
         )
         self.config.load()
 
@@ -66,8 +75,13 @@ class Plugin:
     async def login(self):
         """Start interactive browser login (opens Epic authorization page)."""
         try:
-            await self.legendary.auth_login()
+            # Browser login requires Legendary; give a clear error otherwise.
+            if self.legendary._resolve() is None:
+                return {"ok": False, "error": "Legendary 未安装,请先在设置中点击「一键安装 Legendary」"}
+            await asyncio.wait_for(self.legendary.auth_login(), timeout=60.0)
             return {"ok": True}
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "浏览器登录超时。游戏模式下建议改用「扫码/验证码登录」"}
         except LegendaryError as e:
             return {"ok": False, "error": str(e)}
 
@@ -77,10 +91,16 @@ class Plugin:
         if self._device_poll_task and not self._device_poll_task.done():
             return {"ok": False, "error": "已有登录流程在进行中"}
 
+        loop = asyncio.get_running_loop()
         try:
-            info = await asyncio.get_event_loop().run_in_executor(
-                None, self._device_flow.start_device_code
+            info = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, self._device_flow.start_device_code
+                ),
+                timeout=45.0,
             )
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "连接 Epic 服务器超时,请检查网络后重试"}
         except EpicOAuthError as e:
             return {"ok": False, "error": str(e)}
         except Exception as e:
@@ -100,7 +120,7 @@ class Plugin:
                 code = result.get("code", "")
                 try:
                     if not code and access_token:
-                        code = await asyncio.get_event_loop().run_in_executor(
+                        code = await asyncio.get_running_loop().run_in_executor(
                             None, self._device_flow.exchange_for_code, access_token
                         )
                     if not code:
@@ -112,12 +132,12 @@ class Plugin:
                 except (LegendaryError, EpicOAuthError) as e:
                     await decky.emit("device_code_status", "error", str(e))
 
-            asyncio.get_event_loop().create_task(_finish())
+            asyncio.get_running_loop().create_task(_finish())
 
         def on_error(exc):
             decky.emit("device_code_status", "error", str(exc))
 
-        self._device_poll_task = asyncio.get_event_loop().create_task(
+        self._device_poll_task = asyncio.get_running_loop().create_task(
             run_device_code_poll(
                 self._device_flow,
                 info["device_code"],
@@ -297,7 +317,10 @@ class Plugin:
         exe = shutil.which(self.legendary.binary)
         if exe is None:
             raise LegendaryNotFound("Legendary 未安装")
-        script_dir = os.path.join(decky.DECKY_RUNTIME_DIR, "launchers")
+        script_dir = os.path.join(
+            getattr(decky, "DECKY_PLUGIN_RUNTIME_DIR", None) or getattr(decky, "DECKY_RUNTIME_DIR", None) or os.path.join(decky.HOME, ".epicdeck"),
+            "launchers",
+        )
         os.makedirs(script_dir, exist_ok=True)
         script = os.path.join(script_dir, f"{app_name}.sh")
         content = (
@@ -385,7 +408,7 @@ class Plugin:
         """Download the standalone Legendary binary into the user dir."""
         try:
             dest_dir = default_install_dir()
-            path, version = await asyncio.get_event_loop().run_in_executor(
+            path, version = await asyncio.get_running_loop().run_in_executor(
                 None, download_legendary, dest_dir
             )
             decky.logger.info("legendary installed: %s (%s)", path, version)

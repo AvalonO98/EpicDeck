@@ -102,25 +102,32 @@ class Legendary:
     # -- auth -------------------------------------------------------------
     async def auth_login(self):
         """Launch interactive browser login."""
-        return await self._run("auth")
+        return await self._run("auth", timeout=60.0)
 
     async def auth_with_code(self, code: str):
         """Authenticate using an authorization code from the device flow."""
         return await self._run("auth", "--code", code, timeout=120.0)
 
     async def auth_status(self):
-        """Return dict describing auth state: logged_in, account_id, display_name."""
+        """Return dict describing auth state: logged_in, account_id, display_name.
+
+        Legendary 0.21.x exposes a non-interactive `status --json` command that
+        reports the current account. (`auth --status` does not exist and would
+        drop into the interactive login flow.)
+        """
         try:
-            out = await self._run_json("auth", "--status", timeout=15.0)
+            out = await self._run_json("status", timeout=15.0)
         except LegendaryError:
             return {"logged_in": False, "account_id": "", "display_name": ""}
-        if isinstance(out, dict) and out.get("account_id"):
-            return {
-                "logged_in": True,
-                "account_id": out.get("account_id", ""),
-                "display_name": out.get("display_name", ""),
-            }
-        return {"logged_in": False, "account_id": "", "display_name": ""}
+        if not isinstance(out, dict):
+            return {"logged_in": False, "account_id": "", "display_name": ""}
+        account = out.get("account", "")
+        logged_in = bool(account) and account != "<not logged in>"
+        return {
+            "logged_in": logged_in,
+            "account_id": account if logged_in else "",
+            "display_name": account if logged_in else "",
+        }
 
     async def auth_logout(self):
         return await self._run("auth", "--delete")
@@ -129,7 +136,7 @@ class Legendary:
     async def list_games(self, include_metadata: bool = True):
         """Return the installed + owned game library, with cover art if present."""
         try:
-            games = await self._run_json("list-games", "--include-ue", timeout=60.0)
+            games = await self._run_json("list", "--include-ue", timeout=60.0)
         except LegendaryError as e:
             raise LegendaryError("读取游戏库失败: %s" % e)
         if isinstance(games, dict):

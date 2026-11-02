@@ -26,6 +26,7 @@ client id used by open-source projects (Legendary, Heroic, etc.).
 
 import asyncio
 import base64
+import ssl
 import time
 
 DEVICE_AUTH_URL = (
@@ -57,6 +58,32 @@ class EpicOAuthError(Exception):
     pass
 
 
+def _ssl_context():
+    """Build a verifying SSL context, falling back gracefully.
+
+    Decky's sandbox may not expose CA certificates, causing urllib to fail with
+    CERTIFICATE_VERIFY_FAILED. Prefer certifi, then system bundles, then an
+    unverified context as a last resort.
+    """
+    import os
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    for candidate in (
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    ):
+        if os.path.isfile(candidate):
+            return ssl.create_default_context(cafile=candidate)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+
 class DeviceCodeFlow:
     def __init__(self):
         self._client = None
@@ -86,7 +113,7 @@ class DeviceCodeFlow:
         for k, v in headers.items():
             req.add_header(k, v)
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             try:
@@ -163,7 +190,7 @@ class DeviceCodeFlow:
             req.add_header(k, v)
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             # 400 with a JSON body carries the pending/denied/expired state.
@@ -223,7 +250,7 @@ class DeviceCodeFlow:
             headers={"Authorization": f"Bearer {access_token}"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
@@ -250,7 +277,7 @@ async def run_device_code_poll(flow: DeviceCodeFlow, device_code: str,
     def _poll():
         return flow.poll_token(device_code)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     while True:
         if time.time() - start > max_wait:
             on_error(EpicOAuthError("等待授权超时"))
