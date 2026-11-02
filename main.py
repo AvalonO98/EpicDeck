@@ -4,6 +4,7 @@
 import os
 import re
 import sys
+import time
 import asyncio
 import shutil
 import shlex
@@ -18,6 +19,7 @@ if _PLUGIN_DIR and _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
 from py_modules.config import Config
+from py_modules.epic_api import detect_locale, fetch_localized_titles, fetch_playtime
 from py_modules.legendary import Legendary, LegendaryError, LegendaryNotFound
 from py_modules.steam import SteamShortcuts, SteamError, open_steam_protocol
 from py_modules.legendary_installer import (
@@ -76,12 +78,19 @@ class Plugin:
 
         # app_name -> asyncio.Task for active installs.
         self._install_tasks = {}
+        self._meta_task = None
+        self._meta_done = False
 
     async def _unload(self):
         for task in getattr(self, "_install_tasks", {}).values():
             if not task.done():
                 task.cancel()
+        meta = getattr(self, "_meta_task", None)
+        if meta is not None and not meta.done():
+            meta.cancel()
         decky.logger.info("EpicDeck unloaded")
+        # Decky treats a falsy return as "keep the plugin running".
+        return True
 
     async def _uninstall(self):
         decky.logger.info("EpicDeck uninstalled")
@@ -174,21 +183,267 @@ class Plugin:
     # -- library ----------------------------------------------------------
     async def list_games(self):
         try:
-            return {"ok": True, "games": await self.legendary.list_games()}
+            games = await self.legendary.list_games()
         except LegendaryError as e:
             return {"ok": False, "error": str(e)}
 
+        # Play time comes from Epic's library-service. It is a nice-to-have, so
+        # a timeout or an expired token degrades to zero rather than failing
+        # the whole library load.
+        loop = asyncio.get_running_loop()
+        try:
+            playtime = await asyncio.wait_for(
+                loop.run_in_executor(None, fetch_playtime), timeout=15.0
+            )
+        except Exception as e:
+            decky.logger.warning("playtime unavailable: %s", e)
+            playtime = {}
+
+        # Epic exposes no "date added", so we record when each title first
+        # showed up in this plugin's library. Everything seen on the first run
+        # shares one timestamp; later acquisitions sort above them.
+        first_seen = self.config.get("first_seen") or {}
+        if not isinstance(first_seen, dict):
+            first_seen = {}
+        now = int(time.time())
+        changed = False
+
+        # Read shortcuts.vdf once instead of one `is_in_steam` callable per row
+        # (the old per-row call meant 138 IPC round-trips on every render).
+        try:
+            in_steam = {s.app_name for s in self.steam.list_shortcuts()}
+        except Exception as e:
+            decky.logger.warning("shortcuts read failed: %s", e)
+            in_steam = set()
+
+        for g in games:
+            g["playtime_seconds"] = playtime.get(g["app_name"], 0)
+            g["in_steam"] = g["app_name"] in in_steam
+            seen = first_seen.get(g["app_name"])
+            if not isinstance(seen, int):
+                first_seen[g["app_name"]] = now
+                seen = now
+                changed = True
+            g["first_seen"] = seen
+
+        if changed:
+            try:
+                self.config.set("first_seen", first_seen)
+            except OSError as e:
+                decky.logger.warning("first_seen save failed: %s", e)
+
+        # Titles and sizes are enriched separately: localised titles come from
+        # one catalog call, sizes need a per-game manifest download (seconds
+        # each), so both are cached and filled in by a background task that
+        # patches the list through events.
+        locale = detect_locale(self.config.get("title_locale", "auto"))
+        self._apply_cached_metadata(games, locale)
+
+        # Only advertise a pending count when a background job will actually
+        # fill it in; otherwise the UI would sit on "0/138" forever.
+        try:
+            have_legendary = self.legendary._resolve() is not None
+        except Exception:
+            have_legendary = False
+        can_fetch = bool(self.config.get("auto_fetch_size", True)) and have_legendary
+        pending = sum(1 for g in games if not g.get("disk_size")) if can_fetch else 0
+        if can_fetch:
+            self._ensure_metadata_refresh(games, locale)
+
+        return {
+            "ok": True,
+            "games": games,
+            "locale": locale,
+            "size_pending": pending,
+        }
+
+    # -- library enrichment ----------------------------------------------
+    def _apply_cached_metadata(self, games, locale):
+        """Overlay cached localised titles and cached install sizes."""
+        titles = (self.config.get("title_cache") or {}).get(locale) or {}
+        sizes = self.config.get("size_cache") or {}
+        if not isinstance(titles, dict):
+            titles = {}
+        if not isinstance(sizes, dict):
+            sizes = {}
+
+        for g in games:
+            title = titles.get(g["app_name"])
+            if isinstance(title, str) and title.strip():
+                g["title"] = title.strip()
+                g["localized_title"] = True
+
+            cached = sizes.get(g["app_name"])
+            if isinstance(cached, dict):
+                disk = int(cached.get("disk") or 0)
+                download = int(cached.get("download") or 0)
+                if disk or download:
+                    g["download_size"] = download
+                    g["disk_size"] = disk
+                    # `install_size` is what the UI has always shown; keep it
+                    # meaning "bytes to download".
+                    g["install_size"] = download or disk
+
+    def _ensure_metadata_refresh(self, games, locale):
+        if not self.config.get("auto_fetch_size", True):
+            return
+        task = getattr(self, "_meta_task", None)
+        if task is not None and not task.done():
+            return
+        if getattr(self, "_meta_locale", "") == locale and getattr(self, "_meta_done", False):
+            return
+        self._meta_task = asyncio.create_task(self._refresh_metadata(games, locale))
+
+    async def _refresh_metadata(self, games, locale):
+        """Fill in localised titles, then sizes, emitting patches as it goes."""
+        loop = asyncio.get_running_loop()
+        self._meta_locale = locale
+        self._meta_done = False
+
+        # 1) Localised titles: a few catalog calls, done in one go.
+        try:
+            cache = self.config.get("title_cache") or {}
+            if not isinstance(cache, dict):
+                cache = {}
+            cached = cache.get(locale) or {}
+            items = [
+                (g["app_name"], g.get("namespace", ""), g.get("catalog_item_id", ""))
+                for g in games
+                if g["app_name"] not in cached
+            ]
+            if items:
+                got = await loop.run_in_executor(None, fetch_localized_titles, items, locale)
+                if got:
+                    cached.update(got)
+                    cache[locale] = cached
+                    self.config.set("title_cache", cache)
+                    await decky.emit("library_patch", got, 0)
+                    decky.logger.info("localized titles: %d added for %s", len(got), locale)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            decky.logger.warning("localized titles failed: %s", e)
+
+        # 2) Install sizes: one manifest fetch per game, throttled and cached.
+        sizes = self.config.get("size_cache") or {}
+        if not isinstance(sizes, dict):
+            sizes = {}
+        now = int(time.time())
+        todo = []
+        for g in games:
+            cached = sizes.get(g["app_name"])
+            fresh = isinstance(cached, dict) and int(cached.get("disk") or 0) > 0
+            if fresh and now - int(cached.get("ts") or 0) < 30 * 86400:
+                continue
+            todo.append(g["app_name"])
+        if not todo:
+            self._meta_done = True
+            await decky.emit("library_patch", {}, 0)
+            return
+
+        decky.logger.info("fetching sizes for %d games", len(todo))
+        sem = asyncio.Semaphore(3)
+        patch = {}
+        remaining = [len(todo)]
+        dirty = [False]
+        flush_at = [time.time()]
+
+        async def fetch_one(app_name):
+            async with sem:
+                try:
+                    result = await self.legendary.game_size(app_name)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    decky.logger.warning("size %s failed: %s", app_name, e)
+                    result = None
+                remaining[0] -= 1
+                if result:
+                    sizes[app_name] = {
+                        "download": result["download"],
+                        "disk": result["disk"],
+                        "ts": now,
+                    }
+                    patch[app_name] = result
+                    dirty[0] = True
+
+                # Flush in batches: per-game IPC would mean 138 events.
+                due = len(patch) >= 6 or (time.time() - flush_at[0]) > 3.0
+                if patch and (due or remaining[0] == 0):
+                    await decky.emit("library_patch", dict(patch), remaining[0])
+                    patch.clear()
+                    flush_at[0] = time.time()
+                    if dirty[0]:
+                        try:
+                            self.config.set("size_cache", sizes)
+                            dirty[0] = False
+                        except OSError as e:
+                            decky.logger.warning("size cache save failed: %s", e)
+
+        try:
+            await asyncio.gather(*[fetch_one(app) for app in todo])
+        except asyncio.CancelledError:
+            try:
+                self.config.set("size_cache", sizes)
+            except OSError:
+                pass
+            raise
+
+        try:
+            self.config.set("size_cache", sizes)
+        except OSError as e:
+            decky.logger.warning("size cache save failed: %s", e)
+        self._meta_done = True
+        await decky.emit("library_patch", {}, 0)
+        decky.logger.info("size fetch complete (%d games)", len(todo))
+
+    async def get_game_size(self, app_name: str):
+        """On-demand size for one title, for the detail page."""
+        sizes = self.config.get("size_cache") or {}
+        if not isinstance(sizes, dict):
+            sizes = {}
+        cached = sizes.get(app_name)
+        if isinstance(cached, dict) and int(cached.get("disk") or 0) > 0:
+            return {"ok": True, "download": cached.get("download", 0), "disk": cached.get("disk", 0)}
+
+        try:
+            result = await self.legendary.game_size(app_name)
+        except LegendaryError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not result:
+            return {"ok": False, "error": "无法读取安装体积"}
+
+        sizes[app_name] = {
+            "download": result["download"],
+            "disk": result["disk"],
+            "ts": int(time.time()),
+        }
+        try:
+            self.config.set("size_cache", sizes)
+        except OSError:
+            pass
+        await decky.emit("library_patch", {app_name: result}, 0)
+        return {"ok": True, **result}
+
     # -- install / launch / uninstall ------------------------------------
-    async def install(self, app_name: str):
+    async def install(self, app_name: str, install_dir: str = ""):
         if app_name in self._install_tasks and not self._install_tasks[app_name].done():
             return {"ok": False, "error": "该游戏正在下载中"}
 
-        install_dir = self.config.get("install_dir", "")
+        # Per-game override wins over the global default set in Settings.
+        target = (install_dir or "").strip() or self.config.get("install_dir", "")
+        if target:
+            if not os.path.isdir(target):
+                return {"ok": False, "error": "安装目录不存在: %s" % target}
+            if not os.access(target, os.W_OK):
+                return {"ok": False, "error": "安装目录不可写: %s" % target}
 
         async def _run():
             try:
                 await decky.emit("install_progress", app_name, "starting", 0.0, "")
-                await self._install_streaming(app_name, install_dir)
+                await self._install_streaming(app_name, target)
                 await decky.emit("install_progress", app_name, "done", 100.0, "")
                 if self.config.get("auto_add_to_steam"):
                     await self._add_to_steam(app_name)
@@ -201,7 +456,7 @@ class Plugin:
 
         task = asyncio.create_task(_run())
         self._install_tasks[app_name] = task
-        return {"ok": True}
+        return {"ok": True, "install_dir": target}
 
     async def _install_streaming(self, app_name: str, install_dir: str):
         exe = shutil.which(self.legendary.binary)
@@ -377,20 +632,54 @@ class Plugin:
         return {"ok": True}
 
     async def get_install_dir_options(self):
-        options = []
-        for base in ["/run/media", "/home/deck"]:
-            if os.path.isdir(base):
-                try:
-                    for name in os.listdir(base):
-                        full = os.path.join(base, name)
-                        if os.path.isdir(full):
-                            options.append(full)
-                except OSError:
-                    continue
+        """Install roots the user can pick from, annotated with free space.
+
+        The same SD card can be reachable through several paths
+        (`/run/media/<label>`, `/run/media/<user>/<label>`, symlinked mounts),
+        so candidates are normalised with realpath and de-duplicated, and only
+        real mount points are offered — a plain directory like /run/media/deck
+        is not somewhere you want games installed.
+        """
         home = os.path.expanduser("~")
-        if home not in options:
-            options.insert(0, home)
-        return {"options": options}
+
+        mount_points = []
+        try:
+            with open("/proc/mounts", "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    mp = parts[1].replace("\\040", " ")
+                    if mp.startswith(("/run/media/", "/media/")):
+                        mount_points.append(mp)
+        except OSError:
+            mount_points = []
+
+        seen = set()
+        options = []
+        for path in [home] + mount_points:
+            real = os.path.realpath(path)
+            if real in seen:
+                continue
+            if path != home and not os.path.ismount(path) and not os.path.ismount(real):
+                continue
+            seen.add(real)
+
+            try:
+                free = shutil.disk_usage(real).free
+                free_label = "%0.1f GB 可用" % (free / 1024 / 1024 / 1024)
+            except OSError:
+                free = 0
+                free_label = "空间未知"
+
+            if path == home:
+                label = "内置存储 · " + free_label
+            else:
+                label = "%s · %s" % (os.path.basename(real.rstrip("/")), free_label)
+            options.append({"path": real, "label": label, "free": free})
+
+        options.sort(key=lambda o: (o["path"] != home, o["path"]))
+        return {"options": options, "current": self.config.get("install_dir", "")}
 
     # -- environment ------------------------------------------------------
     async def check_environment(self):

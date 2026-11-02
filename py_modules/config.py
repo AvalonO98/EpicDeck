@@ -19,6 +19,19 @@ DEFAULTS = {
     "legendary_path": "legendary",
     "refresh_token_managed": True,
     "auto_add_to_steam": False,
+    # app_name -> unix timestamp of when it first appeared in the library.
+    # Epic's API has no "date added", so we track it ourselves for sorting.
+    "first_seen": {},
+    # "auto" follows the Steam UI language; otherwise a BCP-47 tag such as
+    # "zh-Hans" / "en-US". Titles fall back to English when untranslated.
+    "title_locale": "auto",
+    # Sizes need one manifest download per game (~4 s, a few MB each), so this
+    # can be switched off on a metered connection. Results are cached 30 days.
+    "auto_fetch_size": True,
+    # app_name -> {"download": bytes, "disk": bytes, "ts": unix time}
+    "size_cache": {},
+    # locale -> {app_name: localised title}
+    "title_cache": {},
 }
 
 

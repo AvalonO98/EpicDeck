@@ -198,6 +198,10 @@ class Legendary:
                     "install_size": g.get("install_size", 0) or 0,
                     "installed_size": ins.get("install_size", 0) or 0,
                     "cover_url": self._extract_cover(g),
+                    # Needed to ask Epic's catalog service for a localised
+                    # title (its bulk endpoint is keyed by catalog item id).
+                    "namespace": metadata.get("namespace", "") or "",
+                    "catalog_item_id": metadata.get("id", "") or "",
                 }
             )
         result.sort(key=lambda x: (not x["is_installed"], (x["title"] or "").lower()))
@@ -223,6 +227,23 @@ class Legendary:
         return ""
 
     # -- install / launch / uninstall ------------------------------------
+    async def game_size(self, app_name: str):
+        """Return {'download': bytes, 'disk': bytes} for a title.
+
+        `legendary list` never reports sizes: the only source is the build
+        manifest, which `legendary info --json` fetches (a couple of MB each).
+        That is why callers cache the result instead of asking per render.
+        """
+        data = await self._run_json("info", app_name, timeout=90.0)
+        if not isinstance(data, dict):
+            return None
+        manifest = data.get("manifest") or {}
+        disk = int(manifest.get("disk_size") or 0)
+        download = int(manifest.get("download_size") or 0)
+        if not disk and not download:
+            return None
+        return {"download": download, "disk": disk}
+
     async def install(self, app_name: str, install_dir: str = "", base_path: str = ""):
         args = ["install", app_name]
         if install_dir:
