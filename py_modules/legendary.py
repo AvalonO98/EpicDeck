@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 
 
@@ -85,6 +86,17 @@ class Legendary:
         env = os.environ.copy()
         if self.env_prefix:
             env["LEGENDARY_CONFIG_PATH"] = self.env_prefix
+        # Game Mode has no LANG at all, which makes Legendary's locale lookup
+        # fail ("Getting locale failed ... falling back to using en-US") and
+        # every game launches in English. Derive it from Steam's own setting.
+        if not env.get("LANG"):
+            try:
+                from py_modules.epic_api import steam_posix_locale
+                locale = steam_posix_locale()
+            except Exception:
+                locale = "en_US.UTF-8"
+            env["LANG"] = locale
+            env.setdefault("LC_ALL", locale)
         return env
 
     async def _run(self, *args, timeout: float = 120.0):
@@ -253,8 +265,16 @@ class Legendary:
         args += ["-y"]  # assume yes to any prompt
         return await self._run(*args, timeout=3600.0)
 
-    async def launch(self, app_name: str):
-        return await self._run("launch", app_name, timeout=60.0)
+    async def launch(self, app_name: str, extra_args: str = ""):
+        """Launch an installed title.
+
+        Arguments after the app name go straight to the game (Legendary uses
+        REMAINDER), which is how per-game compatibility flags reach it.
+        """
+        cmd = ["launch", app_name]
+        if extra_args and extra_args.strip():
+            cmd += shlex.split(extra_args)
+        return await self._run(*cmd, timeout=60.0)
 
     async def uninstall(self, app_name: str):
         return await self._run("uninstall", app_name, "-y", timeout=120.0)

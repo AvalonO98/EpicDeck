@@ -92,6 +92,14 @@ const listGames = callable<
 const getGameSize = callable<[app_name: string], { ok: boolean; download?: number; disk?: number; error?: string }>(
   "get_game_size"
 );
+const getLaunchArgs = callable<
+  [app_name: string],
+  { ok: boolean; args: string; own: boolean; from_legendary: boolean }
+>("get_launch_args");
+const setLaunchArgs = callable<
+  [app_name: string, args: string],
+  { ok: boolean; args?: string; error?: string; warning?: string }
+>("set_launch_args");
 const installGame = callable<[app_name: string, install_dir: string], { ok: boolean; error?: string }>("install");
 const launchGame = callable<[app_name: string], { ok: boolean; error?: string }>("launch");
 const uninstallGame = callable<[app_name: string], { ok: boolean; error?: string }>("uninstall");
@@ -581,6 +589,9 @@ function GameDetail({
     download: game.download_size || 0,
     disk: game.disk_size || 0,
   });
+  const [launchArgs, setLaunchArgsValue] = useState("");
+  const [argsDirty, setArgsDirty] = useState(false);
+  const [argsNote, setArgsNote] = useState("");
   const [target, setTarget] = useState(
     defaultDir || (dirs.length ? dirs[0].path : "")
   );
@@ -588,6 +599,41 @@ function GameDetail({
   useEffect(() => {
     isInSteam(game.app_name).then((r) => setInSteam(r.in_steam));
   }, [game.app_name]);
+
+  // Launch arguments live in the plugin config; the Steam wrapper script is
+  // rewritten on save so both entry points behave identically.
+  useEffect(() => {
+    let cancelled = false;
+    setArgsDirty(false);
+    getLaunchArgs(game.app_name).then((r) => {
+      if (cancelled || !r.ok) return;
+      setLaunchArgsValue(r.args ?? "");
+      setArgsNote(
+        r.from_legendary
+          ? "来自 Legendary 配置（Legendary 启动时会自动应用，改这里会改为插件接管）"
+          : ""
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [game.app_name]);
+
+  useEffect(() => {
+    if (!argsDirty) return;
+    const timer = setTimeout(async () => {
+      const r = await setLaunchArgs(game.app_name, launchArgs);
+      setArgsDirty(false);
+      if (!r.ok) {
+        toaster.toast({ title: "启动参数保存失败", body: r.error ?? "" });
+      } else if (r.warning) {
+        toaster.toast({ title: "已保存，但 Steam 快捷方式未更新", body: r.warning });
+      } else {
+        setArgsNote("已保存，下次启动生效");
+      }
+    }, 900);
+    return () => clearTimeout(timer);
+  }, [launchArgs, argsDirty, game.app_name]);
 
   // Opening a detail page for a title the background job has not reached yet
   // fetches its manifest right away instead of waiting for the crawl.
@@ -768,6 +814,24 @@ function GameDetail({
             </PanelSectionRow>
           </>
         )}
+
+        <PanelSectionRow>
+          <TextField
+            label="启动参数（可选）"
+            value={launchArgs}
+            onChange={(e: any) => {
+              setLaunchArgsValue(e.target.value);
+              setArgsDirty(true);
+            }}
+          />
+          <Field
+            label="启动参数"
+            description={
+              argsNote ||
+              "追加在 legendary launch 之后，如 -windowed；留空即不添加。Steam 属性里手填的启动项也会被转发"
+            }
+          />
+        </PanelSectionRow>
 
         <PanelSectionRow>
           <ButtonItem

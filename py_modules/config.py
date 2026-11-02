@@ -32,6 +32,11 @@ DEFAULTS = {
     "size_cache": {},
     # locale -> {app_name: localised title}
     "title_cache": {},
+    # app_name -> extra arguments passed to `legendary launch` (also written
+    # into the Steam shortcut's wrapper script). An empty string means "none",
+    # which is different from "no opinion" (key absent -> import from
+    # Legendary's own config.ini, where Heroic stores per-game args).
+    "launch_args": {},
 }
 
 

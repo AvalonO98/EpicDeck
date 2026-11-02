@@ -1,6 +1,6 @@
 {
   "name": "epicdeck",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Epic Games login and download manager for Steam Deck, powered by Legendary",
   "type": "module",
   "scripts": {

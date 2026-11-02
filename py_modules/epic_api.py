@@ -27,6 +27,41 @@ CATALOG_BULK_URL = (
     "/catalog/api/shared/bulk/items"
 )
 
+# Steam language -> POSIX locale. Legendary reads the system locale to decide
+# which language to launch a game in, and SteamOS Game Mode runs with an empty
+# LANG, so without this every game would start in English.
+STEAM_LANG_TO_POSIX = {
+    "schinese": "zh_CN.UTF-8",
+    "tchinese": "zh_TW.UTF-8",
+    "english": "en_US.UTF-8",
+    "japanese": "ja_JP.UTF-8",
+    "koreana": "ko_KR.UTF-8",
+    "russian": "ru_RU.UTF-8",
+    "german": "de_DE.UTF-8",
+    "french": "fr_FR.UTF-8",
+    "spanish": "es_ES.UTF-8",
+    "latam": "es_MX.UTF-8",
+    "portuguese": "pt_BR.UTF-8",
+    "brazilian": "pt_BR.UTF-8",
+    "italian": "it_IT.UTF-8",
+    "polish": "pl_PL.UTF-8",
+    "ukrainian": "uk_UA.UTF-8",
+    "turkish": "tr_TR.UTF-8",
+    "thai": "th_TH.UTF-8",
+    "vietnamese": "vi_VN.UTF-8",
+    "czech": "cs_CZ.UTF-8",
+    "danish": "da_DK.UTF-8",
+    "dutch": "nl_NL.UTF-8",
+    "finnish": "fi_FI.UTF-8",
+    "norwegian": "nb_NO.UTF-8",
+    "swedish": "sv_SE.UTF-8",
+    "hungarian": "hu_HU.UTF-8",
+    "romanian": "ro_RO.UTF-8",
+    "bulgarian": "bg_BG.UTF-8",
+    "greek": "el_GR.UTF-8",
+    "indonesian": "id_ID.UTF-8",
+}
+
 TIMEOUT = 12.0
 
 # Steam spells languages in its own dialect; Epic's catalog wants BCP-47.
@@ -129,6 +164,17 @@ def _steam_language() -> str:
         if match:
             return match.group(1).lower()
     return ""
+
+
+def steam_posix_locale() -> str:
+    """POSIX locale string (e.g. "zh_CN.UTF-8") for the current Steam language."""
+    lang = _steam_language()
+    if lang in STEAM_LANG_TO_POSIX:
+        return STEAM_LANG_TO_POSIX[lang]
+    raw = os.environ.get("LC_ALL") or os.environ.get("LANG") or ""
+    if raw and "." in raw:
+        return raw
+    return "en_US.UTF-8"
 
 
 def detect_locale(setting: str = "auto") -> str:
