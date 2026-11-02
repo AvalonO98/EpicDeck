@@ -667,10 +667,48 @@ function Content() {
   };
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
-      setEnv(await checkEnvironment());
-      await refresh();
+      // Run environment check and auth status in parallel, each with its own
+      // timeout, so a slow/blocked backend callable can never leave the UI
+      // stuck on "loading" forever.
+      const withTimeout = <T,>(p: Promise<T>, ms: number, fallback: T): Promise<T> =>
+        Promise.race([
+          p,
+          new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
+        ]);
+
+      const [envResult, authResult] = await Promise.all([
+        withTimeout(checkEnvironment(), 8000, { legendary_installed: true, legendary_path: "" }),
+        withTimeout(authStatus(), 15000, { logged_in: false, account_id: "", display_name: "" }),
+      ]);
+
+      if (cancelled) return;
+      setEnv(envResult);
+      setAuth(authResult);
+      setGameError("");
+
+      if (authResult.logged_in) {
+        const r = await withTimeout(listGames(), 20000, {
+          ok: false,
+          games: [],
+          error: "读取游戏库超时",
+        });
+        if (cancelled) return;
+        if (r.ok) {
+          setGames(r.games ?? []);
+        } else {
+          setGames([]);
+          setGameError(r.error ?? "未知错误");
+        }
+      } else {
+        setGames([]);
+      }
+      setLoading(false);
     })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const doLogin = async () => {

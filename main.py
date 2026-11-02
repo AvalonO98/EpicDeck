@@ -191,12 +191,15 @@ class Plugin:
         if install_dir:
             cmd += ["--base-path", install_dir]
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=self.legendary._env(),
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=self.legendary._env(),
+            )
+        except (OSError, PermissionError, FileNotFoundError) as e:
+            raise LegendaryNotFound("无法启动 Legendary(%s): %s" % (exe, e))
         try:
             while True:
                 line = await proc.stdout.readline()
@@ -368,8 +371,11 @@ class Plugin:
     # -- environment ------------------------------------------------------
     async def check_environment(self):
         """Report the runtime environment so the frontend can guide the user."""
-        import shutil as _shutil
-        resolved = self.legendary._resolve()
+        try:
+            resolved = self.legendary._resolve()
+        except Exception as e:
+            decky.logger.error("check_environment: %s", e)
+            resolved = None
         return {
             "legendary_installed": resolved is not None,
             "legendary_path": resolved or "",

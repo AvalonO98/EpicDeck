@@ -63,12 +63,17 @@ class Legendary:
                 "Legendary 未安装。请在插件设置中点击「一键安装 Legendary」。"
             )
         cmd = [exe, *args]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=self._env(),
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=self._env(),
+            )
+        except (OSError, PermissionError, FileNotFoundError) as e:
+            raise LegendaryNotFound(
+                "无法启动 Legendary(%s): %s" % (exe, e)
+            )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -106,7 +111,7 @@ class Legendary:
     async def auth_status(self):
         """Return dict describing auth state: logged_in, account_id, display_name."""
         try:
-            out = await self._run_json("auth", "--status", timeout=30.0)
+            out = await self._run_json("auth", "--status", timeout=15.0)
         except LegendaryError:
             return {"logged_in": False, "account_id": "", "display_name": ""}
         if isinstance(out, dict) and out.get("account_id"):
