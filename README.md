@@ -42,11 +42,35 @@ pnpm build        # 产出 dist/
 pnpm watch        # 监听模式
 ```
 
-### 安装到 Steam Deck(开发者模式)
+### 打包为 Decky 可导入的 zip
 
-1. Decky 开启开发者模式(设置 → 开发者 → 打开开发者模式)
-2. 将项目打包为 zip,或直接把 `dist/` + `main.py` + `py_modules/` 放到插件目录
-3. 在 Decky 插件菜单重载
+```bash
+pnpm package      # 等价于 python build_zip.py,生成 EpicDeck-v0.1.0.zip
+```
+
+打包脚本会先构建前端,再按 Decky 标准格式组装:
+
+```
+EpicDeck-v0.1.0.zip
+└── EpicDeck/
+    ├── dist/index.js    (必填)
+    ├── package.json     (必填)
+    ├── plugin.json      (必填)
+    ├── main.py          (必填,Python 后端)
+    ├── py_modules/      (后端模块)
+    ├── README.md / LICENSE / SECURITY.md / NOTICE
+    └── ...
+```
+
+### 安装到 Steam Deck(zip 导入)
+
+1. 把 `EpicDeck-v0.1.0.zip` 传到 Steam Deck(任意目录,如下载文件夹)
+2. 桌面模式 → 打开 Decky Loader 菜单 → **设置(齿轮)→ 开发者(Developer)**
+3. 打开「开发者模式」开关,点 **Install plugin from zip**
+4. 选择 `EpicDeck-v0.1.0.zip` 完成安装
+5. 回到游戏模式,Quick Access 菜单里即可看到 EpicDeck
+
+> ⚠️ 首次使用前需安装 Legendary,见下方「依赖」章节。
 
 ## 插件 API 一览(前端 callable 对应后端方法)
 

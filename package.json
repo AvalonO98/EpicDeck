@@ -6,11 +6,12 @@
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
+    "package": "python build_zip.py",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/SteamDeckHomebrew/decky-plugin-template.git"
+    "url": "git+https://github.com/AvalonO98/EpicDeck.git"
   },
   "keywords": [
     "decky",
@@ -23,9 +24,9 @@
   "author": "EpicDeck",
   "license": "BSD-3-Clause",
   "bugs": {
-    "url": "https://github.com/SteamDeckHomebrew/decky-plugin-template/issues"
+    "url": "https://github.com/AvalonO98/EpicDeck/issues"
   },
-  "homepage": "https://github.com/SteamDeckHomebrew/decky-plugin-template#readme",
+  "homepage": "https://github.com/AvalonO98/EpicDeck#readme",
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
     "@decky/ui": "^4.11.0",

@@ -1,7 +1,7 @@
 {
   "name": "EpicDeck",
   "author": "EpicDeck",
-  "flags": ["debug"],
+  "flags": [],
   "api_version": 1,
   "publish": {
     "tags": ["epic", "games", "launcher", "download", "legendary"],
