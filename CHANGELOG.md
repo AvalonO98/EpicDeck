@@ -7,6 +7,12 @@
 
 ## [未发布]
 
+## [0.1.8] - 2026-11-02
+
+- **修复「下载并安装」必然失败**：安装流程原先用 `shutil.which("legendary")` 找可执行文件，而插件自带的 Legendary 位于 `data/bin`、不在 `PATH` 里，查找恒为 `None`，于是每次点下载都直接报「Legendary 未安装」。现在统一走 `_resolve()`（绝对路径 → 内置目录 → `PATH`）
+- **修复启动脚本可能指向错误的 Legendary**：生成 Steam 启动脚本时也存在同样的 `which` 问题，虽然靠回落侥幸正确，但若系统里另装过 Legendary 就会用错版本
+- 诊断信息里的「Legendary 路径」改为显示实际解析结果，不再误报「未找到」
+
 ## [0.1.7] - 2026-11-02
 
 - **修正游戏语言**：Game Mode 里 `LANG` 是空的，Legendary 的 locale 探测失败会回落到 en-US，导致中文游戏按英文启动。生成的启动脚本与插件自身调用现在都会注入由 Steam 语言推导出的 POSIX locale（`zh_CN.UTF-8` 等）

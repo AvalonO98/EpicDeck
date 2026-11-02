@@ -472,7 +472,10 @@ class Plugin:
         return {"ok": True, "install_dir": target}
 
     async def _install_streaming(self, app_name: str, install_dir: str):
-        exe = shutil.which(self.legendary.binary)
+        # Must go through _resolve(): the plugin ships its own legendary in
+        # data/bin, which is never on PATH, so shutil.which() always returns
+        # None here and every install would fail with "Legendary 未安装".
+        exe = self.legendary._resolve()
         if exe is None:
             raise LegendaryNotFound("Legendary 未安装")
 
@@ -629,8 +632,10 @@ class Plugin:
         return script
 
     async def _ensure_launcher_script(self, app_name: str):
-        exe = shutil.which(self.legendary.binary)
-        return self._write_launcher_script(app_name, exe)
+        # Let _write_launcher_script resolve the binary itself: it prefers the
+        # bundled copy in data/bin, while shutil.which() only sees PATH and may
+        # pick up an unrelated system-wide legendary.
+        return self._write_launcher_script(app_name)
 
     def _sync_launcher_scripts(self):
         """Refresh wrappers created by older versions (locale + arg forwarding)."""
@@ -880,7 +885,7 @@ class Plugin:
             add(f"  发行版: {distro.name()} {distro.version()}")
         except Exception:
             pass
-        legendary_path = _shutil.which(self.legendary.binary)
+        legendary_path = self.legendary._resolve()
         add(f"  Legendary 路径: {legendary_path or '未找到'}")
         add("")
 
