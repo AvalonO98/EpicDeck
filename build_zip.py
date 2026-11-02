@@ -87,6 +87,11 @@ def main() -> None:
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
 
+    # assets (图标等资源,可选)
+    assets = os.path.join(ROOT, "assets")
+    if os.path.isdir(assets):
+        shutil.copytree(assets, os.path.join(stage, "assets"))
+
     # SECURITY.md / NOTICE (可选但推荐)
     for name in ("SECURITY.md", "NOTICE", "CONTRIBUTING.md"):
         src = os.path.join(ROOT, name)

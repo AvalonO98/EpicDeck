@@ -11,6 +11,8 @@ import {
   staticClasses,
   DialogButton,
   Field,
+  showModal,
+  ConfirmModal,
 } from "@decky/ui";
 import {
   addEventListener,
@@ -71,6 +73,7 @@ const getSettings = callable<[], Record<string, any>>("get_settings");
 const setSetting = callable<[key: string, value: any], { ok: boolean }>("set_setting");
 const getInstallDirOptions = callable<[], { options: string[] }>("get_install_dir_options");
 const checkEnvironment = callable<[], { legendary_installed: boolean; legendary_path: string }>("check_environment");
+const exportLogs = callable<[], { ok: boolean; logs?: string; path?: string; error?: string }>("export_logs");
 
 function fmtSize(bytes: number): string {
   if (!bytes || bytes <= 0) return "—";
@@ -549,6 +552,50 @@ function SettingsView() {
           }}
         >
           重启 Steam 刷新游戏库
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          onClick={async () => {
+            const r = await exportLogs();
+            if (!r.ok) {
+              toaster.toast({ title: "导出失败", body: r.error ?? "" });
+              return;
+            }
+            const logs = r.logs ?? "";
+            const path = r.path ?? "";
+            showModal(
+              <ConfirmModal
+                strTitle="诊断日志"
+                strDescription={
+                  <div>
+                    <div style={{ fontSize: "0.85em", opacity: 0.7, marginBottom: "8px" }}>
+                      日志已导出到:{path || "（写入失败）"}
+                    </div>
+                    <div
+                      style={{
+                        fontFamily: "monospace",
+                        fontSize: "0.8em",
+                        maxHeight: "50vh",
+                        overflowY: "auto",
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-all",
+                        background: "var(--decky-secondary-color, rgba(0,0,0,0.3))",
+                        padding: "8px",
+                        borderRadius: "4px",
+                      }}
+                    >
+                      {logs}
+                    </div>
+                  </div>
+                }
+                strOKButtonText="关闭"
+              />
+            );
+          }}
+        >
+          导出诊断日志
         </ButtonItem>
       </PanelSectionRow>
     </PanelSection>

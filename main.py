@@ -368,3 +368,88 @@ class Plugin:
             "legendary_installed": legendary_path is not None,
             "legendary_path": legendary_path or "",
         }
+
+    # -- logs -------------------------------------------------------------
+    async def export_logs(self):
+        """Collect diagnostic info into a single text blob for troubleshooting."""
+        import datetime
+        import platform
+        import shutil as _shutil
+
+        lines = []
+        add = lines.append
+
+        add("=" * 60)
+        add("EpicDeck 诊断日志")
+        add(f"生成时间: {datetime.datetime.now().isoformat()}")
+        add("=" * 60)
+        add("")
+
+        # 环境信息
+        add("[环境信息]")
+        add(f"  Decky 版本: {getattr(decky, 'DECKY_VERSION', '未知')}")
+        add(f"  插件版本: {getattr(decky, 'DECKY_PLUGIN_VERSION', '未知')}")
+        add(f"  用户: {getattr(decky, 'DECKY_USER', '未知')}")
+        add(f"  Python: {platform.python_version()}")
+        add(f"  系统: {platform.system()} {platform.release()}")
+        try:
+            import distro  # type: ignore
+            add(f"  发行版: {distro.name()} {distro.version()}")
+        except Exception:
+            pass
+        legendary_path = _shutil.which(self.legendary.binary)
+        add(f"  Legendary 路径: {legendary_path or '未找到'}")
+        add("")
+
+        # 登录状态
+        add("[登录状态]")
+        try:
+            status = await self.legendary.auth_status()
+            add(f"  已登录: {status.get('logged_in', False)}")
+            add(f"  账号 ID: {status.get('account_id', '')}")
+            add(f"  显示名: {status.get('display_name', '')}")
+        except Exception as e:
+            add(f"  读取失败: {e}")
+        add("")
+
+        # 插件配置(脱敏)
+        add("[插件配置]")
+        for k, v in sorted(self.config._data.items()):
+            add(f"  {k}: {v!r}")
+        add("")
+
+        # 插件日志
+        add("[插件日志 (最近 200 行)]")
+        log_path = getattr(decky, "DECKY_PLUGIN_LOG", "")
+        if log_path and os.path.isfile(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    tail = f.readlines()[-200:]
+                for line in tail:
+                    add(line.rstrip())
+            except OSError as e:
+                add(f"  读取日志失败: {e}")
+        else:
+            add(f"  日志文件不存在: {log_path or '(路径未提供)'}")
+
+        add("")
+        add("=" * 60)
+        add("(请将以上内容粘贴到 GitHub Issue 或反馈渠道,勿包含敏感信息)")
+        add("=" * 60)
+
+        content = "\n".join(lines)
+
+        # 同时写入用户可访问的导出文件
+        export_path = ""
+        try:
+            export_dir = os.path.join(getattr(decky, "HOME", os.path.expanduser("~")), "epicdeck_logs")
+            os.makedirs(export_dir, exist_ok=True)
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_path = os.path.join(export_dir, f"epicdeck_{stamp}.log")
+            with open(export_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            decky.logger.error("export_logs write: %s", e)
+            export_path = ""
+
+        return {"ok": True, "logs": content, "path": export_path}

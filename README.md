@@ -8,6 +8,7 @@
 - **游戏库**:读取已购 + 已安装游戏列表,显示大小与安装状态
 - **下载/启动/卸载**:实时进度条,支持取消
 - **Steam 集成**:把游戏注册为 Steam 非 Steam 游戏(写入 `shortcuts.vdf`),可重启 Steam 刷新,或通过 `steam://` 启动
+- **诊断日志导出**:设置页「导出诊断日志」按钮,一键收集环境信息、登录状态、配置和插件日志,方便排错
 
 ## 架构
 
@@ -61,6 +62,17 @@ EpicDeck-v0.1.0.zip
     ├── README.md / LICENSE / SECURITY.md / NOTICE
     └── ...
 ```
+
+### 自动发布到 GitHub Releases
+
+仓库已配置 GitHub Actions(`.github/workflows/release.yml`)。推送一个 `v*` 标签即可自动构建并发布:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+CI 会自动:构建前端 → 打包 zip → 创建 Release 并附上 `EpicDeck-v0.1.0.zip`。用户可从 Release 页面下载 zip,再用下方「zip 导入」方式安装。
 
 ### 安装到 Steam Deck(zip 导入)
 
