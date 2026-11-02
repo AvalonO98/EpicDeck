@@ -7,8 +7,9 @@ import sys
 import time
 import asyncio
 import configparser
-import shutil
 import shlex
+import shutil
+from urllib.parse import quote
 
 import decky
 
@@ -27,6 +28,7 @@ from py_modules.epic_api import (
     steam_posix_locale,
 )
 from py_modules.legendary import Legendary, LegendaryError, LegendaryNotFound
+from py_modules.paths import default_games_dir, ensure_dir, free_bytes, pretty_free
 from py_modules.steam import SteamShortcuts, SteamError, open_steam_protocol
 from py_modules.legendary_installer import (
     InstallerError,
@@ -49,6 +51,12 @@ EPIC_LOGIN_URL = (
 _JSON_CODE_RE = re.compile(r'"authorizationCode"\s*:\s*"([0-9a-fA-F]{32})"')
 _URL_CODE_RE = re.compile(r"[?&]code=([0-9a-fA-F]{32})")
 _RAW_CODE_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+# A login session reads the clipboard every other tick; reading it opens an X11
+# connection, so it is not free. Auto-capture waits at least this long after the
+# page opens before pressing Ctrl+A, so it cannot interrupt a password being
+# typed.
+_LOGIN_FIRST_CAPTURE_DELAY = 20.0
 
 
 def extract_authorization_code(raw: str) -> str:
@@ -101,6 +109,7 @@ class Plugin:
         meta = getattr(self, "_meta_task", None)
         if meta is not None and not meta.done():
             meta.cancel()
+        await self._stop_login_session()
         decky.logger.info("EpicDeck unloaded")
         # Decky treats a falsy return as "keep the plugin running".
         return True
@@ -193,6 +202,347 @@ class Plugin:
         except LegendaryError as e:
             return {"ok": False, "error": str(e)}
 
+    async def open_login_browser(self):
+        """Open Epic's login page in Steam's built-in browser.
+
+        Game Mode has no system browser, and sending the user to desktop mode
+        just to copy a code defeats the purpose. Steam's CEF overlay is an
+        ordinary X11 clipboard client, so whatever it copies is readable via
+        py_modules.clipboard once we get the page in front of the user.
+        """
+        url = "steam://openurl/" + EPIC_LOGIN_URL
+        env = os.environ.copy()
+        # plugin_loader is a systemd service: it does not inherit the desktop
+        # session, so pointing it at Steam's X server has to be explicit.
+        env.setdefault("DISPLAY", ":0")
+        env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+        for cmd in (["xdg-open", url], ["steam", url]):
+            exe = shutil.which(cmd[0])
+            if not exe:
+                continue
+            try:
+                await asyncio.create_subprocess_exec(
+                    *cmd, env=env,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                decky.logger.info("opened login page via %s", cmd[0])
+                return {"ok": True, "url": EPIC_LOGIN_URL}
+            except (OSError, PermissionError) as e:
+                decky.logger.warning("%s failed: %s", cmd[0], e)
+        return {"ok": False, "error": "找不到可用的浏览器，请改用手机扫码登录"}
+
+    async def login_with_clipboard(self):
+        """Read an authorization code from the clipboard and log in with it.
+
+        This is the "I already logged in in Steam's browser" button: the user
+        selects the JSON page's content once and the plugin does the rest.
+        """
+        from py_modules.clipboard import read_clipboard
+
+        try:
+            raw = await asyncio.get_running_loop().run_in_executor(None, read_clipboard)
+        except Exception as e:
+            decky.logger.warning("clipboard read failed: %s", e)
+            raw = ""
+
+        if not raw.strip():
+            return {
+                "ok": False,
+                "error": "剪贴板是空的。请在 Steam 浏览器里登录完成后，全选页面内容并复制。",
+            }
+
+        code = extract_authorization_code(raw)
+        if not code:
+            preview = raw.strip()[:80].replace("\n", " ")
+            return {
+                "ok": False,
+                "error": "剪贴板内容里没有授权码（读到：%s…）。请复制登录后显示的那整段内容。" % preview,
+            }
+
+        result = await self.login_with_code(code)
+        if result.get("ok"):
+            decky.logger.info("logged in from clipboard")
+        return result
+
+    # -- hands-off login ---------------------------------------------------
+    #
+    # The user's complaint about the code flow was never the code itself, it was
+    # that copying it on a handheld means fighting the on-screen keyboard.
+    #
+    # Epic only sends the browser back to redirect URLs registered on the
+    # launcher client (legendary's own `epicgames.com/id/api/redirect`), so a
+    # loopback callback is refused and the page simply parks on that JSON —
+    # which is exactly what an earlier version got wrong. Instead of asking the
+    # browser to hand the code to us, the session takes it:
+    #
+    #   begin_login()  -> open Epic's page and start watching
+    #   login_poll()   -> the QAM panel polls this until the code arrives
+    #
+    # Watching means two things: the clipboard (in case the user copies the
+    # text by hand) and, once the screen has been idle for a moment, a
+    # synthetic Ctrl+A / Ctrl+C on whatever Steam is showing. The JSON page's
+    # body is plain text, so that selection *is* the payload, and it lands on
+    # the same X11 clipboard this plugin already reads.
+
+    def _login_page_url(self) -> str:
+        """Epic's sign-in page, returning to the page that yields a code."""
+        return "https://www.epicgames.com/id/login?redirectUrl=%s" % quote(
+            EPIC_LOGIN_URL, safe=""
+        )
+
+    async def _open_in_steam(self, url: str) -> bool:
+        """Hand a URL to Steam's built-in browser (the only one in Game Mode)."""
+        env = os.environ.copy()
+        # plugin_loader is a systemd service: it does not inherit the desktop
+        # session, so pointing it at Steam's X server has to be explicit.
+        env.setdefault("DISPLAY", ":0")
+        env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+        candidates = (["xdg-open", "steam://openurl/" + url], ["steam", "steam://openurl/" + url])
+        for cmd in candidates:
+            exe = shutil.which(cmd[0])
+            if not exe:
+                continue
+            try:
+                await asyncio.create_subprocess_exec(
+                    *cmd,
+                    env=env,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                decky.logger.info("handed URL to Steam via %s", cmd[0])
+                return True
+            except (OSError, PermissionError) as e:
+                decky.logger.warning("%s failed: %s", cmd[0], e)
+        return False
+
+    async def _read_clipboard_async(self) -> str:
+        from py_modules.clipboard import read_clipboard
+
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, read_clipboard)
+        except Exception as e:
+            decky.logger.debug("clipboard read failed: %s", e)
+            return ""
+
+    async def _stop_login_session(self):
+        task = getattr(self, "_login_task", None)
+        self._login_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    def _login_state_or_idle(self) -> dict:
+        state = getattr(self, "_login_state", None)
+        if isinstance(state, dict):
+            return state
+        return {"state": "idle", "message": "", "display_name": "", "auto_copied": False}
+
+    async def begin_login(self):
+        """Start a login session that finishes without any copying."""
+        if self.legendary._resolve() is None:
+            return {"ok": False, "error": "Legendary 未安装,请先点「一键安装 Legendary」"}
+
+        # Already signed in (e.g. the panel was reopened after a successful
+        # login): do not open a browser or a clipboard watcher.
+        try:
+            status = await asyncio.wait_for(self.legendary.auth_status(), timeout=20.0)
+        except Exception as e:
+            decky.logger.debug("begin_login status probe failed: %s", e)
+            status = {}
+        if status.get("logged_in"):
+            self._login_state = {
+                "state": "ok",
+                "message": "",
+                "display_name": status.get("display_name", ""),
+                "auto_copied": False,
+            }
+            return {
+                "ok": True,
+                "already_logged_in": True,
+                "url": "",
+                "opened": False,
+            }
+
+        await self._stop_login_session()
+
+        url = self._login_page_url()
+        # Baseline: whatever is already on the clipboard must not be mistaken
+        # for a fresh code (a previous attempt's JSON often lingers).
+        self._login_baseline = await self._read_clipboard_async()
+        self._login_state = {
+            "state": "waiting",
+            "message": "",
+            "display_name": "",
+            "auto_copied": False,
+        }
+
+        opened = await self._open_in_steam(url)
+        self._login_task = asyncio.create_task(self._run_login_session())
+        decky.logger.info("login session started: opened=%s", opened)
+        return {
+            "ok": True,
+            "url": url,
+            "opened": opened,
+            "message": "" if opened else "没能自动打开浏览器，请手动打开上面的链接",
+        }
+
+    async def _auto_copy_async(self) -> bool:
+        """Select the whole page in Steam's browser and copy it.
+
+        Runs off the event loop: the helper sleeps between key events so
+        Chromium can finish the selection before Ctrl+C arrives.
+        """
+        try:
+            from py_modules import xkey
+        except Exception as e:
+            decky.logger.debug("xkey unavailable: %s", e)
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+            ok = await loop.run_in_executor(None, xkey.select_all_and_copy)
+        except Exception as e:
+            decky.logger.debug("auto copy failed: %s", e)
+            return False
+        if ok:
+            decky.logger.info("sent Ctrl+A / Ctrl+C to Steam's browser")
+        return ok
+
+    async def _run_login_session(self):
+        """Wait for the authorization code to reach the clipboard."""
+        baseline = getattr(self, "_login_baseline", "")
+        start = time.monotonic()
+        deadline = start + 600.0  # 10 minutes is plenty to sign in
+        # Signing in (password, captcha) takes a while; do not start pressing
+        # keys in the middle of it.
+        next_capture = start + _LOGIN_FIRST_CAPTURE_DELAY
+        # Back off between attempts: signing in can take a couple of minutes,
+        # and pressing Ctrl+A once every 8 seconds in that window would be a
+        # nuisance if the screen happened to pause on a half-filled form.
+        capture_gap = 8.0
+
+        last_clip = baseline
+        ticks = 0
+        watch = None
+        try:
+            from py_modules.xkey import ActivityWatch
+
+            watch = ActivityWatch()
+            if not watch.start():
+                # Without raw input events we cannot tell whether somebody is
+                # typing, so the capture stays off and the user finishes by
+                # hand (the waiting screen offers that).
+                decky.logger.warning("activity watch unavailable: auto capture disabled")
+                watch = None
+
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.7)
+                if self._login_state.get("state") in ("ok", "error", "timeout"):
+                    return
+
+                # Reading the clipboard opens an X11 connection, so it runs on
+                # a slow cadence; only a *new* value can carry a fresh code.
+                ticks += 1
+                raw = ""
+                if ticks % 2 == 0:
+                    text = await self._read_clipboard_async()
+                    if text and text != last_clip:
+                        last_clip = text
+                        if extract_authorization_code(text):
+                            raw = text
+
+                # Nobody is typing and Epic's code page should be up: take the
+                # page ourselves. Ctrl+A while a password field is focused
+                # would select (and Ctrl+C would copy) it, which is why this
+                # waits for a quiet screen instead of running on a timer.
+                if not raw and watch is not None and time.monotonic() >= next_capture:
+                    capture_gap = min(30.0, capture_gap * 1.5)
+                    next_capture = time.monotonic() + capture_gap
+                    if watch.idle_seconds() >= 6.0 and await self._auto_copy_async():
+                        await asyncio.sleep(0.6)
+                        text = await self._read_clipboard_async()
+                        if text and extract_authorization_code(text):
+                            raw = text
+                            last_clip = text
+                            self._login_state["auto_copied"] = True
+
+                if not raw:
+                    continue
+
+                code = extract_authorization_code(raw)
+                if not code:
+                    continue
+
+                self._login_state["state"] = "finishing"
+                decky.logger.info("authorization code captured")
+                result = await self.login_with_code(code)
+                self._login_baseline = ""
+                if result.get("ok"):
+                    self._login_state = {
+                        "state": "ok",
+                        "message": "",
+                        "display_name": result.get("display_name", ""),
+                        "auto_copied": self._login_state.get("auto_copied", False),
+                    }
+                else:
+                    self._login_state = {
+                        "state": "error",
+                        "message": result.get("error", "登录失败"),
+                        "display_name": "",
+                        "auto_copied": self._login_state.get("auto_copied", False),
+                    }
+                return
+
+            self._login_state = {
+                "state": "timeout",
+                "message": "等待登录超时，请重试。",
+                "display_name": "",
+                "auto_copied": self._login_state.get("auto_copied", False),
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # a broken session must never kill the plugin
+            decky.logger.error("login session crashed: %s", e)
+            self._login_state = {
+                "state": "error",
+                "message": "登录过程出错: %s" % e,
+                "display_name": "",
+                "auto_copied": False,
+            }
+        finally:
+            if watch is not None:
+                watch.stop()
+            # The identity check keeps a slow teardown from clobbering the
+            # state of a session that was already restarted behind it.
+            if getattr(self, "_login_task", None) is asyncio.current_task():
+                self._login_task = None
+                self._login_baseline = ""
+
+    async def login_poll(self):
+        """Current state of the running login session.
+
+        Read-only: the session coroutine owns its own lifecycle, so polling
+        never races with it. `ok` mirrors the state for callers that only care
+        about the outcome.
+        """
+        state = dict(self._login_state_or_idle())
+        state["ok"] = state.get("state") == "ok"
+        return state
+
+    async def cancel_login(self):
+        await self._stop_login_session()
+        self._login_state = {
+            "state": "idle",
+            "message": "",
+            "display_name": "",
+            "auto_copied": False,
+        }
+        return {"ok": True}
+
     # -- library ----------------------------------------------------------
     async def list_games(self):
         try:
@@ -223,15 +573,18 @@ class Plugin:
 
         # Read shortcuts.vdf once instead of one `is_in_steam` callable per row
         # (the old per-row call meant 138 IPC round-trips on every render).
+        # Keyed by the wrapper script name: AppName is the display title now.
         try:
-            in_steam = {s.app_name for s in self.steam.list_shortcuts()}
+            in_steam = {
+                os.path.basename(s.exe) for s in self.steam.list_shortcuts() if s.exe
+            }
         except Exception as e:
             decky.logger.warning("shortcuts read failed: %s", e)
             in_steam = set()
 
         for g in games:
             g["playtime_seconds"] = playtime.get(g["app_name"], 0)
-            g["in_steam"] = g["app_name"] in in_steam
+            g["in_steam"] = ("%s.sh" % g["app_name"]) in in_steam
             seen = first_seen.get(g["app_name"])
             if not isinstance(seen, int):
                 first_seen[g["app_name"]] = now
@@ -446,12 +799,22 @@ class Plugin:
             return {"ok": False, "error": "该游戏正在下载中"}
 
         # Per-game override wins over the global default set in Settings.
-        target = (install_dir or "").strip() or self.config.get("install_dir", "")
+        target = (install_dir or "").strip() or (self.config.get("install_dir") or "").strip()
         if target:
             if not os.path.isdir(target):
                 return {"ok": False, "error": "安装目录不存在: %s" % target}
             if not os.access(target, os.W_OK):
                 return {"ok": False, "error": "安装目录不可写: %s" % target}
+        else:
+            # Nothing configured: use the same root the settings dropdown
+            # advertises. Leaving it to Legendary's own default looked fine but
+            # let the UI (which showed ~) drift away from the real target
+            # (~/Games), and a missing default dir made the very first install
+            # fail on a machine that had never run Legendary before.
+            target, err = ensure_dir(default_games_dir())
+            if err:
+                return {"ok": False, "error": err}
+            decky.logger.info("install %s: no dir configured, using %s", app_name, target)
 
         async def _run():
             try:
@@ -459,7 +822,7 @@ class Plugin:
                 await self._install_streaming(app_name, target)
                 await decky.emit("install_progress", app_name, "done", 100.0, "")
                 if self.config.get("auto_add_to_steam"):
-                    await self._add_to_steam(app_name)
+                    await self._add_to_steam(app_name, await self._installed_title(app_name))
             except asyncio.CancelledError:
                 await decky.emit("install_progress", app_name, "cancelled", 0.0, "")
                 raise
@@ -581,9 +944,78 @@ class Plugin:
         return {"ok": True}
 
     # -- steam integration ------------------------------------------------
-    async def _add_to_steam(self, app_name: str):
+    async def _add_to_steam(self, app_name: str, title: str = ""):
         exe = await self._ensure_launcher_script(app_name)
-        return self.steam.add_game(app_name, exe)
+        return self.steam.add_game(app_name, exe, title=title, icon=self._steam_icon())
+
+    def _steam_icon(self) -> str:
+        """Absolute path to the icon Steam should show for our shortcuts.
+
+        Without one, Steam falls back to extracting the icon out of the target
+        executable — and our target is a shell script, which has none. That
+        extraction runs while the non-Steam page renders, so a real image file
+        keeps that page snappy and gives the entries a recognisable icon.
+        """
+        try:
+            base = (
+                getattr(decky, "DECKY_PLUGIN_DIR", "")
+                or os.path.dirname(os.path.abspath(__file__))
+            )
+            path = os.path.join(base, "assets", "icon.png")
+            return path if os.path.isfile(path) else ""
+        except Exception:
+            return ""
+
+    async def _installed_title(self, app_name: str) -> str:
+        """Title to show in Steam's library for an installed game."""
+        try:
+            for item in await self.legendary.list_installed():
+                if item.get("app_name") == app_name:
+                    return item.get("title") or ""
+        except LegendaryError:
+            pass
+        return ""
+
+    async def sync_installed_to_steam(self, app_name: str = ""):
+        """Register installed Epic games as non-Steam shortcuts.
+
+        Writes into Steam's own shortcuts.vdf, i.e. the exact same place the
+        "Add a Non-Steam Game" dialog writes, so the entries show up under
+        the library's non-Steam filter. Steam only reads that file at startup,
+        hence the reminder in the response.
+        """
+        try:
+            if app_name:
+                targets = [
+                    {"app_name": app_name, "title": await self._installed_title(app_name)}
+                ]
+            else:
+                targets = await self.legendary.list_installed()
+        except LegendaryError as e:
+            return {"ok": False, "error": str(e)}
+
+        if not targets:
+            return {"ok": True, "added": 0, "failed": [], "note": "没有已安装的 Epic 游戏"}
+
+        added, failed = 0, []
+        for item in targets:
+            name = item.get("app_name") or ""
+            if not name:
+                continue
+            try:
+                await self._add_to_steam(name, item.get("title") or "")
+                added += 1
+            except Exception as e:
+                decky.logger.error("sync_to_steam %s: %s", name, e)
+                failed.append({"title": item.get("title") or name, "error": str(e)})
+
+        decky.logger.info("sync_to_steam: %d added, %d failed", added, len(failed))
+        return {
+            "ok": True,
+            "added": added,
+            "failed": failed,
+            "note": "重启 Steam 后才会出现在库中（库 → 非 Steam 游戏）",
+        }
 
     def _launcher_dir(self):
         base = (
@@ -592,6 +1024,14 @@ class Plugin:
             or os.path.join(decky.HOME, ".epicdeck")
         )
         return os.path.join(base, "launchers")
+
+    def _launcher_script_path(self, app_name: str) -> str:
+        """Path of the wrapper Steam launches for this game.
+
+        `_write_launcher_script` uses the same name, so this doubles as the
+        stable key when looking a shortcut up in shortcuts.vdf.
+        """
+        return os.path.join(self._launcher_dir(), "%s.sh" % app_name)
 
     def _write_launcher_script(self, app_name: str, exe: str = None) -> str:
         """(Re)write the wrapper Steam points at for this game.
@@ -654,6 +1094,13 @@ class Plugin:
                 decky.logger.info("launcher refreshed for %s", app_name)
             except Exception as e:
                 decky.logger.warning("launcher refresh failed for %s: %s", entry.exe, e)
+
+        try:
+            patched = self.steam.backfill_icons(launchers, self._steam_icon())
+            if patched:
+                decky.logger.info("shortcut icon backfilled for %d entry(ies)", patched)
+        except Exception as e:
+            decky.logger.warning("icon backfill skipped: %s", e)
 
     # -- launch options ---------------------------------------------------
     def _legendary_ini_args(self, app_name: str) -> str:
@@ -727,20 +1174,22 @@ class Plugin:
 
     async def add_to_steam(self, app_name: str):
         try:
-            appid = await self._add_to_steam(app_name)
+            appid = await self._add_to_steam(app_name, await self._installed_title(app_name))
             return {"ok": True, "appid": appid}
         except (SteamError, LegendaryError) as e:
             return {"ok": False, "error": str(e)}
 
     async def remove_from_steam(self, app_name: str):
         try:
-            self.steam.remove_game(app_name)
+            self.steam.remove_by_exe(self._launcher_script_path(app_name))
             return {"ok": True}
         except SteamError as e:
             return {"ok": False, "error": str(e)}
 
     async def is_in_steam(self, app_name: str):
-        return {"in_steam": self.steam.find_game(app_name) is not None}
+        return {
+            "in_steam": self.steam.find_by_exe(self._launcher_script_path(app_name)) is not None
+        }
 
     async def refresh_steam(self):
         try:
@@ -750,7 +1199,7 @@ class Plugin:
             return {"ok": False, "error": str(e)}
 
     async def launch_steam_game(self, app_name: str):
-        entry = self.steam.find_game(app_name)
+        entry = self.steam.find_by_exe(self._launcher_script_path(app_name))
         if not entry:
             return {"ok": False, "error": "该游戏尚未添加到 Steam"}
         try:
@@ -770,6 +1219,11 @@ class Plugin:
     async def get_install_dir_options(self):
         """Install roots the user can pick from, annotated with free space.
 
+        The first entry is the *real* default (``~/Games`` unless Legendary's
+        config.ini says otherwise) rather than the home directory, so the
+        selected default is also the path that ends up on the install command
+        line. `current` never comes back empty for the same reason.
+
         The same SD card can be reachable through several paths
         (`/run/media/<label>`, `/run/media/<user>/<label>`, symlinked mounts),
         so candidates are normalised with realpath and de-duplicated, and only
@@ -777,6 +1231,7 @@ class Plugin:
         is not somewhere you want games installed.
         """
         home = os.path.expanduser("~")
+        default_dir = os.path.realpath(default_games_dir())
 
         mount_points = []
         try:
@@ -793,29 +1248,52 @@ class Plugin:
 
         seen = set()
         options = []
-        for path in [home] + mount_points:
+        for path, is_default in [(default_dir, True)] + [(mp, False) for mp in mount_points]:
             real = os.path.realpath(path)
             if real in seen:
                 continue
-            if path != home and not os.path.ismount(path) and not os.path.ismount(real):
+            if not is_default and not os.path.ismount(path) and not os.path.ismount(real):
                 continue
             seen.add(real)
 
-            try:
-                free = shutil.disk_usage(real).free
-                free_label = "%0.1f GB 可用" % (free / 1024 / 1024 / 1024)
-            except OSError:
-                free = 0
-                free_label = "空间未知"
+            free = free_bytes(real)
+            free_label = pretty_free(free)
 
-            if path == home:
+            if not is_default:
+                label = "%s · %s" % (os.path.basename(real.rstrip("/")), free_label)
+            elif real == os.path.realpath(home) or real.startswith(os.path.realpath(home) + os.sep):
                 label = "内置存储 · " + free_label
             else:
-                label = "%s · %s" % (os.path.basename(real.rstrip("/")), free_label)
-            options.append({"path": real, "label": label, "free": free})
+                label = "默认位置 · " + free_label
+            options.append({"path": real, "label": label, "free": free, "is_default": is_default})
 
-        options.sort(key=lambda o: (o["path"] != home, o["path"]))
-        return {"options": options, "current": self.config.get("install_dir", "")}
+        options.sort(key=lambda o: (not o["is_default"], o["path"]))
+        return {"options": options, "current": (self.config.get("install_dir") or "").strip() or default_dir}
+
+    async def resolve_install_dir(self, path: str = ""):
+        """Validate a hand-typed install path and create it if missing.
+
+        Called from the UI before saving, so a typo is reported here instead of
+        failing later with a half-finished download.
+        """
+        resolved, err = ensure_dir((path or "").strip() or default_games_dir())
+        if err:
+            return {"ok": False, "error": err}
+        return {"ok": True, "path": resolved, "free": free_bytes(resolved)}
+
+    async def complete_first_run(self, install_dir: str = ""):
+        """Persist the folder chosen in the first-run prompt.
+
+        An empty string means "just use the default", and the resolved default
+        is written to config anyway: that way a later edit of Legendary's own
+        config.ini can never silently relocate an existing library.
+        """
+        resolved, err = ensure_dir((install_dir or "").strip() or default_games_dir())
+        if err:
+            return {"ok": False, "error": err}
+        self.config.update({"install_dir": resolved, "first_run_done": True})
+        decky.logger.info("first run: install dir set to %s", resolved)
+        return {"ok": True, "install_dir": resolved}
 
     # -- environment ------------------------------------------------------
     async def check_environment(self):

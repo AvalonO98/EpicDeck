@@ -328,6 +328,36 @@ class SteamShortcuts:
         os.replace(tmp, path)
 
     # -- public API -------------------------------------------------------
+    def backfill_icons(self, launcher_dir: str, icon: str) -> int:
+        """Give shortcuts written by older versions an icon if they lack one.
+
+        Steam resolves a shortcut icon by extracting it from the target when the
+        `icon` field is empty; our targets are shell scripts, so that lookup is
+        both wasted work on the non-Steam page and a missing picture. Writing
+        the field once fixes both.
+        """
+        if not icon or not os.path.isfile(icon):
+            return 0
+        path = self._shortcuts_path()
+        if not path:
+            return 0
+        target = os.path.realpath(launcher_dir)
+        data = self._load_tree(path)
+        changed = 0
+        for node in (data.get("shortcuts") or {}).values():
+            if not isinstance(node, dict):
+                continue
+            exe = _unquote(node.get("Exe"))
+            if not exe or os.path.realpath(os.path.dirname(exe)) != target:
+                continue
+            if str(node.get("icon") or ""):
+                continue
+            node["icon"] = icon
+            changed += 1
+        if changed:
+            self._save_tree(path, data)
+        return changed
+
     def list_shortcuts(self):
         path = self._shortcuts_path()
         if not path:
@@ -351,27 +381,42 @@ class SteamShortcuts:
         return entries
 
     def add_game(self, app_name: str, exe: str, start_dir: str = "",
-                 icon: str = "", launch_options: str = "", tags=None):
-        """Add or update a non-Steam game. Returns the unsigned appid."""
+                 icon: str = "", launch_options: str = "", tags=None,
+                 title: str = ""):
+        """Add or update a non-Steam game. Returns the unsigned appid.
+
+        `app_name` is Legendary's opaque id (the wrapper script is named after
+        it); `title` is what the library should display. Steam derives a
+        shortcut's identity from (exe, AppName), so passing the id as the
+        display name would put a 32-character hash in the user's library.
+        """
         path = self._shortcuts_path()
         if not path:
             raise SteamError(
                 "找不到 Steam 用户数据目录。请先启动过 Steam 游戏模式。"
             )
+        display = (title or "").strip() or app_name
         data = self._load_tree(path)
         shortcuts = data.setdefault("shortcuts", {})
 
         exe_q = _quote(exe)
         start_dir_q = _quote(start_dir or os.path.dirname(exe))
-        appid = make_appid(_unquote(exe_q), app_name)
+        target_exe = _unquote(exe_q)
+        appid = make_appid(target_exe, display)
 
-        # Update an existing entry with the same display name instead of
-        # appending a duplicate.
+        # Match on Exe first: the wrapper path comes from app_name and never
+        # changes, while AppName follows the localised title and can be edited
+        # by the user later.
         target_key = None
         for key, node in shortcuts.items():
-            if isinstance(node, dict) and str(node.get("AppName", "")) == app_name:
+            if isinstance(node, dict) and _unquote(node.get("Exe")) == target_exe:
                 target_key = key
                 break
+        if target_key is None:
+            for key, node in shortcuts.items():
+                if isinstance(node, dict) and str(node.get("AppName", "")) == display:
+                    target_key = key
+                    break
 
         if target_key is None:
             numeric = []
@@ -395,10 +440,16 @@ class SteamShortcuts:
         # Keep whatever Steam or another plugin already stored, only touch the
         # fields we own.
         entry["appid"] = appid
-        entry["AppName"] = app_name
+        entry["AppName"] = display
         entry["Exe"] = exe_q
         entry["StartDir"] = start_dir_q
-        entry.setdefault("icon", icon or "")
+        # An icon we supply must win over the empty placeholder earlier
+        # versions wrote, otherwise Steam keeps trying to extract one from the
+        # launcher script on every library render.
+        if icon:
+            entry["icon"] = icon
+        else:
+            entry.setdefault("icon", "")
         entry.setdefault("ShortcutPath", "")
         entry["LaunchOptions"] = launch_options or ""
         entry.setdefault("IsHidden", 0)
@@ -410,6 +461,9 @@ class SteamShortcuts:
         entry.setdefault("DevkitOverrideAppID", 0)
         entry.setdefault("LastPlayTime", 0)
         entry.setdefault("FlatpakAppID", "")
+        # Steam writes this itself; without it the entry still shows, but the
+        # sort key falls back to AppName and the library order can look odd.
+        entry.setdefault("sortas", "")
         if tag_map:
             entry["tags"] = tag_map
         else:
@@ -444,6 +498,43 @@ class SteamShortcuts:
             (e for e in self.list_shortcuts() if e.app_name == app_name),
             None,
         )
+
+    def find_by_exe(self, exe: str):
+        """Look a shortcut up by its executable — for us, the wrapper script.
+
+        The wrapper path is derived from Legendary's app_name and is stable,
+        which makes it a better key than AppName (the localised title).
+        """
+        target = os.path.realpath(_unquote(exe)) if exe else ""
+        if not target:
+            return None
+        for entry in self.list_shortcuts():
+            if entry.exe and os.path.realpath(entry.exe) == target:
+                return entry
+        return None
+
+    def remove_by_exe(self, exe: str) -> bool:
+        target = os.path.realpath(_unquote(exe)) if exe else ""
+        if not target:
+            return False
+        path = self._shortcuts_path()
+        if not path:
+            return False
+        data = self._load_tree(path)
+        shortcuts = data.setdefault("shortcuts", {})
+        keep = []
+        removed = False
+        for key in sorted(shortcuts, key=lambda k: int(str(k)) if str(k).isdigit() else 0):
+            node = shortcuts[key]
+            if isinstance(node, dict) and os.path.realpath(_unquote(node.get("Exe"))) == target:
+                removed = True
+                continue
+            keep.append(node)
+        if not removed:
+            return False
+        data["shortcuts"] = {str(i): node for i, node in enumerate(keep)}
+        self._save_tree(path, data)
+        return True
 
 
 def open_steam_protocol(uri: str):

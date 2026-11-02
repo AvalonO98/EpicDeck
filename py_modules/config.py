@@ -15,10 +15,17 @@ import tempfile
 
 
 DEFAULTS = {
+    # Absolute path games are installed under. Empty means "not chosen yet";
+    # the backend then falls back to py_modules.paths.default_games_dir().
     "install_dir": "",
+    # Set once the first-run prompt (choose a download folder) is answered, so
+    # it is shown exactly once per install.
+    "first_run_done": False,
     "legendary_path": "legendary",
     "refresh_token_managed": True,
-    "auto_add_to_steam": False,
+    # Add to Steam right after a successful install. On by default: a game the
+    # user cannot see in their library looks like a failed install.
+    "auto_add_to_steam": True,
     # app_name -> unix timestamp of when it first appeared in the library.
     # Epic's API has no "date added", so we track it ourselves for sorting.
     "first_seen": {},

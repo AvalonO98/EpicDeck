@@ -13,11 +13,13 @@ authorization page in a browser (web-style login) and stores tokens locally.
 """
 
 import asyncio
+import datetime
 import json
 import os
 import re
 import shlex
 import shutil
+import time
 
 
 class LegendaryError(Exception):
@@ -56,6 +58,28 @@ def _loads_lenient(text: str):
             continue
 
     raise LegendaryError("无法解析 legendary 输出: %s" % stripped[:200])
+
+
+def _expiry_ok(stamp, grace: float = 0.0) -> bool:
+    """Is an ISO-8601 timestamp from ``user.json`` still in the future?
+
+    Legendary writes ``2027-11-02T11:43:20.190Z``; Python 3.11 parses the
+    trailing ``Z``, older builds do not, so normalise it first. Unknown or
+    malformed values count as "expired" — never claim a session we cannot
+    verify.
+    """
+    if not stamp:
+        return False
+    text = str(stamp).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        when = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return when.timestamp() - grace > time.time()
 
 
 class Legendary:
@@ -143,28 +167,76 @@ class Legendary:
     async def auth_status(self):
         """Return dict describing auth state: logged_in, account_id, display_name.
 
-        Legendary 0.21.x exposes a non-interactive `status --json` command that
-        reports the current account. (`auth --status` does not exist and would
-        drop into the interactive login flow.)
+        Read from legendary's own ``user.json`` instead of shelling out to
+        ``legendary status``: that command refreshes the session over the
+        network and took 26 seconds on a bad connection (it also asks
+        api.legendary.gl about updates, which times out here), while the
+        plugin's UI gives up after 15 — a signed-in user was shown the login
+        screen. The stored file already carries everything the UI needs.
         """
-        try:
-            out = await self._run_json("status", timeout=15.0)
-        except LegendaryError:
+        session = self.local_session()
+        if session is None:
+            # Legendary writes this file as part of logging in; no file means
+            # no session. Do not fall back to the CLI: that is where the slow
+            # path lived, and it never knows more than the file does.
             return {"logged_in": False, "account_id": "", "display_name": ""}
-        if not isinstance(out, dict):
-            return {"logged_in": False, "account_id": "", "display_name": ""}
-        account = out.get("account", "")
-        logged_in = bool(account) and account != "<not logged in>"
+
+        # A refresh token is what keeps the session alive; the access token is
+        # short-lived and appears "expired" for most of a normal session.
+        account_id = str(session.get("account_id") or "")
+        display_name = str(session.get("displayName") or "")
+        logged_in = bool(
+            session.get("refresh_token")
+            and _expiry_ok(session.get("refresh_expires_at"), grace=60.0)
+            and account_id
+        )
         return {
             "logged_in": logged_in,
-            "account_id": account if logged_in else "",
-            "display_name": account if logged_in else "",
+            "account_id": account_id if logged_in else "",
+            "display_name": display_name if logged_in else "",
         }
+
+    def config_dir(self) -> str:
+        if self.env_prefix:
+            return self.env_prefix
+        override = os.environ.get("LEGENDARY_CONFIG_PATH")
+        if override:
+            return override
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        return os.path.join(base, "legendary")
+
+    def local_session(self):
+        """Parse ``user.json`` without touching the network.
+
+        Returns ``None`` when the file is missing or unreadable, so callers can
+        tell "not logged in" apart from "cannot read the store".
+        """
+        path = os.path.join(self.config_dir(), "user.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
 
     async def auth_logout(self):
         return await self._run("auth", "--delete")
 
     # -- library ----------------------------------------------------------
+    async def list_installed(self):
+        """Return Legendary's own install records (fast, no network calls).
+
+        A broken manifest must never hide the whole library, so failures
+        degrade to an empty list instead of raising.
+        """
+        try:
+            inst = await self._run_json("list-installed", timeout=45.0)
+        except LegendaryError:
+            return []
+        if isinstance(inst, dict):
+            inst = inst.get("games", [])
+        return [item for item in (inst or []) if isinstance(item, dict)]
+
     async def list_games(self, include_metadata: bool = True):
         """Return the owned game library, merged with install state.
 
@@ -180,17 +252,8 @@ class Legendary:
         if isinstance(games, dict):
             games = games.get("games", [])
 
-        installed = {}
-        try:
-            inst = await self._run_json("list-installed", timeout=45.0)
-            if isinstance(inst, dict):
-                inst = inst.get("games", [])
-            for item in inst or []:
-                if item.get("app_name"):
-                    installed[item["app_name"]] = item
-        except LegendaryError:
-            # A broken install manifest should never hide the whole library.
-            pass
+        installed = await self.list_installed()
+        by_name = {item["app_name"]: item for item in installed if item.get("app_name")}
 
         result = []
         for g in games or []:
@@ -198,7 +261,7 @@ class Legendary:
             app_name = g.get("app_name")
             if not app_name:
                 continue
-            ins = installed.get(app_name) or {}
+            ins = by_name.get(app_name) or {}
             result.append(
                 {
                     "app_name": app_name,

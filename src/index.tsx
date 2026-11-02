@@ -13,6 +13,7 @@ import {
   DialogButton,
   Field,
   Focusable,
+  GamepadButton,
   showModal,
   ConfirmModal,
 } from "@decky/ui";
@@ -65,6 +66,7 @@ interface InstallDirOption {
   path: string;
   label: string;
   free: number;
+  is_default?: boolean;
 }
 
 interface InstallProgress {
@@ -76,8 +78,34 @@ interface InstallProgress {
 }
 
 const authStatus = callable<[], AuthStatus>("auth_status");
-const login = callable<[], { ok: boolean; error?: string }>("login");
 const logout = callable<[], { ok: boolean; error?: string }>("logout");
+// A login attempt is a session, not a single call: begin_login opens Epic's page
+// and starts reading the result off it, then login_poll reports the outcome
+// while the user is still in the browser.
+const beginLogin = callable<
+  [],
+  {
+    ok: boolean;
+    url?: string;
+    opened?: boolean;
+    message?: string;
+    already_logged_in?: boolean;
+    error?: string;
+  }
+>("begin_login");
+const loginPoll = callable<
+  [],
+  { state: string; message: string; display_name: string; auto_copied: boolean; ok: boolean }
+>("login_poll");
+const cancelLogin = callable<[], { ok: boolean }>("cancel_login");
+const loginWithClipboard = callable<
+  [],
+  { ok: boolean; display_name?: string; account_id?: string; error?: string }
+>("login_with_clipboard");
+const syncInstalledToSteam = callable<
+  [app_name: string],
+  { ok: boolean; added?: number; failed?: { title: string; error: string }[]; note?: string; error?: string }
+>("sync_installed_to_steam");
 const getLoginUrl = callable<[], { ok: boolean; url: string }>("get_login_url");
 const loginWithCode = callable<[raw: string], {
   ok: boolean;
@@ -110,6 +138,13 @@ const refreshSteam = callable<[], { ok: boolean; note?: string; error?: string }
 const getSettings = callable<[], Record<string, any>>("get_settings");
 const setSetting = callable<[key: string, value: any], { ok: boolean }>("set_setting");
 const getInstallDirOptions = callable<[], { options: InstallDirOption[]; current: string }>("get_install_dir_options");
+const resolveInstallDir = callable<[path: string], { ok: boolean; path?: string; free?: number; error?: string }>(
+  "resolve_install_dir"
+);
+const completeFirstRun = callable<
+  [install_dir: string],
+  { ok: boolean; install_dir?: string; error?: string }
+>("complete_first_run");
 const checkEnvironment = callable<[], { legendary_installed: boolean; legendary_path: string }>("check_environment");
 const installLegendary = callable<[], { ok: boolean; path?: string; version?: string; error?: string }>("install_legendary");
 const exportLogs = callable<[], { ok: boolean; logs?: string; path?: string; error?: string }>("export_logs");
@@ -212,13 +247,38 @@ function QrImage({ url }: { url: string }) {
   );
 }
 
-function LoginView({ onLogin, onLoggedIn }: { onLogin: () => void; onLoggedIn: () => void }) {
+// The QAM unmounts whenever Steam's browser takes over the screen, which would
+// otherwise reset this screen and make it look like nothing is happening. Keep
+// the live attempt on `window` so reopening the panel re-attaches to it.
+const LOGIN_UI_KEY = "__epicdeckLoginUI";
+
+type LoginSession = { state: string; message: string; display_name: string };
+
+function readStoredLoginSession(): LoginSession | null {
+  const stored = (window as any)[LOGIN_UI_KEY] as LoginSession | undefined;
+  return stored && stored.state === "waiting" ? stored : null;
+}
+
+function storeLoginSession(session: LoginSession | null) {
+  if (session && session.state === "waiting") {
+    (window as any)[LOGIN_UI_KEY] = session;
+  } else {
+    delete (window as any)[LOGIN_UI_KEY];
+  }
+}
+
+function LoginView({ onLoggedIn }: { onLoggedIn: () => void }) {
   const [showCode, setShowCode] = useState<boolean>(false);
   const [loginUrl, setLoginUrl] = useState<string>(EPIC_LOGIN_URL);
   const [code, setCode] = useState<string>("");
-  const [busy, setBusy] = useState<boolean>(false);
+  const [busy, setBusy] = useState<string>("");
   const [msg, setMsg] = useState<string>("");
-  const [browserBusy, setBrowserBusy] = useState<boolean>(false);
+  // null = no attempt running; "waiting" = browser open, plugin is listening.
+  const [session, setSession] = useState<LoginSession | null>(readStoredLoginSession);
+
+  useEffect(() => {
+    storeLoginSession(session);
+  }, [session]);
 
   useEffect(() => {
     if (!showCode) return;
@@ -241,7 +301,7 @@ function LoginView({ onLogin, onLoggedIn }: { onLogin: () => void; onLoggedIn: (
       setMsg("请先粘贴授权码");
       return;
     }
-    setBusy(true);
+    setBusy("code");
     setMsg("正在登录…");
     try {
       const r = await loginWithCode(raw);
@@ -257,22 +317,98 @@ function LoginView({ onLogin, onLoggedIn }: { onLogin: () => void; onLoggedIn: (
     } catch (e) {
       setMsg("登录出错:" + String(e));
     } finally {
-      setBusy(false);
+      setBusy("");
     }
   };
 
-  const doBrowserLogin = async () => {
-    setBrowserBusy(true);
+  // Hands-off login: the backend captures the code from the page itself, so all
+  // this screen has to do is poll for the outcome. Restored sessions (panel
+  // reopened after the browser closed it) resume polling here.
+  useEffect(() => {
+    if (!session || session.state !== "waiting") return;
+    let stopped = false;
+    const tick = async () => {
+      try {
+        const r = await loginPoll();
+        if (stopped) return;
+        if (r.ok) {
+          stopped = true;
+          setSession({ state: "ok", message: "", display_name: r.display_name });
+          toaster.toast({ title: "登录成功", body: r.display_name || "" });
+          onLoggedIn();
+        } else if (r.state === "error" || r.state === "timeout") {
+          stopped = true;
+          setSession({ state: r.state, message: r.message, display_name: "" });
+        }
+      } catch (e) {
+        console.log("EpicDeck: login poll failed", e);
+      }
+    };
+    void tick();
+    const timer = setInterval(tick, 1500);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [session?.state]);
+
+  const startLogin = async () => {
+    setBusy("open");
+    setMsg("");
+    setSession(null);
     try {
-      onLogin();
+      const r = await beginLogin();
+      if (!r.ok) {
+        setMsg(r.error ?? "无法开始登录");
+        return;
+      }
+      if (r.already_logged_in) {
+        toaster.toast({ title: "已经登录", body: "不需要重复登录" });
+        onLoggedIn();
+        return;
+      }
+      setLoginUrl(r.url || EPIC_LOGIN_URL);
+      setSession({ state: "waiting", message: r.message ?? "", display_name: "" });
+    } catch (e) {
+      setMsg("启动登录失败:" + String(e));
     } finally {
-      setBrowserBusy(false);
+      setBusy("");
+    }
+  };
+
+  const stopLogin = async () => {
+    setSession(null);
+    try {
+      await cancelLogin();
+    } catch (e) {
+      console.log("EpicDeck: cancel login failed", e);
+    }
+  };
+
+  // The code is sitting in the clipboard after step 3; the backend reads X11
+  // CLIPBOARD itself, so the user never has to paste it anywhere.
+  const loginFromClipboard = async () => {
+    setBusy("clip");
+    setMsg("正在读取剪贴板…");
+    try {
+      const r = await loginWithClipboard();
+      if (r.ok) {
+        setMsg("");
+        toaster.toast({ title: "登录成功", body: r.display_name || "" });
+        onLoggedIn();
+      } else {
+        setMsg(r.error ?? "登录失败");
+      }
+    } catch (e) {
+      setMsg("读取失败:" + String(e));
+    } finally {
+      setBusy("");
     }
   };
 
   if (showCode) {
     return (
-      <PanelSection title="授权码登录">
+      <PanelSection title="手机扫码登录">
         <PanelSectionRow>
           <div style={{ padding: "4px 0 2px", lineHeight: 1.5 }}>
             1. 用手机或电脑打开下面的链接(也可扫码),登录你的 Epic 账号
@@ -309,13 +445,13 @@ function LoginView({ onLogin, onLoggedIn }: { onLogin: () => void; onLoggedIn: (
             label="授权码"
             value={code}
             onChange={(e) => setCode(e.target.value)}
-            disabled={busy}
+            disabled={!!busy}
             bShowClearAction
           />
         </PanelSectionRow>
         <PanelSectionRow>
-          <ButtonItem layout="below" onClick={submitCode} disabled={busy}>
-            {busy ? "正在登录…" : "完成登录"}
+          <ButtonItem layout="below" onClick={submitCode} disabled={!!busy}>
+            {busy === "code" ? "正在登录…" : "完成登录"}
           </ButtonItem>
         </PanelSectionRow>
         {msg ? (
@@ -331,7 +467,7 @@ function LoginView({ onLogin, onLoggedIn }: { onLogin: () => void; onLoggedIn: (
               setMsg("");
               setCode("");
             }}
-            disabled={busy}
+            disabled={!!busy}
           >
             返回
           </ButtonItem>
@@ -340,21 +476,103 @@ function LoginView({ onLogin, onLoggedIn }: { onLogin: () => void; onLoggedIn: (
     );
   }
 
+  // The browser is open on top of the QAM and the plugin is reading the code
+  // off the result page, so this screen only has to wait.
+  if (session && session.state === "waiting") {
+    return (
+      <PanelSection title="等待登录完成">
+        <PanelSectionRow>
+          <div style={{ padding: "10px 0", lineHeight: 1.6 }}>
+            在弹出的 Steam 窗口里登录 Epic 账号就行，<b>不用复制，也不用回来粘贴</b>。
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ padding: "2px 0 4px", fontSize: "0.85em", lineHeight: 1.55, opacity: 0.75 }}>
+            登录成功后浏览器会停在一个显示 JSON 的页面（<code>authorizationCode</code>
+            ），那就是成功了，插件会自己把码取走并完成登录。看到这个页面后按 <b>B</b> 关掉浏览器即可。
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ padding: "2px 0", fontSize: "0.9em", opacity: 0.7 }}>
+            正在等待登录…（约 20 秒后开始自动读取）
+          </div>
+        </PanelSectionRow>
+        {session.message ? (
+          <PanelSectionRow>
+            <div style={{ padding: "4px 0", fontSize: "0.85em", lineHeight: 1.5, opacity: 0.85 }}>
+              {session.message}
+            </div>
+          </PanelSectionRow>
+        ) : null}
+        <PanelSectionRow>
+          <div style={{ padding: "2px 0 6px", fontSize: "0.78em", lineHeight: 1.55, opacity: 0.55 }}>
+            一直没反应的话，可以「重新打开登录页」；也可以改用手机扫码，或自己复制那段 JSON 后点「立即读取剪贴板」。
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={startLogin} disabled={!!busy}>
+            重新打开登录页
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={loginFromClipboard} disabled={!!busy}>
+            {busy === "clip" ? "正在读取…" : "立即读取剪贴板"}
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            onClick={async () => {
+              await stopLogin();
+              setShowCode(true);
+            }}
+            disabled={!!busy}
+          >
+            改用手动粘贴授权码
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={stopLogin}>
+            取消登录
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
+  const failure =
+    session && (session.state === "error" || session.state === "timeout") ? session.message : "";
+
   return (
     <PanelSection title="Epic Games 登录">
       <PanelSectionRow>
-        <div style={{ padding: "12px 0" }}>
-          登录后即可浏览你的 Epic 游戏库并下载游戏。
+        <div style={{ padding: "8px 0", lineHeight: 1.5 }}>
+          点下面的按钮，在弹出的 Steam 窗口里登录 Epic 账号即可。登录完成后插件会自己把授权码读走，
+          <b>全程不用复制或粘贴</b>。
         </div>
       </PanelSectionRow>
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={() => setShowCode(true)}>
-          手机/电脑授权码登录(推荐)
+        <ButtonItem layout="below" onClick={startLogin} disabled={!!busy}>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", justifyContent: "center" }}>
+            <FaSteamSymbol /> 在 Steam 浏览器中登录（推荐）
+          </div>
         </ButtonItem>
       </PanelSectionRow>
+      {failure ? (
+        <PanelSectionRow>
+          <div style={{ padding: "6px 0", fontSize: "0.85em", lineHeight: 1.5 }}>{failure}</div>
+        </PanelSectionRow>
+      ) : null}
+      {msg ? (
+        <PanelSectionRow>
+          <div style={{ padding: "6px 0", fontSize: "0.85em", lineHeight: 1.5, wordBreak: "break-all" }}>
+            {msg}
+          </div>
+        </PanelSectionRow>
+      ) : null}
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={doBrowserLogin} disabled={browserBusy}>
-          浏览器登录(需桌面模式)
+        <ButtonItem layout="below" onClick={() => setShowCode(true)} disabled={!!busy}>
+          用手机扫码 / 手动粘贴授权码
         </ButtonItem>
       </PanelSectionRow>
     </PanelSection>
@@ -893,6 +1111,42 @@ const SORT_OPTIONS: { data: SortMode; label: string }[] = [
   { data: "recent", label: "最近添加" },
 ];
 
+type InstallFilter = "all" | "installed" | "not_installed";
+
+// Order doubles as the L1/R1 cycle order: 全部 → 已安装 → 未安装 → 全部.
+const INSTALL_FILTER_ORDER: InstallFilter[] = ["all", "installed", "not_installed"];
+
+const INSTALL_FILTER_LABEL: Record<InstallFilter, string> = {
+  all: "全部",
+  installed: "已安装",
+  not_installed: "未安装",
+};
+
+interface LibraryUIState {
+  filter: InstallFilter;
+  sort: SortMode;
+  query: string;
+}
+
+// The QAM unmounts the plugin panel when it closes, so component state is lost
+// every time the user re-opens it — which is why picking "已安装" looked like it
+// snapped back to the full list. `window` survives both remounts and a plugin
+// UI reload, so the choice stays put without a backend round-trip.
+const UI_STATE_KEY = "__epicdeckLibraryUI";
+
+function readUIState(): LibraryUIState {
+  const saved = (window as any)[UI_STATE_KEY] ?? {};
+  return {
+    filter: INSTALL_FILTER_ORDER.includes(saved.filter) ? saved.filter : "all",
+    sort: SORT_OPTIONS.some((o) => o.data === saved.sort) ? saved.sort : "alpha",
+    query: typeof saved.query === "string" ? saved.query : "",
+  };
+}
+
+function writeUIState(patch: Partial<LibraryUIState>) {
+  (window as any)[UI_STATE_KEY] = { ...readUIState(), ...patch };
+}
+
 function LibraryView({
   games,
   error,
@@ -908,18 +1162,50 @@ function LibraryView({
   locale: string;
   onOpen: (game: Game) => void;
 }) {
-  const [query, setQuery] = useState("");
-  const [sort, setSort] = useState<SortMode>("alpha");
+  const initial = useMemo(readUIState, []);
+  const [query, setQuery] = useState(initial.query);
+  const [sort, setSort] = useState<SortMode>(initial.sort);
+  const [installFilter, setInstallFilter] = useState<InstallFilter>(initial.filter);
+
+  const chooseFilter = (next: InstallFilter) => {
+    setInstallFilter(next);
+    writeUIState({ filter: next });
+  };
+
+  // L1 / R1 step through the three lists and wrap around, so the whole library
+  // can be paged without touching the tab row.
+  const cycleFilter = (delta: number) => {
+    const i = INSTALL_FILTER_ORDER.indexOf(installFilter);
+    const next = INSTALL_FILTER_ORDER[
+      (i + delta + INSTALL_FILTER_ORDER.length) % INSTALL_FILTER_ORDER.length
+    ];
+    chooseFilter(next);
+  };
+
+  const filterCount = (f: InstallFilter) =>
+    f === "installed" ? installedCount : f === "not_installed" ? games.length - installedCount : games.length;
+
+  const onGamepadButton = (evt: any) => {
+    const button = evt?.detail?.button;
+    if (button === GamepadButton.BUMPER_LEFT) cycleFilter(-1);
+    else if (button === GamepadButton.BUMPER_RIGHT) cycleFilter(1);
+  };
+
+  const installedCount = useMemo(
+    () => games.filter((g) => g.is_installed).length,
+    [games]
+  );
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const filtered = q
-      ? games.filter(
-          (g) =>
-            (g.title || "").toLowerCase().includes(q) ||
-            g.app_name.toLowerCase().includes(q)
-        )
-      : games.slice();
+    const filtered = games.filter((g) => {
+      if (installFilter === "installed" && !g.is_installed) return false;
+      if (installFilter === "not_installed" && g.is_installed) return false;
+      if (!q) return true;
+      return (
+        (g.title || "").toLowerCase().includes(q) || g.app_name.toLowerCase().includes(q)
+      );
+    });
 
     filtered.sort((a, b) => {
       switch (sort) {
@@ -934,7 +1220,7 @@ function LibraryView({
       }
     });
     return filtered;
-  }, [games, query, sort]);
+  }, [games, query, sort, installFilter]);
 
   if (error) {
     return (
@@ -961,28 +1247,68 @@ function LibraryView({
   }
 
   return (
-    <>
+    <Focusable
+      onButtonDown={onGamepadButton}
+      actionDescriptionMap={{
+        [GamepadButton.BUMPER_LEFT]: "上一类",
+        [GamepadButton.BUMPER_RIGHT]: "下一类",
+      }}
+    >
       <FocusStyles />
       <PanelSection>
+        <PanelSectionRow>
+          <Focusable style={{ display: "flex", gap: "6px", width: "100%" }}>
+            {INSTALL_FILTER_ORDER.map((f) => {
+              const active = f === installFilter;
+              return (
+                <DialogButton
+                  key={f}
+                  onClick={() => chooseFilter(f)}
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    padding: "8px 4px",
+                    fontSize: "0.82em",
+                    textAlign: "center",
+                    background: active
+                      ? "var(--decky-selected-background-color, rgba(255,255,255,0.22))"
+                      : "var(--decky-button-background-color, rgba(255,255,255,0.07))",
+                    color: active ? "#fff" : "inherit",
+                    fontWeight: active ? 600 : 400,
+                  }}
+                >
+                  {INSTALL_FILTER_LABEL[f]} {filterCount(f)}
+                </DialogButton>
+              );
+            })}
+          </Focusable>
+          <Field label="列表分类" description="按 L1 / R1 左右切换" />
+        </PanelSectionRow>
         <PanelSectionRow>
           <TextField
             label="搜索游戏"
             value={query}
-            onChange={(e: any) => setQuery(e.target.value)}
+            onChange={(e: any) => {
+              setQuery(e.target.value);
+              writeUIState({ query: e.target.value });
+            }}
           />
         </PanelSectionRow>
         <PanelSectionRow>
           <Dropdown
             rgOptions={SORT_OPTIONS}
             selectedOption={sort}
-            onChange={(e) => setSort(e.data as SortMode)}
+            onChange={(e) => {
+              setSort(e.data as SortMode);
+              writeUIState({ sort: e.data as SortMode });
+            }}
           />
           <Field
             label="排序方式"
             description={
-              (query.trim()
-                ? "找到 " + visible.length + " / " + games.length + " 个游戏"
-                : "共 " + games.length + " 个游戏") +
+              (visible.length === games.length
+                ? "共 " + games.length + " 个游戏"
+                : "显示 " + visible.length + " / 共 " + games.length + " 个游戏") +
               (sizePending > 0
                 ? " · 体积读取中 " + (games.length - sizePending) + "/" + games.length
                 : locale
@@ -997,7 +1323,17 @@ function LibraryView({
         {visible.length === 0 ? (
           <PanelSectionRow>
             <div style={{ padding: "12px 0", opacity: 0.7 }}>
-              <FaSearch /> 没有匹配「{query}」的游戏
+              {query.trim() ? (
+                <>
+                  <FaSearch /> 没有匹配「{query}」的游戏
+                </>
+              ) : installFilter === "installed" ? (
+                <>还没有已安装的游戏</>
+              ) : installFilter === "not_installed" ? (
+                <>所有游戏都已安装</>
+              ) : (
+                <>没有可显示的游戏</>
+              )}
             </div>
           </PanelSectionRow>
         ) : (
@@ -1008,7 +1344,7 @@ function LibraryView({
           ))
         )}
       </PanelSection>
-    </>
+    </Focusable>
   );
 }
 
@@ -1049,15 +1385,144 @@ function MissingDependency({ onInstalled }: { onInstalled: () => void }) {
   );
 }
 
+function FirstRunView({
+  dirs,
+  onReloadDirs,
+  onDone,
+}: {
+  dirs: InstallDirOption[];
+  onReloadDirs: () => void;
+  onDone: (path: string) => void;
+}) {
+  const [choice, setChoice] = useState<string>("");
+  const [custom, setCustom] = useState<string>("");
+  const [busy, setBusy] = useState<boolean>(false);
+  const [note, setNote] = useState<string>("");
+
+  // Options arrive asynchronously; preselect the backend's default (first item).
+  useEffect(() => {
+    if (!choice && dirs.length) setChoice(dirs[0].path);
+  }, [dirs, choice]);
+
+  const finish = async (path: string) => {
+    if (busy) return;
+    setBusy(true);
+    setNote("");
+    try {
+      const r = await completeFirstRun(path);
+      if (!r.ok) {
+        setNote(r.error ?? "保存失败");
+        return;
+      }
+      toaster.toast({ title: "下载位置已设置", body: r.install_dir ?? path });
+      onDone(r.install_dir ?? path);
+    } catch (e) {
+      setNote(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirm = async () => {
+    const typed = custom.trim();
+    if (!typed) {
+      await finish(choice);
+      return;
+    }
+    if (busy) return;
+    setBusy(true);
+    setNote("");
+    try {
+      const v = await resolveInstallDir(typed);
+      if (!v.ok || !v.path) {
+        setNote(v.error ?? "路径无效");
+        return;
+      }
+      await finish(v.path);
+    } catch (e) {
+      setNote(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <PanelSection title="欢迎使用 EpicDeck">
+        <PanelSectionRow>
+          <div style={{ padding: "4px 0", lineHeight: 1.5 }}>
+            Epic 游戏体积很大，先选一个下载安装的位置。选好之后可以在
+            「设置 → 默认安装目录」里随时更改，单个游戏也能单独指定。
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <Dropdown
+            rgOptions={dirs.map((d) => ({ data: d.path, label: d.label }))}
+            selectedOption={choice}
+            onChange={(e) => setChoice(e.data)}
+          />
+          <Field
+            label="下载安装位置"
+            description={
+              dirs.length
+                ? dirs.find((d) => d.path === choice)?.path ?? ""
+                : "正在读取可用磁盘…"
+            }
+          />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <TextField
+            label="自定义路径（可选）"
+            value={custom}
+            onChange={(e: any) => setCustom(e.target.value)}
+          />
+          <Field
+            label="自定义路径"
+            description="填了就用它（例如 /run/media/deck/MySD/EpicGames），留空则用上面的位置；目录不存在会自动创建"
+          />
+        </PanelSectionRow>
+        {note && (
+          <PanelSectionRow>
+            <div style={{ color: "#ff8a80", fontSize: "0.9em", wordBreak: "break-all" }}>{note}</div>
+          </PanelSectionRow>
+        )}
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={confirm} disabled={busy}>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", justifyContent: "center" }}>
+              <FaDownload /> {busy ? "正在准备…" : "使用此位置并继续"}
+            </div>
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => finish("")} disabled={busy}>
+            用默认位置（~/Games）
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={onReloadDirs} disabled={busy}>
+            刷新磁盘列表（刚插 SD 卡？）
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+    </>
+  );
+}
+
 function SettingsView() {
   const [settings, setSettings] = useState<Record<string, any>>({});
   const [dirs, setDirs] = useState<InstallDirOption[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [customPath, setCustomPath] = useState<string>("");
+  const [savingPath, setSavingPath] = useState<boolean>(false);
+  const [syncingSteam, setSyncingSteam] = useState<boolean>(false);
 
   useEffect(() => {
     (async () => {
-      setSettings(await getSettings());
-      setDirs((await getInstallDirOptions()).options);
+      const s = await getSettings();
+      const d = await getInstallDirOptions();
+      setSettings(s);
+      setDirs(d.options);
+      setCustomPath(s.install_dir || d.current || "");
       setLoaded(true);
     })();
   }, []);
@@ -1069,6 +1534,52 @@ function SettingsView() {
     // cheapest way to tell it to re-read titles/sizes after a settings change.
     if (key === "title_locale" || key === "auto_fetch_size") {
       window.dispatchEvent(new CustomEvent("epicdeck:library-changed"));
+    }
+  };
+
+  // A hand-typed path is validated (and created) before it is stored, so a
+  // typo surfaces here instead of as a failed download later.
+  const applyCustomPath = async () => {
+    if (savingPath) return;
+    if (!customPath.trim()) {
+      toaster.toast({ title: "请填写路径", body: "留空则使用上面的默认安装目录" });
+      return;
+    }
+    setSavingPath(true);
+    try {
+      const r = await resolveInstallDir(customPath);
+      if (!r.ok || !r.path) {
+        toaster.toast({ title: "路径无效", body: r.error ?? "" });
+        return;
+      }
+      setCustomPath(r.path);
+      await update("install_dir", r.path);
+      toaster.toast({ title: "已保存安装目录", body: r.path });
+    } finally {
+      setSavingPath(false);
+    }
+  };
+
+  // Writes every installed Epic title into Steam's shortcuts.vdf in one go.
+  // Steam only re-reads that file at startup, so the note says so explicitly.
+  const syncAllToSteam = async () => {
+    if (syncingSteam) return;
+    setSyncingSteam(true);
+    try {
+      const r = await syncInstalledToSteam("");
+      if (!r.ok) {
+        toaster.toast({ title: "添加失败", body: r.error ?? "" });
+        return;
+      }
+      const failed = r.failed ?? [];
+      const body = failed.length
+        ? `已添加 ${r.added ?? 0} 个，失败 ${failed.length} 个（${failed[0].title}）`
+        : `已添加 ${r.added ?? 0} 个。${r.note ?? ""}`;
+      toaster.toast({ title: "已写入 Steam", body });
+    } catch (e) {
+      toaster.toast({ title: "添加失败", body: String(e) });
+    } finally {
+      setSyncingSteam(false);
     }
   };
 
@@ -1088,9 +1599,28 @@ function SettingsView() {
         <Dropdown
           rgOptions={dirs.map((d) => ({ data: d.path, label: d.label }))}
           selectedOption={settings.install_dir || (dirs.length ? dirs[0].path : "")}
-          onChange={(e) => update("install_dir", e.data)}
+          onChange={(e) => {
+            setCustomPath(e.data);
+            update("install_dir", e.data);
+          }}
         />
         <Field label="默认安装目录" description="新建下载默认使用此位置（单个游戏可在详情页覆盖）" />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <TextField
+          label="自定义路径（可选）"
+          value={customPath}
+          onChange={(e: any) => setCustomPath(e.target.value)}
+        />
+        <Field
+          label="自定义路径"
+          description="目录不存在会自动创建；改完点下面的按钮保存"
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={applyCustomPath} disabled={savingPath}>
+          保存自定义路径
+        </ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>
         <Dropdown
@@ -1109,6 +1639,15 @@ function SettingsView() {
           description="逐个读取 Epic 清单来估算体积（每个游戏约几秒、几 MB 流量，结果缓存 30 天）"
           checked={settings.auto_fetch_size !== false}
           onChange={(v) => update("auto_fetch_size", v)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={syncAllToSteam} disabled={syncingSteam}>
+          {syncingSteam ? "正在写入…" : "把已安装的游戏全部加入 Steam"}
+        </ButtonItem>
+        <Field
+          label="加入 Steam"
+          description="写入 Steam 的非 Steam 快捷方式；重启 Steam 后出现在「库 → 非 Steam 游戏」"
         />
       </PanelSectionRow>
       <PanelSectionRow>
@@ -1182,6 +1721,9 @@ function Content() {
   const [progress, setProgress] = useState<Record<string, InstallProgress>>({});
   const [dirs, setDirs] = useState<InstallDirOption[]>([]);
   const [defaultDir, setDefaultDir] = useState<string>("");
+  // null while the first-run prompt is still being decided, so neither the
+  // login screen nor the library flashes before the prompt appears.
+  const [firstRunDone, setFirstRunDone] = useState<boolean | null>(null);
   // Titles and sizes arrive after the list is already on screen.
   const [sizePending, setSizePending] = useState(0);
   const [locale, setLocale] = useState("");
@@ -1272,14 +1814,29 @@ function Content() {
           new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
         ]);
 
-      const [envResult, authResult] = await Promise.all([
+      const [envResult, authResult, boot] = await Promise.all([
         withTimeout(checkEnvironment(), 8000, { legendary_installed: true, legendary_path: "" }),
         withTimeout(authStatus(), 15000, { logged_in: false, account_id: "", display_name: "" }),
+        // The first-run prompt needs the install-location options up front, so
+        // they load together with the rest instead of after the UI is shown.
+        withTimeout(
+          (async () => {
+            const [d, s] = await Promise.all([getInstallDirOptions(), getSettings()]);
+            return { dirs: d.options ?? [], current: d.current ?? "", settings: s };
+          })(),
+          8000,
+          { dirs: [] as InstallDirOption[], current: "", settings: {} as Record<string, any> }
+        ),
       ]);
 
       if (cancelled) return;
       setEnv(envResult);
       setAuth(authResult);
+      setDirs(boot.dirs);
+      setDefaultDir(boot.settings.install_dir || boot.current || "");
+      // A backend that timed out reports {} — do not trap the user in the
+      // prompt just because the settings call was slow.
+      setFirstRunDone(boot.settings.first_run_done !== false);
       setGameError("");
 
       if (authResult.logged_in) {
@@ -1317,35 +1874,15 @@ function Content() {
     return () => window.removeEventListener("epicdeck:library-changed", handler);
   }, []);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const [d, s] = await Promise.all([getInstallDirOptions(), getSettings()]);
-        setDirs(d.options ?? []);
-        setDefaultDir(s.install_dir || d.current || "");
-      } catch (e) {
-        console.log("EpicDeck: install dir options unavailable", e);
-      }
-    })();
-  }, []);
-
-  const doLogin = async () => {
-    const r = await login();
-    if (r.ok) {
-      toaster.toast({ title: "登录中", body: "请在浏览器中完成 Epic 授权" });
-      // Poll for auth completion
-      const timer = setInterval(async () => {
-        const a = await authStatus();
-        if (a.logged_in) {
-          clearInterval(timer);
-          await refresh();
-          toaster.toast({ title: "登录成功", body: a.display_name });
-        }
-      }, 3000);
-      // stop polling after 5 minutes
-      setTimeout(() => clearInterval(timer), 300000);
-    } else {
-      toaster.toast({ title: "登录失败", body: r.error ?? "" });
+  // Re-read the disk list — the first-run prompt offers this because an SD
+  // card inserted after the plugin opened would otherwise be invisible.
+  const reloadDirs = async () => {
+    try {
+      const d = await getInstallDirOptions();
+      setDirs(d.options ?? []);
+      if (d.current) setDefaultDir(d.current);
+    } catch (e) {
+      console.log("EpicDeck: install dir options unavailable", e);
     }
   };
 
@@ -1368,8 +1905,23 @@ function Content() {
     return <MissingDependency onInstalled={refresh} />;
   }
 
+  // Before the login screen: a first-run user picks where games go. Asking now
+  // avoids the "disk full halfway through a 60 GB download" surprise.
+  if (firstRunDone === false) {
+    return (
+      <FirstRunView
+        dirs={dirs}
+        onReloadDirs={reloadDirs}
+        onDone={(path) => {
+          if (path) setDefaultDir(path);
+          setFirstRunDone(true);
+        }}
+      />
+    );
+  }
+
   if (!auth?.logged_in) {
-    return <LoginView onLogin={doLogin} onLoggedIn={() => refresh()} />;
+    return <LoginView onLoggedIn={() => refresh()} />;
   }
 
   if (selected) {
