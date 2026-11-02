@@ -1,0 +1,47 @@
+# NOTICE — 第三方版权与许可声明
+
+本项目 EpicDeck 采用 [BSD 3-Clause License](./LICENSE) 开源。
+
+## 上游项目与依赖
+
+EpicDeck 基于以下开源项目构建,特此致谢并声明其许可证:
+
+### 1. decky-plugin-template
+
+- 项目地址:https://github.com/SteamDeckHomebrew/decky-plugin-template
+- 许可证:BSD 3-Clause
+- 用途:本项目的插件脚手架与前端构建配置(rollup、tsconfig、decky 集成结构)基于该模板。
+- 版权:Copyright (c) 2022-2024, Steam Deck Homebrew
+
+### 2. Legendary
+
+- 项目地址:https://github.com/derrod/legendary
+- 许可证:GPL-3.0
+- 用途:Epic Games 下载/安装/启动引擎。EpicDeck 通过调用 Legendary CLI 实现下载功能,Legendary 为独立的运行时依赖,不包含在本仓库源码中。
+- 版权:Copyright (c) derrod
+
+### 3. qrcode (npm)
+
+- 项目地址:https://github.com/soldair/node-qrcode
+- 许可证:MIT
+- 用途:前端登录页将 Epic 设备授权 URL 生成二维码。
+
+### 4. react-icons
+
+- 项目地址:https://github.com/react-icons/react-icons
+- 许可证:MIT(图标各自的许可证,详见其仓库)
+- 用途:前端 UI 图标。
+
+### 5. EpicResearch (参考)
+
+- 项目地址:https://github.com/MixV2/EpicResearch
+- 用途:Epic OAuth / device code 授权流程的参考,以及 `fortniteNewSwitchGameClient` 公共客户端凭据的来源。凭据为 Epic 官方客户端反编译得到的公开常量。
+
+## 商标声明
+
+- "Epic"、"Epic Games" 及其相关商标为 Epic Games, Inc. 的商标。本项目与其无任何隶属、赞助或背书关系。
+- "Steam"、"Steam Deck" 为 Valve Corporation 的商标。本项目与其无任何隶属、赞助或背书关系。
+
+## 免责声明
+
+本项目为社区开源项目,与 Epic Games、Valve 无关。使用第三方客户端访问 Epic 服务可能违反其服务条款,请自行评估并承担相应风险。

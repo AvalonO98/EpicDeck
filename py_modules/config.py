@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026, EpicDeck Contributors
+
 """EpicDeck configuration persistence.
 
 Stores plugin state as JSON in the Decky settings directory. Handles

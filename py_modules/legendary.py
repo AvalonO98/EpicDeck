@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026, EpicDeck Contributors
+
 """Legendary CLI wrapper.
 
 Legendary (https://github.com/derrod/legendary) is an open-source

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026, EpicDeck Contributors
+
 """Steam non-Steam-game shortcut integration.
 
 Steam stores non-Steam shortcuts in `shortcuts.vdf` under

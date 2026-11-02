@@ -87,3 +87,17 @@ pnpm watch        # 监听模式
 - [decky-plugin-template](https://github.com/SteamDeckHomebrew/decky-plugin-template) — 插件脚手架
 - [Legendary](https://github.com/derrod/legendary) — Epic 命令行客户端
 - [EpicResearch](https://github.com/MixV2/EpicResearch) — Epic OAuth/API 研究(device code 流程参考)
+
+## 开源协议
+
+本项目基于 [BSD 3-Clause License](./LICENSE) 开源。
+
+相关文档:
+
+- [CONTRIBUTING.md](./CONTRIBUTING.md) — 贡献指南(如何提 issue、贡献代码、开发规范)
+- [SECURITY.md](./SECURITY.md) — 安全与隐私说明(认证凭据、用户数据存储)
+- [NOTICE](./NOTICE) — 第三方版权与许可声明(上游项目、依赖、商标)
+
+### 商标与免责声明
+
+"Epic"、"Epic Games" 为 Epic Games, Inc. 的商标;"Steam"、"Steam Deck" 为 Valve Corporation 的商标。本项目为社区开源项目,与上述公司无隶属、赞助或背书关系,使用前请自行评估并遵守相关服务条款。

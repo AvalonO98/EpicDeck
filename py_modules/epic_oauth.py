@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026, EpicDeck Contributors
+
 """Epic Games Device Code (OAuth 2.0 Device Authorization Grant) flow.
 
 Implements the "sign in from a device with a code shown on screen" flow so
