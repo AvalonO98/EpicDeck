@@ -6,6 +6,6 @@
   "publish": {
     "tags": ["epic", "games", "launcher", "download", "legendary"],
     "description": "Epic Games login and download manager for Steam Deck. Sign in to Epic, browse your library, download and launch games, and add them to Steam.",
-    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+    "image": "https://opengraph.githubassets.com/1/AvalonO98/EpicDeck"
   }
 }
