@@ -3,168 +3,206 @@
 
 """Steam non-Steam-game shortcut integration.
 
-Steam stores non-Steam shortcuts in `shortcuts.vdf` under
-`~/.local/share/Steam/userdata/<userid>/config/`. The file uses a
-Valve-proprietary binary-ish format (8-bit lengths, null-terminated
-strings, 32-bit little-endian integers for the app id).
+`shortcuts.vdf` lives in `~/.local/share/Steam/userdata/<userid>/config/` and
+uses Valve's KeyValues **binary** format, which looks like this:
 
-Adding a game requires:
-  1. Reading the existing shortcuts (if any).
-  2. Appending a new entry with a unique appid.
-  3. Writing the file back.
-  4. Asking Steam to reload via `steam://` (e.g. `steam://restart` or
-     simply restarting Steam) so the new shortcut shows up.
+    \\x00 "shortcuts" \\x00
+        \\x00 "0" \\x00
+            \\x02 "appid"   \\x00 <int32>
+            \\x01 "AppName" \\x00 <utf8> \\x00
+            \\x01 "Exe"     \\x00 <utf8> \\x00
+            ...
+            \\x00 "tags" \\x00 \\x01 "0" \\x00 <utf8> \\x00 \\x08
+        \\x08                     # end of entry block
+    \\x08                         # end of root
 
-We also support launching the shortcut once added through
-`steam://rungameid/<appid>`.
+An earlier version of this module wrote a hand-rolled "null-terminated
+strings in a row" layout instead. Steam cannot parse that, treats the whole
+file as corrupt and drops *every* non-Steam shortcut the user had. This
+implementation therefore:
+
+  * parses the real format into a nested dict and keeps fields it does not
+    understand, so nothing is lost on a round trip;
+  * refuses to write when the existing file cannot be parsed (fail closed
+    rather than clobber it);
+  * keeps a timestamped backup before every write;
+  * re-parses its own output and compares entry counts before swapping the
+    file in with an atomic rename.
 """
 
 import os
+import shutil
 import struct
 import subprocess
+import time
+import zlib
+
+TYPE_BLOCK = 0x00
+TYPE_STRING = 0x01
+TYPE_INT32 = 0x02
+TYPE_FLOAT32 = 0x03
+TYPE_UINT64 = 0x07
+TYPE_END = 0x08
+
+MAX_BACKUPS = 8
 
 
 class SteamError(Exception):
     pass
 
 
-# Steam appid for non-Steam games are negative and derived from the game's
-# exe path via a CRC32-ish scheme. We use a stable hash of the app_name.
-def _crc32(data: bytes) -> int:
-    crc = 0xFFFFFFFF
-    for b in data:
-        crc ^= b
-        for _ in range(8):
-            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1))
-    return crc ^ 0xFFFFFFFF
+class VdfError(SteamError):
+    pass
 
 
-def make_appid(app_name: str) -> int:
-    """Derive a stable 32-bit appid (Steam non-Steam game convention).
+# ---------------------------------------------------------------- vdf codec
 
-    Steam computes non-Steam game appids from the exe path: the high 16 bits
-    are the top 16 bits of a CRC32 of the path, and the low 16 bits are a
-    per-shortcut index (we use 0 for the first/only entry). This keeps the
-    appid within the signed 32-bit negative range Steam expects for
-    non-Steam games.
+def vdf_loads(raw: bytes) -> dict:
+    """Parse KeyValues binary data into a nested dict."""
+    pos = 0
+    n = len(raw)
+
+    def read_cstr():
+        nonlocal pos
+        end = raw.find(b"\x00", pos)
+        if end < 0:
+            raise VdfError("字符串未终止 (offset %d)" % pos)
+        value = raw[pos:end].decode("utf-8", "replace")
+        pos = end + 1
+        return value
+
+    def parse_block(depth: int = 0) -> dict:
+        nonlocal pos
+        if depth > 32:
+            raise VdfError("嵌套层级过深")
+        out = {}
+        while True:
+            if pos >= n:
+                raise VdfError("文件意外结束 (offset %d)" % pos)
+            kind = raw[pos]
+            pos += 1
+            if kind == TYPE_END:
+                return out
+            key = read_cstr()
+            if kind == TYPE_BLOCK:
+                out[key] = parse_block(depth + 1)
+            elif kind == TYPE_STRING:
+                out[key] = read_cstr()
+            elif kind == TYPE_INT32:
+                if pos + 4 > n:
+                    raise VdfError("int32 越界")
+                out[key] = struct.unpack("<i", raw[pos:pos + 4])[0]
+                pos += 4
+            elif kind == TYPE_UINT64:
+                if pos + 8 > n:
+                    raise VdfError("uint64 越界")
+                out[key] = struct.unpack("<Q", raw[pos:pos + 8])[0]
+                pos += 8
+            elif kind == TYPE_FLOAT32:
+                if pos + 4 > n:
+                    raise VdfError("float32 越界")
+                out[key] = struct.unpack("<f", raw[pos:pos + 4])[0]
+                pos += 4
+            else:
+                raise VdfError("不支持的字段类型 0x%02x (key=%r)" % (kind, key))
+
+    if not raw:
+        return {}
+    data = parse_block()
+    return data
+
+
+def vdf_dumps(data: dict) -> bytes:
+    """Serialise a nested dict into KeyValues binary data."""
+    buf = bytearray()
+
+    def write_block(node, depth: int = 0):
+        if depth > 32:
+            raise VdfError("嵌套层级过深")
+        for key, value in node.items():
+            k = str(key).encode("utf-8") + b"\x00"
+            if isinstance(value, dict):
+                buf.extend(bytes([TYPE_BLOCK]) + k)
+                write_block(value, depth + 1)
+                buf.extend(bytes([TYPE_END]))
+            elif isinstance(value, bool):
+                buf.extend(bytes([TYPE_INT32]) + k + struct.pack("<i", 1 if value else 0))
+            elif isinstance(value, int):
+                v = value
+                if v < -0x80000000 or v > 0xFFFFFFFF:
+                    raise VdfError("整数越界: %r" % value)
+                if v > 0x7FFFFFFF:  # store large ids as signed int32
+                    v -= 0x100000000
+                buf.extend(bytes([TYPE_INT32]) + k + struct.pack("<i", v))
+            elif isinstance(value, float):
+                buf.extend(bytes([TYPE_FLOAT32]) + k + struct.pack("<f", value))
+            else:
+                buf.extend(
+                    bytes([TYPE_STRING]) + k + str(value).encode("utf-8") + b"\x00"
+                )
+
+    write_block(data)
+    buf.extend(bytes([TYPE_END]))
+    return bytes(buf)
+
+
+# ----------------------------------------------------------------- shortcuts
+
+def make_appid(exe: str, app_name: str) -> int:
+    """Derive a stable unsigned appid the way Steam does for non-Steam games.
+
+    Steam hashes `<exe><name>` with CRC32 and forces the top bit, which lands
+    the value in the 2^31..2^32 range. Only the low 31 bits distinguish
+    entries, so collisions are rare enough for a library of a few hundred.
     """
-    exe = f"\"{app_name}.sh\""
-    crc = _crc32(exe.encode("utf-8"))
-    high16 = (crc >> 16) & 0xFFFF
-    return (high16 << 16) & 0xFFFFFFFF
+    key = "%s%s" % (exe, app_name)
+    crc = zlib.crc32(key.encode("utf-8")) & 0xFFFFFFFF
+    return crc | 0x80000000
+
+
+def _unquote(value) -> str:
+    s = str(value or "").strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1]
+    return s
+
+
+def _quote(value: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if s[0] == '"' and s[-1] == '"':
+        return s
+    return '"%s"' % s
 
 
 class ShortcutEntry:
     def __init__(self, appid: int, app_name: str, exe: str, start_dir: str,
                  icon: str = "", launch_options: str = "", tags=None):
-        self.appid = appid
+        self.appid = appid          # unsigned 32-bit, as Steam URLs use it
         self.app_name = app_name
         self.exe = exe
         self.start_dir = start_dir
         self.icon = icon
         self.launch_options = launch_options
-        self.tags = tags or []
+        self.tags = list(tags or [])
 
 
-def _read_byte(f):
-    b = f.read(1)
-    if not b:
-        return None
-    return b[0]
-
-
-def parse_shortcuts(path: str):
-    """Parse shortcuts.vdf into a list of ShortcutEntry."""
-    entries = []
-    if not os.path.exists(path):
-        return entries
-    with open(path, "rb") as f:
-        raw = f.read()
-    pos = 0
-    n = len(raw)
-    while pos < n:
-        # Each entry: 3 null-terminated strings (appname, exe, startdir),
-        # 1 icon string, 1 icon char(1), 1 shortcut char(1), 1 launch options
-        # string, 1 char(1), tags (0x00 = none, else 0x01 + N strings), then
-        # int32 appid.
-        strings = []
-        for _ in range(4):
-            end = raw.find(b"\x00", pos)
-            if end == -1:
-                return entries
-            strings.append(raw[pos:end].decode("utf-8", errors="replace"))
-            pos = end + 1
-        if pos + 2 > n:
-            return entries
-        # icon flag byte + shortcut flag byte
-        pos += 2
-        # launch options
-        end = raw.find(b"\x00", pos)
-        if end == -1:
-            return entries
-        launch_options = raw[pos:end].decode("utf-8", errors="replace")
-        pos = end + 1
-        # shortcut flag
-        if pos >= n:
-            return entries
-        pos += 1
-        # tags
-        if pos >= n:
-            return entries
-        tags_flag = raw[pos]
-        pos += 1
-        tags = []
-        if tags_flag == 0x01:
-            end = raw.find(b"\x00", pos)
-            if end == -1:
-                return entries
-            ntags = raw[pos:end].decode("utf-8", errors="replace")
-            try:
-                ntags_int = int(ntags)
-            except ValueError:
-                ntags_int = 0
-            pos = end + 1
-            for _ in range(ntags_int):
-                end = raw.find(b"\x00", pos)
-                if end == -1:
-                    return entries
-                tags.append(raw[pos:end].decode("utf-8", errors="replace"))
-                pos = end + 1
-        if pos + 4 > n:
-            return entries
-        appid = struct.unpack("<I", raw[pos:pos + 4])[0]
-        pos += 4
-        entries.append(
-            ShortcutEntry(appid, strings[0], strings[1], strings[2],
-                          strings[3], launch_options, tags)
-        )
-    return entries
-
-
-def _write_string(f, s: str):
-    f.write(s.encode("utf-8"))
-    f.write(b"\x00")
-
-
-def write_shortcuts(path: str, entries):
-    with open(path, "wb") as f:
-        for e in entries:
-            _write_string(f, e.app_name)
-            _write_string(f, e.exe)
-            _write_string(f, e.start_dir)
-            _write_string(f, e.icon)
-            f.write(b"\x01")  # icon flag
-            f.write(b"\x01")  # shortcut flag
-            _write_string(f, e.launch_options)
-            f.write(b"\x01")  # shortcut flag
-            if e.tags:
-                f.write(b"\x01")
-                _write_string(f, str(len(e.tags)))
-                for t in e.tags:
-                    _write_string(f, t)
-            else:
-                f.write(b"\x00")
-            f.write(struct.pack("<I", e.appid & 0xFFFFFFFF))
+def _entry_from_dict(node: dict) -> ShortcutEntry:
+    tags = node.get("tags")
+    tag_list = []
+    if isinstance(tags, dict):
+        for k in sorted(tags, key=lambda x: str(x)):
+            tag_list.append(str(tags[k]))
+    return ShortcutEntry(
+        appid=int(node.get("appid", 0)) & 0xFFFFFFFF,
+        app_name=str(node.get("AppName", "")),
+        exe=_unquote(node.get("Exe")),
+        start_dir=_unquote(node.get("StartDir")),
+        icon=str(node.get("icon", "") or ""),
+        launch_options=str(node.get("LaunchOptions", "") or ""),
+        tags=tag_list,
+    )
 
 
 class SteamShortcuts:
@@ -172,15 +210,43 @@ class SteamShortcuts:
         self.userdata_root = os.path.expanduser(
             "~/.local/share/Steam/userdata")
 
+    # -- account dir selection -------------------------------------------
     def _config_dir(self):
-        """Return the first user's config dir, or None."""
+        """Pick the config dir of the account Steam actually uses.
+
+        `userdata` can contain several numeric ids, including `0` (a stub
+        directory for the "no account" case). Choosing the first one blindly
+        used to send shortcuts to `userdata/0/config`, where Steam never looks.
+        """
         if not os.path.isdir(self.userdata_root):
             return None
-        for uid in os.listdir(self.userdata_root):
+        candidates = []
+        try:
+            uids = os.listdir(self.userdata_root)
+        except OSError:
+            return None
+        for uid in uids:
+            if not uid.isdigit():
+                continue
             cfg = os.path.join(self.userdata_root, uid, "config")
-            if os.path.isdir(cfg):
-                return cfg
-        return None
+            if not os.path.isdir(cfg):
+                continue
+            score = 0
+            if os.path.isfile(os.path.join(cfg, "shortcuts.vdf")):
+                score += 10
+            if os.path.isfile(os.path.join(cfg, "localconfig.vdf")):
+                score += 5
+            if uid == "0":
+                score -= 100
+            try:
+                score += min(os.path.getmtime(cfg) / 1e9, 1)
+            except OSError:
+                pass
+            candidates.append((score, cfg))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        return candidates[0][1]
 
     def _shortcuts_path(self):
         cfg = self._config_dir()
@@ -188,40 +254,190 @@ class SteamShortcuts:
             return None
         return os.path.join(cfg, "shortcuts.vdf")
 
+    # -- load / save ------------------------------------------------------
+    def _load_tree(self, path: str) -> dict:
+        if not os.path.isfile(path):
+            return {"shortcuts": {}}
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            raise SteamError("读取 shortcuts.vdf 失败: %s" % e)
+        if not raw:
+            return {"shortcuts": {}}
+        try:
+            data = vdf_loads(raw)
+        except VdfError as e:
+            # Fail closed: overwriting an unparseable file would destroy the
+            # user's shortcuts for good.
+            raise SteamError(
+                "shortcuts.vdf 无法解析，已中止写入以免覆盖原有快捷方式（%s）" % e
+            )
+        if not isinstance(data.get("shortcuts"), dict):
+            data["shortcuts"] = {}
+        return data
+
+    def _backup(self, path: str):
+        if not os.path.isfile(path):
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = "%s.epicdeck-backup-%s" % (path, stamp)
+        try:
+            shutil.copy2(path, target)
+        except OSError:
+            return
+        backups = sorted(
+            [p for p in os.listdir(os.path.dirname(path))
+             if os.path.basename(p).startswith(os.path.basename(path) + ".epicdeck-backup-")]
+        )
+        for old in backups[:-MAX_BACKUPS]:
+            try:
+                os.remove(os.path.join(os.path.dirname(path), old))
+            except OSError:
+                pass
+
+    def _save_tree(self, path: str, data: dict):
+        expected = len(data.get("shortcuts") or {})
+        try:
+            blob = vdf_dumps(data)
+        except SteamError:
+            raise
+        except Exception as e:
+            raise SteamError("生成 shortcuts.vdf 失败: %s" % e)
+
+        # Self-check: our own output must parse back with the same entry count
+        # before we let it near the real file.
+        try:
+            check = vdf_loads(blob)
+            got = len(check.get("shortcuts") or {})
+        except VdfError as e:
+            raise SteamError("生成的 shortcuts.vdf 无法回读，已中止: %s" % e)
+        if got != expected:
+            raise SteamError(
+                "生成的 shortcuts.vdf 条目数不一致 (%d != %d)，已中止"
+                % (got, expected)
+            )
+
+        self._backup(path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".epicdeck.tmp"
+        with open(tmp, "wb") as f:
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
+    # -- public API -------------------------------------------------------
     def list_shortcuts(self):
         path = self._shortcuts_path()
         if not path:
             return []
-        return parse_shortcuts(path)
+        try:
+            data = self._load_tree(path)
+        except SteamError:
+            return []
+        shortcuts = data.get("shortcuts") or {}
+        entries = []
+        # Numeric order: plain string sorting would put "10" before "2".
+        def _idx(key):
+            try:
+                return (0, int(str(key)))
+            except (TypeError, ValueError):
+                return (1, str(key))
+        for key in sorted(shortcuts, key=_idx):
+            node = shortcuts[key]
+            if isinstance(node, dict):
+                entries.append(_entry_from_dict(node))
+        return entries
 
     def add_game(self, app_name: str, exe: str, start_dir: str = "",
                  icon: str = "", launch_options: str = "", tags=None):
-        """Add a non-Steam game, returning its appid."""
+        """Add or update a non-Steam game. Returns the unsigned appid."""
         path = self._shortcuts_path()
         if not path:
             raise SteamError(
                 "找不到 Steam 用户数据目录。请先启动过 Steam 游戏模式。"
             )
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        entries = parse_shortcuts(path)
-        appid = make_appid(app_name)
-        # Avoid duplicates: replace an entry with the same app_name.
-        entries = [e for e in entries if e.app_name != app_name]
-        entries.append(
-            ShortcutEntry(appid, app_name, exe, start_dir or os.path.dirname(exe),
-                          icon, launch_options, tags)
-        )
-        write_shortcuts(path, entries)
+        data = self._load_tree(path)
+        shortcuts = data.setdefault("shortcuts", {})
+
+        exe_q = _quote(exe)
+        start_dir_q = _quote(start_dir or os.path.dirname(exe))
+        appid = make_appid(_unquote(exe_q), app_name)
+
+        # Update an existing entry with the same display name instead of
+        # appending a duplicate.
+        target_key = None
+        for key, node in shortcuts.items():
+            if isinstance(node, dict) and str(node.get("AppName", "")) == app_name:
+                target_key = key
+                break
+
+        if target_key is None:
+            numeric = []
+            for key in shortcuts:
+                try:
+                    numeric.append(int(str(key)))
+                except (TypeError, ValueError):
+                    continue
+            target_key = str(max(numeric) + 1 if numeric else 0)
+            shortcuts[target_key] = {}
+
+        entry = shortcuts[target_key]
+        if not isinstance(entry, dict):
+            entry = {}
+            shortcuts[target_key] = entry
+
+        tag_map = {}
+        for i, tag in enumerate(tags or []):
+            tag_map[str(i)] = str(tag)
+
+        # Keep whatever Steam or another plugin already stored, only touch the
+        # fields we own.
+        entry["appid"] = appid
+        entry["AppName"] = app_name
+        entry["Exe"] = exe_q
+        entry["StartDir"] = start_dir_q
+        entry.setdefault("icon", icon or "")
+        entry.setdefault("ShortcutPath", "")
+        entry["LaunchOptions"] = launch_options or ""
+        entry.setdefault("IsHidden", 0)
+        entry.setdefault("AllowDesktopConfig", 1)
+        entry.setdefault("AllowOverlay", 1)
+        entry.setdefault("OpenVR", 0)
+        entry.setdefault("Devkit", 0)
+        entry.setdefault("DevkitGameID", "")
+        entry.setdefault("DevkitOverrideAppID", 0)
+        entry.setdefault("LastPlayTime", 0)
+        entry.setdefault("FlatpakAppID", "")
+        if tag_map:
+            entry["tags"] = tag_map
+        else:
+            entry.setdefault("tags", {})
+
+        self._save_tree(path, data)
         return appid
 
-    def remove_game(self, app_name: str):
+    def remove_game(self, app_name: str) -> bool:
         path = self._shortcuts_path()
         if not path:
-            return
-        entries = parse_shortcuts(path)
-        new_entries = [e for e in entries if e.app_name != app_name]
-        if len(new_entries) != len(entries):
-            write_shortcuts(path, new_entries)
+            return False
+        data = self._load_tree(path)
+        shortcuts = data.setdefault("shortcuts", {})
+        keep = []
+        removed = False
+        for key in sorted(shortcuts, key=lambda k: int(str(k)) if str(k).isdigit() else 0):
+            node = shortcuts[key]
+            if isinstance(node, dict) and str(node.get("AppName", "")) == app_name:
+                removed = True
+                continue
+            keep.append(node)
+        if not removed:
+            return False
+        # Steam expects consecutive numeric keys starting at 0.
+        data["shortcuts"] = {str(i): node for i, node in enumerate(keep)}
+        self._save_tree(path, data)
+        return True
 
     def find_game(self, app_name: str):
         return next(
