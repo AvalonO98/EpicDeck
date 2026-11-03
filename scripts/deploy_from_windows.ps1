@@ -40,7 +40,7 @@ Write-Host "[2/3] 打包并上传项目..."
 $Tarball = Join-Path $env:TEMP "epicdeck_deploy.tar.gz"
 
 Push-Location $ProjectDir
-tar --exclude=node_modules --exclude=.git --exclude=HANDOFF.md --exclude=deploy_from_windows.ps1 --exclude=deploy_from_windows.bat -czf $Tarball .
+tar --exclude=node_modules --exclude=.git --exclude=HANDOFF.md --exclude=scripts/deploy_from_windows.ps1 --exclude=scripts/deploy_from_windows.bat -czf $Tarball .
 Pop-Location
 
 scp $Tarball "$DeckUser@$DeckIp`:/tmp/epicdeck_deploy.tar.gz"
@@ -51,7 +51,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # 3. 解压执行
 Write-Host "[3/3] 在 Steam Deck 上部署..."
-ssh "$DeckUser@$DeckIp" "rm -rf /tmp/epicdeck_src && mkdir -p /tmp/epicdeck_src && tar -xzf /tmp/epicdeck_deploy.tar.gz -C /tmp/epicdeck_src && cd /tmp/epicdeck_src && chmod +x deploy.sh && ./deploy.sh"
+ssh "$DeckUser@$DeckIp" "rm -rf /tmp/epicdeck_src && mkdir -p /tmp/epicdeck_src && tar -xzf /tmp/epicdeck_deploy.tar.gz -C /tmp/epicdeck_src && cd /tmp/epicdeck_src && chmod +x scripts/deploy.sh && ./scripts/deploy.sh"
 
 Write-Host ""
 Write-Host "=== 部署完成,回到游戏模式打开 Decky 菜单 ===" -ForegroundColor Green

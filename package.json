@@ -6,7 +6,7 @@
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
-    "package": "python build_zip.py",
+    "package": "python scripts/build_zip.py",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {

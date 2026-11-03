@@ -41,7 +41,7 @@ jobs:
       - name: Package plugin zip (build check)
         # push 到 main 时:只验证打包是否成功,产物仅供检查,不发布
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        run: python3 build_zip.py --skip-build
+        run: python3 scripts/build_zip.py --skip-build
 
   release:
     # 只在打 v* tag 时执行发布
@@ -88,7 +88,7 @@ jobs:
         run: pnpm build
 
       - name: Package plugin zip
-        run: python3 build_zip.py --skip-build --version "${{ steps.version.outputs.version }}"
+        run: python3 scripts/build_zip.py --skip-build --version "${{ steps.version.outputs.version }}"
 
       - name: Extract release notes from CHANGELOG
         # Release 正文直接取 CHANGELOG 里对应版本的小节,避免用提交列表(对用户没有意义)。

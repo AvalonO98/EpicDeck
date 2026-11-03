@@ -225,18 +225,33 @@ Decky 关闭 QAM 时会卸载内容组件,重开就要重新跑 `legendary list`
 
 ## 开发与调试
 
+**目录结构**（根目录只放插件运行必需的文件 + 文档,其余归到子目录):
+
+```
+src/               前端 TypeScript(QAM 面板 + 全屏大屏页)
+py_modules/        Python 后端模块(legendary / steam / proton / artwork …)
+scripts/           构建、打包、部署脚本
+assets/            图标等静态资源
+main.py            Decky 插件入口(必须在根目录)
+plugin.json        插件清单(必须在根目录)
+package.json       依赖与版本号(必须在根目录)
+decky.pyi          decky 模块的类型存根(供编辑器识别)
+.github/           CI:push 到 main 只做构建校验,打 v* tag 才发 Release
+```
+
 ```bash
 pnpm install
 pnpm build          # rollup 打包到 dist/
 pnpm watch          # 监听
-pnpm package        # build_zip.py:构建 + 组装 Decky 可导入的 zip
+pnpm package        # scripts/build_zip.py:构建 + 组装 Decky 可导入的 zip
 ```
 
 部署到 Deck(开发时用的方式,需要 SSH):
 
 ```bash
-# 仓库里附了脚本,改完路径即可
-./deploy.sh                 # 或 deploy_from_windows.bat / .ps1
+# 脚本都在 scripts/ 下
+./scripts/deploy.sh                                  # 在 Deck 上跑
+./scripts/deploy_from_windows.bat <Deck_IP>          # 在 Windows 上跑(.ps1 同)
 ssh deck@steamdeck.local 'sudo systemctl restart plugin_loader'
 ```
 

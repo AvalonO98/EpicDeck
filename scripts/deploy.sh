@@ -2,23 +2,24 @@
 # =============================================================================
 # EpicDeck 部署脚本 (在 Steam Deck 上运行)
 #
-# 用法:
-#   chmod +x deploy.sh
-#   ./deploy.sh
+# 用法(在仓库根目录执行):
+#   chmod +x scripts/deploy.sh
+#   ./scripts/deploy.sh
 #
 # 功能:
 #   1. 检测/安装 Legendary
 #   2. 安装插件文件到 Decky 插件目录
 #   3. 重载 Decky Loader
 #
-# 前置:已开启 SSH,本脚本放在项目根目录 (epicdeck/) 下,通过 scp 传到 Steam Deck
+# 前置:已开启 SSH。脚本在 scripts/ 下,项目根目录取它的上一级,通过 scp 传到 Steam Deck
 # =============================================================================
 set -euo pipefail
 
 # ---- 配置 ---------------------------------------------------------------
 PLUGIN_NAME="EpicDeck"   # 必须与 plugin.json 的 name 一致,且与 Decky 下已有目录大小写相同
 PLUGIN_DIR="${HOME}/homebrew/plugins/${PLUGIN_NAME}"
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 脚本在 scripts/ 下,项目根目录是它的上一级
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ---- 颜色 -----------------------------------------------------------------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -84,8 +85,7 @@ install_plugin() {
       --exclude node_modules \
       --exclude .git \
       --exclude HANDOFF.md \
-      --exclude deploy.sh \
-      --exclude deploy_from_windows.* \
+      --exclude scripts \
       "${PROJECT_DIR}/" "${PLUGIN_DIR}/"
   else
     warn "rsync 不可用,改用 cp (不清除旧文件)"

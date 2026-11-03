@@ -11,6 +11,14 @@
 
 任何版本都要等用户确认后才打 tag 发版。
 
+## [未发布]
+
+- **仓库结构整理**：构建 / 打包 / 部署脚本从根目录移到 `scripts/`
+  （`build_zip.py` / `build_icon.py` / `deploy.sh` / `deploy_from_windows.bat` / `.ps1`），
+  命令相应改为 `python scripts/build_zip.py`、`./scripts/deploy.sh`；CI 与 `pnpm package` 已同步。
+  插件运行必需的文件（`main.py` / `plugin.json` / `package.json` / `py_modules/` / `dist/`）
+  仍留在根目录——Decky 按这个结构加载，不能动。纯工程整理，不影响插件行为，随下个版本一起走。
+
 ## [0.8.3] - 2026-11-04
 
 大屏页面正式可用。原 0.8.2 的重构没有单独发版，改动一并并入本版。

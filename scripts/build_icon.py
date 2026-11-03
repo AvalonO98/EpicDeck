@@ -10,7 +10,9 @@ import math
 import os
 
 SIZE = 512
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.png")
+# 本脚本在 scripts/ 下,图标输出到仓库根的 assets/
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT = os.path.join(_ROOT, "assets", "icon.png")
 
 
 def hex_rgb(h):

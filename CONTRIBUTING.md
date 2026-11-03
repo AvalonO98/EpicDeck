@@ -48,6 +48,11 @@ pnpm build
 python -c "import ast; [ast.parse(open(f, encoding='utf-8').read()) for f in ['main.py','py_modules/config.py','py_modules/legendary.py','py_modules/steam.py','py_modules/epic_oauth.py']]"
 ```
 
+### 目录约定
+
+- 插件运行必需的文件(`main.py` / `plugin.json` / `package.json` / `py_modules/` / `dist/`)必须在仓库根目录,Decky 按这个结构加载。
+- 构建、打包、部署脚本统一放在 `scripts/`,不要在根目录新增脚本。
+
 ### 代码规范
 
 - **前端**:TypeScript + React,使用 `@decky/ui` 提供的组件,遵循现有代码风格。

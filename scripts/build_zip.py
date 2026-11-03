@@ -12,9 +12,9 @@
         ├── README.md       (推荐)
         └── LICENSE         (必填)
 
-用法:
-    python build_zip.py            # 打包当前版本
-    python build_zip.py --skip-build   # 跳过 pnpm build(已构建过时)
+用法(在仓库根目录执行):
+    python scripts/build_zip.py               # 打包当前版本
+    python scripts/build_zip.py --skip-build  # 跳过 pnpm build(已构建过时)
 """
 import argparse
 import json
@@ -24,7 +24,8 @@ import subprocess
 import sys
 import zipfile
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+# 本脚本在 scripts/ 下,项目根目录是它的上一级
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def read_version() -> str:

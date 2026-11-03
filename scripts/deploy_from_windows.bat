@@ -7,7 +7,7 @@ REM   双击运行,或命令行执行 deploy_from_windows.bat <SteamDeck_IP>
 REM
 REM 功能:
 REM   1. 打包项目(排除 node_modules 等)上传到 Steam Deck
-REM   2. 在 Steam Deck 上执行 deploy.sh 完成安装 + 重载
+REM   2. 在 Steam Deck 上执行 scripts/deploy.sh 完成安装 + 重载
 REM
 REM 前置:
 REM   - Steam Deck 已开启 SSH (sshd)
@@ -48,7 +48,7 @@ set "TARBALL=%TEMP%\epicdeck_deploy.tar.gz"
 
 REM 在项目目录打包(排除不必要的文件)
 pushd "%PROJECT_DIR%"
-tar --exclude=node_modules --exclude=.git --exclude=HANDOFF.md --exclude=deploy_from_windows.bat -czf "%TARBALL%" .
+tar --exclude=node_modules --exclude=.git --exclude=HANDOFF.md --exclude=scripts/deploy_from_windows.bat -czf "%TARBALL%" .
 popd
 
 echo       上传中 (可能需要十几秒)...
@@ -60,7 +60,7 @@ if errorlevel 1 (
 
 REM ---- 3. 解压并执行部署 -----------------------------------------------------
 echo [3/3] 在 Steam Deck 上解压并执行部署...
-ssh %DECK_USER%@%DECK_IP% "rm -rf /tmp/epicdeck_src && mkdir -p /tmp/epicdeck_src && tar -xzf /tmp/epicdeck_deploy.tar.gz -C /tmp/epicdeck_src && cd /tmp/epicdeck_src && chmod +x deploy.sh && ./deploy.sh"
+ssh %DECK_USER%@%DECK_IP% "rm -rf /tmp/epicdeck_src && mkdir -p /tmp/epicdeck_src && tar -xzf /tmp/epicdeck_deploy.tar.gz -C /tmp/epicdeck_src && cd /tmp/epicdeck_src && chmod +x scripts/deploy.sh && ./scripts/deploy.sh"
 
 echo.
 echo === 部署完成 ===
