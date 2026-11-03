@@ -2143,6 +2143,9 @@ function Content() {
     setRefreshing(true);
     const a = await authStatus();
     setAuth(a);
+    // Ref writes are synchronous: the cache key must be correct before
+    // applyLibrary() writes to it, not one render later.
+    accountRef.current = a.account_id || "";
     setGameError(null);
     if (a.logged_in) {
       const r = await listGames(force);
