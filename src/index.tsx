@@ -24,7 +24,7 @@ import {
   definePlugin,
   toaster,
 } from "@decky/api";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   FaGamepad,
   FaDownload,
@@ -35,6 +35,8 @@ import {
   FaArrowLeft,
   FaSearch,
   FaClock,
+  FaExclamationTriangle,
+  FaRedo,
 } from "react-icons/fa";
 import QRCode from "qrcode";
 
@@ -114,8 +116,18 @@ const loginWithCode = callable<[raw: string], {
   error?: string;
 }>("login_with_code");
 const listGames = callable<
-  [],
-  { ok: boolean; games?: Game[]; locale?: string; size_pending?: number; error?: string }
+  [force?: boolean],
+  {
+    ok: boolean;
+    games?: Game[];
+    locale?: string;
+    size_pending?: number;
+    stale?: boolean;
+    cached_at?: number;
+    warning?: string;
+    error?: string;
+    error_kind?: "network" | "auth" | "unknown";
+  }
 >("list_games");
 const getGameSize = callable<[app_name: string], { ok: boolean; download?: number; disk?: number; error?: string }>(
   "get_game_size"
@@ -1165,20 +1177,195 @@ function writeUIState(patch: Partial<LibraryUIState>) {
   (window as any)[UI_STATE_KEY] = { ...readUIState(), ...patch };
 }
 
+// ---- library snapshot cache -------------------------------------------
+// Opening the QAM must not wait for `legendary list`. The backend keeps its
+// own snapshot, and the frontend keeps the last rendered list too: `window`
+// survives a QAM close/open (the panel is unmounted, the window is not), and
+// localStorage covers a full plugin-UI reload.
+const LIB_CACHE_KEY = "epicdeck:library:v1";
+const LIB_MEM_KEY = "__epicdeckLibrary";
+
+interface LibraryCache {
+  account: string;
+  ts: number;
+  locale: string;
+  size_pending?: number;
+  games: Game[];
+}
+
+function readLibraryCache(account?: string): LibraryCache | null {
+  const accept = (data: any): LibraryCache | null => {
+    if (!data || !Array.isArray(data.games) || data.games.length === 0) return null;
+    if (account && data.account && data.account !== account) return null;
+    return data as LibraryCache;
+  };
+  const mem = accept((window as any)[LIB_MEM_KEY]);
+  if (mem) return mem;
+  try {
+    const raw = localStorage.getItem(LIB_CACHE_KEY);
+    const data = raw ? accept(JSON.parse(raw)) : null;
+    // Promote to memory: localStorage is a synchronous read, and this helper
+    // is called several times while the panel mounts.
+    if (data) (window as any)[LIB_MEM_KEY] = data;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function writeLibraryCache(
+  account: string,
+  payload: { games?: Game[]; locale?: string; size_pending?: number }
+) {
+  if (!payload.games || payload.games.length === 0) return;
+  const data: LibraryCache = {
+    account,
+    ts: Date.now(),
+    locale: payload.locale ?? "",
+    size_pending: payload.size_pending ?? 0,
+    games: payload.games,
+  };
+  (window as any)[LIB_MEM_KEY] = data;
+  try {
+    localStorage.setItem(LIB_CACHE_KEY, JSON.stringify(data));
+  } catch (e) {
+    console.log("EpicDeck: library cache write failed", e);
+  }
+}
+
+function clearLibraryCache() {
+  delete (window as any)[LIB_MEM_KEY];
+  try {
+    localStorage.removeItem(LIB_CACHE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+type LibraryFailure = { message: string; kind: "network" | "auth" | "unknown" };
+
+// A dedicated card instead of one red line: "can't reach Epic" is an actionable
+// state, and the user needs to know whether to check Wi-Fi or log in again.
+function LibraryErrorCard({
+  error,
+  onRetry,
+  retrying,
+}: {
+  error: LibraryFailure;
+  onRetry: () => void;
+  retrying?: boolean;
+}) {
+  const title =
+    error.kind === "network"
+      ? "连不上 Epic 服务器"
+      : error.kind === "auth"
+      ? "登录状态已失效"
+      : "读取游戏库失败";
+  const hint =
+    error.kind === "network"
+      ? "请确认掌机已联网、代理（如有）可用；Epic 服务器偶发不稳定，稍后重试通常就好。"
+      : error.kind === "auth"
+      ? "凭证可能已过期或被吊销，请在下方「设置」里重新登录。"
+      : "可以重试一次；若反复失败，请到设置里导出诊断日志。";
+  return (
+    <PanelSection title="游戏库">
+      <PanelSectionRow>
+        <div style={{ padding: "8px 0", lineHeight: 1.5 }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              color: "#ffb84d",
+              fontWeight: 600,
+            }}
+          >
+            <FaExclamationTriangle /> {title}
+          </div>
+          <div
+            style={{
+              marginTop: "6px",
+              color: "var(--decky-secondary-text, #b8b8b8)",
+              fontSize: "0.9em",
+              wordBreak: "break-word",
+            }}
+          >
+            {error.message}
+          </div>
+          <div
+            style={{
+              marginTop: "6px",
+              color: "var(--decky-secondary-text, #9a9a9a)",
+              fontSize: "0.82em",
+            }}
+          >
+            {hint}
+          </div>
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={onRetry} disabled={retrying}>
+          <div style={{ display: "flex", gap: "6px", justifyContent: "center", alignItems: "center" }}>
+            <FaRedo /> {retrying ? "正在重试…" : "重试"}
+          </div>
+        </ButtonItem>
+      </PanelSectionRow>
+    </PanelSection>
+  );
+}
+
+// Non-blocking banner shown above a cached list when a refresh failed.
+function LibraryWarning({ text, onRetry }: { text: string; onRetry?: () => void }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        margin: "0 0 8px 0",
+        padding: "8px 10px",
+        borderRadius: "6px",
+        background: "rgba(255, 184, 77, 0.12)",
+        border: "1px solid rgba(255, 184, 77, 0.35)",
+        color: "#ffcf80",
+        fontSize: "0.82em",
+        lineHeight: 1.4,
+      }}
+    >
+      <FaExclamationTriangle />
+      <span style={{ flex: 1 }}>{text}</span>
+      {onRetry && (
+        <span
+          onClick={onRetry}
+          style={{ textDecoration: "underline", cursor: "pointer", whiteSpace: "nowrap" }}
+        >
+          重试
+        </span>
+      )}
+    </div>
+  );
+}
+
 function LibraryView({
   games,
   error,
+  warning,
   progress,
   sizePending,
   locale,
   onOpen,
+  onRetry,
+  retrying,
 }: {
   games: Game[];
-  error?: string;
+  error?: LibraryFailure | null;
+  warning?: string;
   progress: Record<string, InstallProgress>;
   sizePending: number;
   locale: string;
   onOpen: (game: Game) => void;
+  onRetry?: () => void;
+  retrying?: boolean;
 }) {
   const initial = useMemo(readUIState, []);
   const [query, setQuery] = useState(initial.query);
@@ -1240,15 +1427,13 @@ function LibraryView({
     return filtered;
   }, [games, query, sort, installFilter]);
 
-  if (error) {
+  if (error && games.length === 0) {
     return (
-      <PanelSection title="游戏库">
-        <PanelSectionRow>
-          <div style={{ padding: "12px 0", color: "var(--decky-error-color, #ff6b6b)" }}>
-            读取游戏库失败：{error}
-          </div>
-        </PanelSectionRow>
-      </PanelSection>
+      <LibraryErrorCard
+        error={error}
+        onRetry={onRetry ?? (() => {})}
+        retrying={retrying}
+      />
     );
   }
 
@@ -1274,6 +1459,18 @@ function LibraryView({
     >
       <FocusStyles />
       <PanelSection>
+        {(error || warning) && (
+          <PanelSectionRow>
+            <LibraryWarning
+              text={
+                error
+                  ? `${error.message} 当前显示的是上次加载的游戏库。`
+                  : warning!
+              }
+              onRetry={onRetry}
+            />
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
           <Focusable style={{ display: "flex", gap: "6px", width: "100%" }}>
             {INSTALL_FILTER_ORDER.map((f) => {
@@ -1805,10 +2002,14 @@ function SettingsView() {
 
 function Content() {
   const [auth, setAuth] = useState<AuthStatus | null>(null);
-  const [games, setGames] = useState<Game[]>([]);
-  const [gameError, setGameError] = useState<string>("");
+  // Paint the last known library before the first IPC round-trip finishes.
+  // `useState(readLibraryCache())` runs once per mount; the QAM remounts the
+  // panel on every open, so this is what makes opening feel instant.
+  const [games, setGames] = useState<Game[]>(() => readLibraryCache()?.games ?? []);
+  const [gameError, setGameError] = useState<LibraryFailure | null>(null);
   const [env, setEnv] = useState<{ legendary_installed: boolean }>({ legendary_installed: true });
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState<boolean>(() => !readLibraryCache());
+  const [refreshing, setRefreshing] = useState<boolean>(false);
   // Detail page state: opening a game replaces the library view.
   const [selected, setSelected] = useState<Game | null>(null);
   const [progress, setProgress] = useState<Record<string, InstallProgress>>({});
@@ -1818,8 +2019,15 @@ function Content() {
   // login screen nor the library flashes before the prompt appears.
   const [firstRunDone, setFirstRunDone] = useState<boolean | null>(null);
   // Titles and sizes arrive after the list is already on screen.
-  const [sizePending, setSizePending] = useState(0);
-  const [locale, setLocale] = useState("");
+  const [sizePending, setSizePending] = useState<number>(
+    () => readLibraryCache()?.size_pending ?? 0
+  );
+  const [locale, setLocale] = useState<string>(() => readLibraryCache()?.locale ?? "");
+  // Cache is keyed by account so switching users never shows the old library.
+  const accountRef = useRef<string>("");
+  useEffect(() => {
+    accountRef.current = auth?.account_id || "";
+  }, [auth?.account_id]);
 
   // Install progress is owned here so both the list and the detail page see it.
   useEffect(() => {
@@ -1837,9 +2045,14 @@ function Content() {
 
   // The backend patches titles/sizes in as it discovers them (localised title
   // first, then one manifest per game), so the list never blocks on 138
-  // network round-trips.
+  // network round-trips. Playtime arrives through the same channel.
   useEffect(() => {
-    type Patch = { title?: string; download?: number; disk?: number };
+    type Patch = {
+      title?: string;
+      playtime_seconds?: number;
+      download?: number;
+      disk?: number;
+    };
     const listener = addEventListener<[Record<string, Patch>, number]>(
       "library_patch",
       (patch, remaining) => {
@@ -1852,6 +2065,7 @@ function Content() {
                 ...g,
                 title: p.title ?? g.title,
                 localized_title: p.title ? true : g.localized_title,
+                playtime_seconds: p.playtime_seconds ?? g.playtime_seconds,
                 download_size: p.download ?? g.download_size,
                 disk_size: p.disk ?? g.disk_size,
                 install_size: p.download ?? g.install_size,
@@ -1859,40 +2073,104 @@ function Content() {
             })
           );
         }
-        setSizePending(typeof remaining === "number" ? remaining : 0);
+        // A negative count means "this patch is not about sizes" (playtime).
+        if (typeof remaining === "number" && remaining >= 0) setSizePending(remaining);
       }
     );
     return () => removeEventListener("library_patch", listener);
   }, []);
 
-  const reloadGames = async () => {
-    const r = await listGames();
-    if (r.ok) {
-      setGames(r.games ?? []);
-      setSizePending(r.size_pending ?? 0);
-      setLocale(r.locale ?? "");
-    }
+  // The backend refreshes a stale snapshot in the background and pushes the
+  // whole list when it lands, which is what lets the panel open instantly and
+  // fill itself in silently.
+  useEffect(() => {
+    const onFull = addEventListener<[any]>("library_full", (payload) => {
+      if (!payload || !payload.ok) return;
+      setGames(payload.games ?? []);
+      setSizePending(payload.size_pending ?? 0);
+      setLocale(payload.locale ?? "");
+      setGameError(null);
+      setLoading(false);
+      writeLibraryCache(accountRef.current, payload);
+    });
+    const onError = addEventListener<[string, string]>("library_error", (message, kind) => {
+      setGameError({
+        message: message || "读取游戏库失败",
+        kind: (kind as LibraryFailure["kind"]) || "unknown",
+      });
+    });
+    return () => {
+      removeEventListener("library_full", onFull);
+      removeEventListener("library_error", onError);
+    };
+  }, []);
+
+  // Single place that turns a backend payload into component state, so the
+  // cached, refreshed and event-driven paths can never drift apart.
+  const applyLibrary = (r: {
+    games?: Game[];
+    locale?: string;
+    size_pending?: number;
+    stale?: boolean;
+    warning?: string;
+    error?: string;
+    error_kind?: string;
+  }) => {
+    setGames(r.games ?? []);
+    setSizePending(r.size_pending ?? 0);
+    setLocale(r.locale ?? "");
+    setGameError(
+      r.error_kind
+        ? {
+            message: r.warning || r.error || "读取游戏库失败",
+            kind: (r.error_kind as LibraryFailure["kind"]) || "unknown",
+          }
+        : null
+    );
+    writeLibraryCache(accountRef.current, r);
   };
 
-  const refresh = async () => {
-    setLoading(true);
+  const reloadGames = async () => {
+    const r = await listGames();
+    if (r.ok) applyLibrary(r);
+  };
+
+  // `force` skips the backend snapshot — used by the retry button, where the
+  // user explicitly wants a fresh network call.
+  const refresh = async (force = false) => {
+    // Only block the UI when there is nothing cached to show.
+    if (readLibraryCache() === null) setLoading(true);
+    setRefreshing(true);
     const a = await authStatus();
     setAuth(a);
-    setGameError("");
+    setGameError(null);
     if (a.logged_in) {
-      const r = await listGames();
+      const r = await listGames(force);
       if (r.ok) {
-        setGames(r.games ?? []);
-        setSizePending(r.size_pending ?? 0);
-        setLocale(r.locale ?? "");
+        applyLibrary(r);
       } else {
-        setGames([]);
-        setGameError(r.error ?? "未知错误");
+        const cached = readLibraryCache(a.account_id);
+        if (cached) {
+          // Keep the cached list visible with a banner instead of wiping it.
+          setGames(cached.games);
+          setGameError({
+            message: r.error ?? "读取游戏库失败",
+            kind: (r.error_kind as LibraryFailure["kind"]) || "unknown",
+          });
+        } else {
+          setGames([]);
+          setGameError({
+            message: r.error ?? "未知错误",
+            kind: (r.error_kind as LibraryFailure["kind"]) || "unknown",
+          });
+        }
       }
     } else {
       setGames([]);
+      clearLibraryCache();
     }
     setLoading(false);
+    setRefreshing(false);
   };
 
   useEffect(() => {
@@ -1930,27 +2208,50 @@ function Content() {
       // A backend that timed out reports {} — do not trap the user in the
       // prompt just because the settings call was slow.
       setFirstRunDone(boot.settings.first_run_done !== false);
-      setGameError("");
+      accountRef.current = authResult.account_id || "";
+      setGameError(null);
 
       if (authResult.logged_in) {
+        // Drop a snapshot that belongs to a different Epic account.
+        const cached = readLibraryCache(authResult.account_id);
+        if (!cached && readLibraryCache()) {
+          clearLibraryCache();
+          setGames([]);
+          setSizePending(0);
+          setLocale("");
+          setLoading(true);
+        }
+
+        // The snapshot path returns in milliseconds; the first run (no cache)
+        // still gets a generous ceiling so a dead network cannot hang the UI.
         const r = await withTimeout(listGames(), 20000, {
           ok: false,
           games: [],
           size_pending: 0,
           locale: "",
-          error: "读取游戏库超时",
+          error: "读取游戏库超时：Epic 服务器没有响应",
+          error_kind: "network",
         });
         if (cancelled) return;
         if (r.ok) {
-          setGames(r.games ?? []);
-          setSizePending(r.size_pending ?? 0);
-          setLocale(r.locale ?? "");
+          applyLibrary(r);
+        } else if (cached) {
+          // Keep the cached rows; the banner explains the failed refresh.
+          setGames(cached.games);
+          setGameError({
+            message: r.error ?? "读取游戏库失败",
+            kind: (r.error_kind as LibraryFailure["kind"]) || "unknown",
+          });
         } else {
           setGames([]);
-          setGameError(r.error ?? "未知错误");
+          setGameError({
+            message: r.error ?? "未知错误",
+            kind: (r.error_kind as LibraryFailure["kind"]) || "unknown",
+          });
         }
       } else {
         setGames([]);
+        clearLibraryCache();
       }
       setLoading(false);
     })();
@@ -1984,7 +2285,8 @@ function Content() {
     if (r.ok) {
       setAuth(null);
       setGames([]);
-      setGameError("");
+      setGameError(null);
+      clearLibraryCache();
     } else {
       toaster.toast({ title: "登出失败", body: r.error ?? "" });
     }
@@ -2051,6 +2353,8 @@ function Content() {
         sizePending={sizePending}
         locale={locale}
         onOpen={(g) => setSelected(g)}
+        onRetry={() => refresh(true)}
+        retrying={refreshing}
       />
       <SettingsView />
     </>

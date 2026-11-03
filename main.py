@@ -4,6 +4,7 @@
 import os
 import re
 import sys
+import json
 import time
 import asyncio
 import configparser
@@ -81,11 +82,61 @@ def extract_authorization_code(raw: str) -> str:
     return hits[-1] if hits else ""
 
 
+# How long a library snapshot is considered fresh enough to skip the network.
+# Five minutes keeps "added a game on the phone, opened the panel" responsive
+# without hammering Epic's API every time the QAM is opened.
+LIBRARY_TTL = 300.0
+PLAYTIME_TTL = 3600.0
+
+_AUTH_MARKERS = (
+    "401",
+    "unauthorized",
+    "invalid_grant",
+    "expired",
+    "not logged in",
+    "no user",
+    "credentials",
+)
+_NETWORK_MARKERS = (
+    "timed out",
+    "timeout",
+    "urlopen",
+    "connection",
+    "resolve",
+    "unreachable",
+    "ssl",
+    "temporary failure",
+    "network",
+    "proxy",
+    "502",
+    "503",
+    "504",
+    "getaddrinfo",
+)
+
+
+def classify_error(exc) -> tuple:
+    """Map a Legendary failure to (kind, human message).
+
+    The QAM has to tell "you are offline" apart from "your token expired" —
+    otherwise every hiccup looks like the same generic error and the user has
+    no idea whether to check Wi-Fi or log in again.
+    """
+    text = str(exc or "").strip()
+    low = text.lower()
+    if any(m in low for m in _AUTH_MARKERS):
+        return "auth", "Epic 登录状态已失效，请在设置里重新登录后再试。"
+    if any(m in low for m in _NETWORK_MARKERS):
+        return "network", "连不上 Epic 服务器：请检查网络或代理，然后重试。"
+    return "unknown", text[:300] or "未知错误"
+
+
 class Plugin:
     async def _main(self):
         decky.logger.info("EpicDeck loaded")
 
         settings_dir = getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", None) or getattr(decky, "DECKY_SETTINGS_DIR", None) or os.path.join(decky.HOME, ".epicdeck")
+        self._settings_dir = settings_dir
         self.config = Config(
             os.path.join(settings_dir, "epicdeck.json")
         )
@@ -104,12 +155,25 @@ class Plugin:
         # whole library, so artwork for several games costs one call.
         self._image_cache = None
 
+        # Library snapshot cache. The QAM is torn down every time it closes,
+        # so without this every open pays for `legendary list` + a playtime
+        # request before the first row appears.
+        self._lib_cache = None
+        self._lib_cache_at = 0.0
+        self._lib_locale = ""
+        self._lib_task = None
+        self._playtime_task = None
+        self._load_library_cache()
+
         # Shortcuts created by older versions lack the locale export and the
         # "$@" forwarding; rewriting them costs nothing and fixes game language.
         try:
             self._sync_launcher_scripts()
         except Exception as e:
             decky.logger.warning("launcher sync failed: %s", e)
+
+        # Warm the cache right after load so the first panel open is instant.
+        asyncio.create_task(self._warm_library())
 
     async def _unload(self):
         for task in getattr(self, "_install_tasks", {}).values():
@@ -118,6 +182,10 @@ class Plugin:
         meta = getattr(self, "_meta_task", None)
         if meta is not None and not meta.done():
             meta.cancel()
+        for name in ("_lib_task", "_playtime_task"):
+            task = getattr(self, name, None)
+            if task is not None and not task.done():
+                task.cancel()
         await self._stop_login_session()
         decky.logger.info("EpicDeck unloaded")
         # Decky treats a falsy return as "keep the plugin running".
@@ -207,6 +275,8 @@ class Plugin:
     async def logout(self):
         try:
             await self.legendary.auth_logout()
+            # The snapshot belongs to the account that just signed out.
+            self._clear_library_cache()
             return {"ok": True}
         except LegendaryError as e:
             return {"ok": False, "error": str(e)}
@@ -553,23 +623,55 @@ class Plugin:
         return {"ok": True}
 
     # -- library ----------------------------------------------------------
-    async def list_games(self):
-        try:
-            games = await self.legendary.list_games()
-        except LegendaryError as e:
-            return {"ok": False, "error": str(e)}
+    async def list_games(self, force: bool = False):
+        """Return the library, cache-first.
 
-        # Play time comes from Epic's library-service. It is a nice-to-have, so
-        # a timeout or an expired token degrades to zero rather than failing
-        # the whole library load.
-        loop = asyncio.get_running_loop()
+        Decky tears the QAM content down every time it closes, so this used to
+        re-run `legendary list` plus a playtime request on every open — several
+        seconds of blank panel. A snapshot (memory + JSON on disk) is served
+        immediately now, and a background refresh patches the rows in.
+        """
+        cached = getattr(self, "_lib_cache", None)
+        age = time.time() - getattr(self, "_lib_cache_at", 0.0)
+
+        if cached and not force and age < LIBRARY_TTL:
+            return self._library_payload(cached)
+
+        # Stale but usable: never make the user wait for the network.
+        if cached and not force:
+            self._ensure_library_refresh()
+            return self._library_payload(cached, stale=True)
+
         try:
-            playtime = await asyncio.wait_for(
-                loop.run_in_executor(None, fetch_playtime), timeout=15.0
-            )
-        except Exception as e:
-            decky.logger.warning("playtime unavailable: %s", e)
-            playtime = {}
+            games = await self._fetch_library()
+        except LegendaryError as e:
+            kind, message = classify_error(e)
+            decky.logger.warning("library load failed (%s): %s", kind, e)
+            if cached:
+                # Keep showing the last known library instead of an error page
+                # just because the network blinked.
+                self._ensure_library_refresh()
+                payload = self._library_payload(cached, stale=True)
+                payload["warning"] = message
+                payload["error_kind"] = kind
+                return payload
+            return {"ok": False, "error": message, "error_kind": kind}
+        except Exception as e:  # noqa: BLE001 - never leave the QAM blank
+            kind, message = classify_error(e)
+            decky.logger.exception("library load crashed")
+            if cached:
+                payload = self._library_payload(cached, stale=True)
+                payload["warning"] = message
+                payload["error_kind"] = kind
+                return payload
+            return {"ok": False, "error": message, "error_kind": kind}
+
+        self._store_library(games)
+        return self._library_payload(games)
+
+    async def _fetch_library(self):
+        """Hit Epic and build a fresh game list (slow path, network involved)."""
+        games = await self.legendary.list_games()
 
         # Epic exposes no "date added", so we record when each title first
         # showed up in this plugin's library. Everything seen on the first run
@@ -592,7 +694,6 @@ class Plugin:
             in_steam = set()
 
         for g in games:
-            g["playtime_seconds"] = playtime.get(g["app_name"], 0)
             g["in_steam"] = ("%s.sh" % g["app_name"]) in in_steam
             seen = first_seen.get(g["app_name"])
             if not isinstance(seen, int):
@@ -612,25 +713,181 @@ class Plugin:
         # each), so both are cached and filled in by a background task that
         # patches the list through events.
         locale = detect_locale(self.config.get("title_locale", "auto"))
+        self._lib_locale = locale
         self._apply_cached_metadata(games, locale)
 
-        # Only advertise a pending count when a background job will actually
-        # fill it in; otherwise the UI would sit on "0/138" forever.
+        if bool(self.config.get("auto_fetch_size", True)):
+            self._ensure_metadata_refresh(games, locale)
+
+        # Playtime is a nice-to-have: it used to block the whole library on a
+        # 15s request. Serve the cached numbers and refresh them quietly.
+        self._ensure_playtime_refresh()
+        return games
+
+    # -- library cache ---------------------------------------------------
+    def _library_cache_path(self):
+        return os.path.join(self._settings_dir, "library.json")
+
+    def _load_library_cache(self):
+        path = self._library_cache_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or data.get("version") != 1:
+                return
+            games = data.get("games")
+            if not isinstance(games, list):
+                return
+            self._lib_cache = [g for g in games if isinstance(g, dict)]
+            self._lib_cache_at = float(data.get("ts") or 0)
+            self._lib_locale = str(data.get("locale") or "")
+            decky.logger.info("library cache: %d games", len(self._lib_cache))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            decky.logger.warning("library cache unreadable: %s", e)
+
+    def _store_library(self, games):
+        self._lib_cache = games
+        self._lib_cache_at = time.time()
+        try:
+            tmp = self._library_cache_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "version": 1,
+                        "ts": int(self._lib_cache_at),
+                        "locale": self._lib_locale,
+                        "games": games,
+                    },
+                    f,
+                    ensure_ascii=False,
+                )
+            os.replace(tmp, self._library_cache_path())
+        except OSError as e:
+            decky.logger.warning("library cache save failed: %s", e)
+
+    def _clear_library_cache(self):
+        """Forget the snapshot — used on logout so accounts never mix."""
+        self._lib_cache = None
+        self._lib_cache_at = 0.0
+        self._lib_locale = ""
+        try:
+            os.remove(self._library_cache_path())
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            decky.logger.warning("library cache clear failed: %s", e)
+
+    def _playtime_map(self):
+        data = self.config.get("playtime_cache") or {}
+        return data if isinstance(data, dict) else {}
+
+    def _library_payload(self, games, stale: bool = False):
+        playtime = self._playtime_map()
+        locale = self._lib_locale or detect_locale(
+            self.config.get("title_locale", "auto")
+        )
+        out = []
+        for g in games:
+            item = dict(g)
+            item["playtime_seconds"] = int(playtime.get(g["app_name"]) or 0)
+            out.append(item)
+        # A refresh may have landed new titles/sizes since the snapshot.
+        self._apply_cached_metadata(out, locale)
+
         try:
             have_legendary = self.legendary._resolve() is not None
         except Exception:
             have_legendary = False
         can_fetch = bool(self.config.get("auto_fetch_size", True)) and have_legendary
-        pending = sum(1 for g in games if not g.get("disk_size")) if can_fetch else 0
+        pending = sum(1 for g in out if not g.get("disk_size")) if can_fetch else 0
         if can_fetch:
-            self._ensure_metadata_refresh(games, locale)
+            self._ensure_metadata_refresh(out, locale)
 
         return {
             "ok": True,
-            "games": games,
+            "games": out,
             "locale": locale,
             "size_pending": pending,
+            "stale": bool(stale),
+            "cached_at": int(self._lib_cache_at or 0),
         }
+
+    def _ensure_library_refresh(self):
+        task = getattr(self, "_lib_task", None)
+        if task is not None and not task.done():
+            return
+        self._lib_task = asyncio.create_task(self._refresh_library_background())
+
+    async def _refresh_library_background(self):
+        try:
+            games = await self._fetch_library()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - background job, log and move on
+            kind, message = classify_error(e)
+            decky.logger.warning("background refresh failed (%s): %s", kind, e)
+            try:
+                await decky.emit("library_error", message, kind)
+            except Exception:
+                pass
+            return
+        self._store_library(games)
+        try:
+            await decky.emit("library_full", self._library_payload(games))
+        except Exception as e:
+            decky.logger.warning("library_full emit failed: %s", e)
+
+    async def _warm_library(self):
+        """Prime the cache after plugin load so the first open is instant."""
+        await asyncio.sleep(1.0)
+        try:
+            status = await self.legendary.auth_status()
+        except Exception:
+            return
+        if not status.get("logged_in"):
+            return
+        if self._lib_cache is None:
+            await self._refresh_library_background()
+        else:
+            self._ensure_playtime_refresh()
+            self._ensure_library_refresh()
+
+    # -- playtime --------------------------------------------------------
+    def _ensure_playtime_refresh(self):
+        cached = self._playtime_map()
+        if time.time() - float(cached.get("__ts") or 0) < PLAYTIME_TTL:
+            return
+        task = getattr(self, "_playtime_task", None)
+        if task is not None and not task.done():
+            return
+        self._playtime_task = asyncio.create_task(self._refresh_playtime())
+
+    async def _refresh_playtime(self):
+        loop = asyncio.get_running_loop()
+        try:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(None, fetch_playtime), timeout=25.0
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            decky.logger.warning("playtime unavailable: %s", e)
+            return
+        if not isinstance(data, dict) or not data:
+            return
+        cache = dict(data)
+        cache["__ts"] = int(time.time())
+        try:
+            self.config.set("playtime_cache", cache)
+        except OSError as e:
+            decky.logger.warning("playtime cache save failed: %s", e)
+        patch = {k: {"playtime_seconds": int(v or 0)} for k, v in data.items()}
+        try:
+            await decky.emit("library_patch", patch, -1)
+        except Exception as e:
+            decky.logger.warning("playtime patch failed: %s", e)
 
     # -- library enrichment ----------------------------------------------
     def _apply_cached_metadata(self, games, locale):
