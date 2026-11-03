@@ -103,6 +103,10 @@ export { LIBRARY_ROUTE };
 
 type TabId = "library" | "downloads" | "settings";
 
+// Replaced with the real number at build time (see rollup.config.js), so the
+// settings footer can never drift from package.json again.
+const PLUGIN_VERSION = "__EPICDECK_VERSION__";
+
 const TABS: { id: TabId; label: string; icon: ReactNode }[] = [
   { id: "library", label: "游戏库", icon: <FaThLarge /> },
   { id: "downloads", label: "下载", icon: <FaDownload /> },
@@ -1390,7 +1394,7 @@ function SettingsTab() {
               </ActionButton>
             </NavRow>
             <div style={{ marginTop: "12px", fontSize: "0.78em", opacity: 0.45 }}>
-              Legendary {env.legendary || "未知版本"} · 插件 0.8.3 · 数据目录
+              Legendary {env.legendary || "未知版本"} · 插件 {PLUGIN_VERSION} · 数据目录
               ~/homebrew/settings/EpicDeck
             </div>
           </Group>

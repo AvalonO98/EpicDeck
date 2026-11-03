@@ -6,7 +6,7 @@ EpicDeck 是一个 [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loa
 
 不需要装 Epic 客户端,不需要退到桌面模式,不需要手动配 wine。
 
-**当前版本 `0.8.4`** · BSD-3-Clause · SteamOS / Steam Deck · Python + Legendary
+**当前版本 `0.8.5`** · BSD-3-Clause · SteamOS / Steam Deck · Python + Legendary
 
 ---
 
