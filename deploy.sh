@@ -16,7 +16,7 @@
 set -euo pipefail
 
 # ---- 配置 ---------------------------------------------------------------
-PLUGIN_NAME="epicdeck"
+PLUGIN_NAME="EpicDeck"   # 必须与 plugin.json 的 name 一致,且与 Decky 下已有目录大小写相同
 PLUGIN_DIR="${HOME}/homebrew/plugins/${PLUGIN_NAME}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
