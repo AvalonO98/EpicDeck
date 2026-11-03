@@ -6,7 +6,7 @@ EpicDeck 是一个 [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loa
 
 不需要装 Epic 客户端,不需要退到桌面模式,不需要手动配 wine。
 
-**当前版本 `0.8.1`** · BSD-3-Clause · SteamOS / Steam Deck · Python + Legendary
+**当前版本 `0.8.3`** · BSD-3-Clause · SteamOS / Steam Deck · Python + Legendary
 
 ---
 
@@ -147,7 +147,17 @@ pnpm package        # 打包成 EpicDeck-v<version>.zip
 ## 架构
 
 ```
-src/index.tsx                  React + TypeScript 前端(QAM 面板 UI)
+src/index.tsx                  插件入口(注册 QAM 面板 + 全屏路由)
+  api.ts                       后端 callable 的类型化封装
+  store.ts                     全局状态与库缓存(QAM / 大屏共用)
+  components.tsx               通用组件:封面、滚动容器、按钮、焦点样式
+  login.tsx                    登录流程(自动取授权码)
+  qam.tsx                      侧边栏 QAM 面板(启动器 + 实时状态)
+  fullscreen.tsx               全屏大屏页:库 / 下载 / 设置 / 详情
+  geomnav.ts                   方向键几何导航(自研,接管摇杆/十字键)
+  viewport.ts                  按页面元素真实尺寸算缩放与列数
+  steammenu.tsx                STEAM 菜单入口注入(见下方已知问题)
+  routes.ts                    路由常量
 main.py                        Decky 插件入口,暴露 @callable 方法 + 事件
 py_modules/
   config.py                    配置持久化(JSON,原子写)
@@ -165,9 +175,9 @@ py_modules/
 数据流向:
 
 ```
-QAM 面板  ──callable──▶  main.py  ──子进程──▶  legendary (下载/启动)
-    ▲                      │
-    └──── 事件 ────────────┘   install_progress / library_patch / library_full / library_error
+QAM 面板 / 全屏大屏页 ──callable──▶  main.py  ──子进程──▶  legendary (下载/启动)
+        ▲                             │
+        └──── 事件 ───────────────────┘  install_progress / library_patch / library_full / library_error
 
 Steam ──启动──▶ launchers/<app>.sh ──legendary launch --wine──▶ proton/<app>.sh ──▶ Proton ──▶ 游戏
 ```

@@ -10,6 +10,7 @@ import asyncio
 import configparser
 import shlex
 import shutil
+import hashlib
 from urllib.parse import quote
 
 import decky
@@ -35,6 +36,7 @@ from py_modules.steam import (
     SteamError,
     appid_for,
     open_steam_protocol,
+    restart_steam,
 )
 from py_modules import artwork, proton
 from py_modules.legendary_installer import (
@@ -80,6 +82,51 @@ def extract_authorization_code(raw: str) -> str:
     # Last resort: take the last 32-hex run (the client id appears earlier).
     hits = re.findall(r"[0-9a-fA-F]{32}", text)
     return hits[-1] if hits else ""
+
+
+def _mask_personal(value: str) -> str:
+    """Mask the middle of an identifier (account id / phone / email) for logs.
+
+    How many chars survive on each side scales with length; an email keeps its
+    full domain. Mirrors the frontend `maskPersonal` so both surfaces agree.
+    """
+    if not value:
+        return ""
+    s = value.strip()
+    at = s.find("@")
+    if at > 0:
+        return _mask_personal(s[:at]) + s[at:]
+    n = len(s)
+    if n <= 2:
+        return s
+    if n <= 4:
+        return s[0] + "*" * max(1, n - 2) + s[-1]
+    keep = 3 if n >= 9 else 2
+    return s[:keep] + "*" * max(1, n - keep * 2) + s[n - keep:]
+
+
+def _hash_id(value: str) -> str:
+    """One-way hash of an Epic account id for the frontend.
+
+    The backend needs the raw id to talk to Epic and to key its own caches, but
+    the frontend only needs a *stable, non-reversible* token to (a) show a
+    masked identity and (b) key its library snapshot. Hashing at the boundary
+    means the raw id never crosses the backend→frontend callable boundary in
+    plaintext.
+    """
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def _public_auth(status: dict) -> dict:
+    """Rewrite an auth status dict so the raw account id never leaves the backend."""
+    raw = str(status.get("account_id") or "")
+    return {
+        "logged_in": bool(status.get("logged_in")),
+        "account_id": _hash_id(raw) if raw else "",
+        "display_name": status.get("display_name", ""),
+    }
 
 
 # How long a library snapshot is considered fresh enough to skip the network.
@@ -197,7 +244,7 @@ class Plugin:
     # -- auth -------------------------------------------------------------
     async def auth_status(self):
         try:
-            return await self.legendary.auth_status()
+            return _public_auth(await self.legendary.auth_status())
         except Exception as e:
             decky.logger.error("auth_status: %s", e)
             return {"logged_in": False, "account_id": "", "display_name": ""}
@@ -269,7 +316,7 @@ class Plugin:
         return {
             "ok": True,
             "display_name": status.get("display_name", ""),
-            "account_id": status.get("account_id", ""),
+            "account_id": _hash_id(str(status.get("account_id") or "")),
         }
 
     async def logout(self):
@@ -1589,7 +1636,7 @@ class Plugin:
 
     async def refresh_steam(self):
         try:
-            open_steam_protocol("steam://restart")
+            restart_steam()
             return {"ok": True, "note": "Steam 正在重启以刷新游戏库"}
         except SteamError as e:
             return {"ok": False, "error": str(e)}
@@ -1852,7 +1899,7 @@ class Plugin:
         try:
             status = await self.legendary.auth_status()
             add(f"  已登录: {status.get('logged_in', False)}")
-            add(f"  账号 ID: {status.get('account_id', '')}")
+            add(f"  账号 ID: {_mask_personal(str(status.get('account_id', '')))}")
             add(f"  显示名: {status.get('display_name', '')}")
         except Exception as e:
             add(f"  读取失败: {e}")

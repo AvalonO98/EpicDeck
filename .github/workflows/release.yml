@@ -90,6 +90,28 @@ jobs:
       - name: Package plugin zip
         run: python3 build_zip.py --skip-build --version "${{ steps.version.outputs.version }}"
 
+      - name: Extract release notes from CHANGELOG
+        # Release 正文直接取 CHANGELOG 里对应版本的小节,避免用提交列表(对用户没有意义)。
+        run: |
+          python3 - "${{ steps.version.outputs.version }}" <<'PY'
+          import pathlib, sys
+
+          ver = sys.argv[1]
+          lines = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+          body, grab = [], False
+          for line in lines:
+              if line.startswith("## ["):
+                  grab = line.startswith(f"## [{ver}]")
+                  continue
+              if grab:
+                  body.append(line)
+          text = "\n".join(body).strip()
+          if not text:
+              text = f"变更说明见 [CHANGELOG.md](https://github.com/AvalonO98/EpicDeck/blob/main/CHANGELOG.md)。"
+          pathlib.Path("release_notes.md").write_text(text + "\n", encoding="utf-8")
+          print(f"release notes: {len(text)} chars")
+          PY
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -97,6 +119,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           draft: false
           prerelease: false
+          body_path: release_notes.md
+          generate_release_notes: false
           files: |
             EpicDeck-v${{ steps.version.outputs.version }}.zip
-          generate_release_notes: true

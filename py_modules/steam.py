@@ -596,3 +596,24 @@ def open_steam_protocol(uri: str):
                          stderr=subprocess.DEVNULL)
     except FileNotFoundError:
         raise SteamError("找不到 xdg-open。请确认运行在 SteamOS 环境。")
+
+
+def restart_steam():
+    """Restart Steam so library/artwork changes take effect.
+
+    ``steam://restart`` via xdg-open does not work from Game Mode: the plugin
+    backend runs under `plugin_loader` without the DBus session that xdg-open
+    needs, so the URI silently dies. ``steam -shutdown`` talks to the running
+    Steam client directly (it just asks the client to quit); Gamescope then
+    relaunches Steam automatically, which is exactly the "restart" we want.
+    """
+    for cmd in (
+        ["steam", "-shutdown"],
+        ["steam", "shutdown"],
+    ):
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except FileNotFoundError:
+            continue
+    raise SteamError("找不到 steam 命令，无法重启 Steam。")
