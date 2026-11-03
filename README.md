@@ -1,19 +1,12 @@
 # EpicDeck
 
-<img src="assets/icon.png" width="88" align="left" alt="EpicDeck 图标" />
-
 **在 Steam Deck 的游戏模式里,玩你 Epic 库里的游戏。**
 
 EpicDeck 是一个 [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) 插件:登录 Epic 账号、浏览你自己的游戏库、下载安装、点一下就能玩,并且会自动把这些游戏变成 Steam 库里的一个条目——带封面、带图标、Windows 游戏由 Proton 跑起来。
 
 不需要装 Epic 客户端,不需要退到桌面模式,不需要手动配 wine。
 
-<br clear="left" />
-
-![version](https://img.shields.io/badge/version-0.8.1-blue)
-![license](https://img.shields.io/badge/license-BSD--3--Clause-green)
-![platform](https://img.shields.io/badge/platform-SteamOS%20%2F%20Steam%20Deck-1a1a1a)
-![backend](https://img.shields.io/badge/backend-Python%20%2B%20Legendary-3776AB)
+**当前版本 `0.8.1`** · BSD-3-Clause · SteamOS / Steam Deck · Python + Legendary
 
 ---
 
