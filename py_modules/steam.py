@@ -160,6 +160,16 @@ def make_appid(exe: str, app_name: str) -> int:
     return crc | 0x80000000
 
 
+def appid_for(exe: str, title: str) -> int:
+    """The appid Steam derives for a shortcut with this exe and display name.
+
+    Needed before the entry exists: the Proton wrapper is keyed by that appid
+    (so the compatdata prefix lines up with the library entry) and it has to be
+    written before the shortcut is created.
+    """
+    return make_appid((exe or "").strip(), (title or "").strip())
+
+
 def _unquote(value) -> str:
     s = str(value or "").strip()
     if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
@@ -353,6 +363,47 @@ class SteamShortcuts:
             if str(node.get("icon") or ""):
                 continue
             node["icon"] = icon
+            changed += 1
+        if changed:
+            self._save_tree(path, data)
+        return changed
+
+    def grid_dir(self) -> str:
+        """Steam's artwork folder for this account: ``userdata/<uid>/config/grid``.
+
+        Steam looks for non-Steam artwork there under the shortcut's appid
+        (`<appid>p.jpg` portrait, `<appid>.jpg` capsule, `<appid>_hero.jpg`,
+        `<appid>_logo.png`, `<appid>_icon.jpg`). It never downloads artwork for
+        a shortcut by itself, which is why entries used to show a grey tile.
+        """
+        cfg = self._config_dir()
+        return os.path.join(cfg, "grid") if cfg else ""
+
+    def set_icons(self, icons: dict) -> int:
+        """Point shortcuts' `icon` field at per-game images, in one write.
+
+        `icons` maps appid -> absolute image path. Writing the field saves
+        Steam the (fruitless) attempt to extract an icon from our shell
+        scripts and gives each entry its own picture instead of the plugin
+        logo they all shared.
+        """
+        if not icons:
+            return 0
+        path = self._shortcuts_path()
+        if not path:
+            return 0
+        data = self._load_tree(path)
+        changed = 0
+        for node in (data.get("shortcuts") or {}).values():
+            if not isinstance(node, dict):
+                continue
+            appid = int(node.get("appid", 0)) & 0xFFFFFFFF
+            wanted = icons.get(appid)
+            if not wanted:
+                continue
+            if str(node.get("icon") or "") == wanted:
+                continue
+            node["icon"] = wanted
             changed += 1
         if changed:
             self._save_tree(path, data)

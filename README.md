@@ -7,7 +7,9 @@
 - **Epic 登录**:通过 Legendary 驱动 Epic 官方网页授权,登录后展示账号昵称
 - **游戏库**:读取已购 + 已安装游戏列表,显示大小与安装状态
 - **下载/启动/卸载**:实时进度条,支持取消
+- **Windows 游戏走 Proton**:SteamOS 没有 `wine`,Windows 版游戏自动套一层 Steam 自带的 Proton(GF/GE 版本自动挑选)
 - **Steam 集成**:把游戏注册为 Steam 非 Steam 游戏(写入 `shortcuts.vdf`),可重启 Steam 刷新,或通过 `steam://` 启动
+- **封面自动补全**:把 Epic 的竖版封面/横幅/图标写进 Steam 的 `grid` 目录,非 Steam 条目不再只有灰底
 - **诊断日志导出**:设置页「导出诊断日志」按钮,一键收集环境信息、登录状态、配置和插件日志,方便排错
 
 ## 架构
@@ -18,6 +20,8 @@ main.py               Python 后端(Decky 入口,暴露 callable 方法)
 py_modules/config.py  插件配置持久化(JSON)
 py_modules/legendary.py  Legendary CLI 封装(登录/库/下载/启动)
 py_modules/steam.py   Steam shortcuts.vdf 读写 + steam:// 协议
+py_modules/proton.py  Windows 游戏的 Proton 包装(生成 --wine 脚本)
+py_modules/artwork.py 把 Epic 封面写进 Steam 的 grid 目录
 py_modules/legendary_installer.py  Legendary 二进制自动下载(含镜像加速)
 ```
 
@@ -105,6 +109,8 @@ CI 会自动:构建前端 → 打包 zip → 创建 Release 并附上 `EpicDeck-
 | `remove_from_steam` | `remove_from_steam(app_name)` | 从 shortcuts.vdf 移除 |
 | `is_in_steam` | `is_in_steam(app_name)` | 是否已添加到 Steam |
 | `refresh_steam` | `refresh_steam()` | `steam://restart` 刷新库 |
+| `get_proton_options` | `get_proton_options()` | 列出设备上可用的 Proton 版本 |
+| `refresh_artwork` | `refresh_artwork(app_name)` | 给已在 Steam 的游戏补齐封面与图标 |
 | `get_settings` / `set_setting` | 同上 | 配置读写 |
 
 后端事件:`install_progress` (app_name, state, percent, message),state 为
@@ -123,6 +129,51 @@ Epic 把授权码绑定到签发它的 client,而 Legendary 用自己的启动�
 (`34a02cf8f4414e29b15921876da36f9a`)去兑换,两者不匹配。因此插件改为:
 用户在该 client 的授权页登录 → 复制 `authorizationCode` → 插件调用
 `legendary auth --code` 完成登录。授权码一次性有效且很快过期。
+
+## Windows 游戏为什么需要 Proton
+
+SteamOS 上没有 `wine`,`which wine` 是空的。Legendary 启动 Windows 游戏时会把可执行文件
+交给 `wine` 运行,于是直接:
+
+```
+FileNotFoundError: [Errno 2] No such file or directory: 'wine'
+```
+
+Steam 自己那套 Proton 不会帮忙——它只对「目标本身是 Windows exe」的快捷方式套兼容层,
+而这个快捷方式指向的是插件的 bash 启动脚本。
+
+Legendary 留了个口子:`--wine` 后面的东西只是被当成「可执行命令」放在 exe 前面,
+不必真的是 wine。所以插件会为每个 Windows 游戏生成一层包装:
+
+```bash
+# ~/homebrew/data/EpicDeck/proton/<app_name>.sh
+unset WINEPREFIX
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.steam/steam"
+export STEAM_COMPAT_DATA_PATH="$HOME/.steam/steam/steamapps/compatdata/<appid>"
+exec "<Proton 目录>/proton" waitforexitandrun "$@"
+```
+
+启动脚本则改成 `legendary launch --wine <包装脚本> <app_name> "$@"`。
+
+- 兼容层目录按 **Steam 快捷方式的 appid** 建,和库里那条目一一对应,存档在 `compatdata/<appid>/pfx`;
+- 首次启动要初始化前缀,**黑屏 1~2 分钟属正常**;
+- Proton 选择顺序:设置里指定 → `compatibilitytools.d` 里的 GE-Proton(版本最高)→ Steam 自带正式版;
+- 可以在设置里关掉(例如改用其他包装脚本)。
+
+## 封面图是怎么来的
+
+Steam 不会给非 Steam 快捷方式自动找图,插件的做法是把 Epic 库元数据里的图下载到
+`userdata/<uid>/config/grid/`:
+
+| 文件 | 来源 | 位置 |
+|---|---|---|
+| `<appid>p.jpg` | `DieselGameBoxTall` 1200×1600 | 库列表的竖版封面 |
+| `<appid>.jpg` | `DieselGameBox` 2560×1440 | 横版胶囊 |
+| `<appid>_hero.jpg` | `DieselStoreFrontWide` | 游戏详情页横幅 |
+| `<appid>_icon.jpg` | `Thumbnail`(缺失时退回竖版) | 小图标,写进快捷方式的 `icon` 字段 |
+
+不转码(设备上没有 Pillow),扩展名按图片魔数判断。写完后需要重启 Steam 才会显示。
+若想手动换图,已装 `decky-steamgriddb` 的话也可以用它。
 
 ## 已知限制与待办
 

@@ -129,7 +129,7 @@ const setLaunchArgs = callable<
   { ok: boolean; args?: string; error?: string; warning?: string }
 >("set_launch_args");
 const installGame = callable<[app_name: string, install_dir: string], { ok: boolean; error?: string }>("install");
-const launchGame = callable<[app_name: string], { ok: boolean; error?: string }>("launch");
+const launchGame = callable<[app_name: string], { ok: boolean; error?: string; note?: string }>("launch");
 const uninstallGame = callable<[app_name: string], { ok: boolean; error?: string }>("uninstall");
 const addToSteam = callable<[app_name: string], { ok: boolean; appid?: number; error?: string }>("add_to_steam");
 const removeFromSteam = callable<[app_name: string], { ok: boolean; error?: string }>("remove_from_steam");
@@ -145,7 +145,24 @@ const completeFirstRun = callable<
   [install_dir: string],
   { ok: boolean; install_dir?: string; error?: string }
 >("complete_first_run");
-const checkEnvironment = callable<[], { legendary_installed: boolean; legendary_path: string }>("check_environment");
+const checkEnvironment = callable<
+  [],
+  {
+    legendary_installed: boolean;
+    legendary_path: string;
+    proton_installed?: boolean;
+    proton_path?: string;
+    use_proton?: boolean;
+  }
+>("check_environment");
+const getProtonOptions = callable<
+  [],
+  { ok: boolean; options: { data: string; label: string }[]; current: string; found: number }
+>("get_proton_options");
+const refreshArtwork = callable<
+  [app_name: string],
+  { ok: boolean; updated?: number; icons?: number; total?: number; note?: string; error?: string }
+>("refresh_artwork");
 const installLegendary = callable<[], { ok: boolean; path?: string; version?: string; error?: string }>("install_legendary");
 const exportLogs = callable<[], { ok: boolean; logs?: string; path?: string; error?: string }>("export_logs");
 
@@ -889,6 +906,7 @@ function GameDetail({
     const r = await launchGame(game.app_name);
     setBusy("");
     if (!r.ok) toaster.toast({ title: "启动失败", body: r.error ?? "" });
+    else if (r.note) toaster.toast({ title: "正在启动", body: r.note });
   };
 
   const doUninstall = async () => {
@@ -1515,6 +1533,8 @@ function SettingsView() {
   const [customPath, setCustomPath] = useState<string>("");
   const [savingPath, setSavingPath] = useState<boolean>(false);
   const [syncingSteam, setSyncingSteam] = useState<boolean>(false);
+  const [protons, setProtons] = useState<{ data: string; label: string }[]>([]);
+  const [fixingArt, setFixingArt] = useState<boolean>(false);
 
   useEffect(() => {
     (async () => {
@@ -1524,6 +1544,12 @@ function SettingsView() {
       setDirs(d.options);
       setCustomPath(s.install_dir || d.current || "");
       setLoaded(true);
+      try {
+        const p = await getProtonOptions();
+        setProtons(p.options);
+      } catch {
+        setProtons([]);
+      }
     })();
   }, []);
 
@@ -1596,6 +1622,32 @@ function SettingsView() {
         />
       </PanelSectionRow>
       <PanelSectionRow>
+        <ToggleField
+          label="Windows 游戏用 Proton 运行"
+          description="SteamOS 没有 wine；Windows 版 Epic 游戏要靠 Steam 自带的 Proton 启动"
+          checked={settings.use_proton !== false}
+          onChange={(v) => {
+            update("use_proton", v);
+            // The launcher scripts carry the --wine flag, so they have to be
+            // rewritten for the change to take effect.
+            window.dispatchEvent(new CustomEvent("epicdeck:library-changed"));
+          }}
+        />
+      </PanelSectionRow>
+      {settings.use_proton !== false && protons.length > 0 && (
+        <PanelSectionRow>
+          <Dropdown
+            rgOptions={protons}
+            selectedOption={settings.proton_path || ""}
+            onChange={(e) => update("proton_path", e.data)}
+          />
+          <Field
+            label="Proton 版本"
+            description="自动 = 优先 GE-Proton，其次 Steam 自带的最新正式版"
+          />
+        </PanelSectionRow>
+      )}
+      <PanelSectionRow>
         <Dropdown
           rgOptions={dirs.map((d) => ({ data: d.path, label: d.label }))}
           selectedOption={settings.install_dir || (dirs.length ? dirs[0].path : "")}
@@ -1639,6 +1691,47 @@ function SettingsView() {
           description="逐个读取 Epic 清单来估算体积（每个游戏约几秒、几 MB 流量，结果缓存 30 天）"
           checked={settings.auto_fetch_size !== false}
           onChange={(v) => update("auto_fetch_size", v)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField
+          label="自动下载封面图"
+          description="把 Epic 的竖版封面/横幅写进 Steam 的 grid 目录，非 Steam 条目才不会只有灰底"
+          checked={settings.auto_cover !== false}
+          onChange={(v) => update("auto_cover", v)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          disabled={fixingArt}
+          onClick={async () => {
+            if (fixingArt) return;
+            setFixingArt(true);
+            try {
+              const r = await refreshArtwork("");
+              if (!r.ok) {
+                toaster.toast({ title: "封面下载失败", body: r.error ?? "" });
+                return;
+              }
+              toaster.toast({
+                title: r.updated ? "封面已补齐" : "封面已是最新",
+                body:
+                  (r.updated ? `更新 ${r.updated}/${r.total ?? 0} 个。` : "") +
+                  (r.note ?? ""),
+              });
+            } catch (e) {
+              toaster.toast({ title: "封面下载失败", body: String(e) });
+            } finally {
+              setFixingArt(false);
+            }
+          }}
+        >
+          {fixingArt ? "正在下载封面…" : "补齐封面与图标"}
+        </ButtonItem>
+        <Field
+          label="封面图"
+          description="只补缺失的图，已存在的不重复下载；下载后重启 Steam 才会显示"
         />
       </PanelSectionRow>
       <PanelSectionRow>

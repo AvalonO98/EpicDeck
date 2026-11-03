@@ -205,6 +205,27 @@ class Legendary:
         base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
         return os.path.join(base, "legendary")
 
+    def installed_records(self) -> dict:
+        """Legendary's own ``installed.json``, read without a subprocess.
+
+        Called on every launcher sync, so it must not shell out: the file is a
+        plain ``{app_name: record}`` map and reading it costs microseconds.
+        """
+        path = os.path.join(self.config_dir(), "installed.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def installed_platform(self, app_name: str) -> str:
+        """'Windows' / 'Mac' / '' for an installed title."""
+        record = self.installed_records().get(app_name) or {}
+        if not isinstance(record, dict):
+            return ""
+        return str(record.get("platform") or "")
+
     def local_session(self):
         """Parse ``user.json`` without touching the network.
 
@@ -301,6 +322,33 @@ class Legendary:
                 return img["url"]
         return ""
 
+    async def key_images(self):
+        """Return ``{app_name: {image_type: url}}`` for the whole library.
+
+        Epic ships a full set of artwork per title (tall box, wide box, hero),
+        which is exactly what Steam's grid directory wants. One `list` call
+        returns all of it, so this is a single shot rather than per-game work.
+        """
+        try:
+            games = await self._run_json("list", timeout=90.0)
+        except LegendaryError:
+            return {}
+        if isinstance(games, dict):
+            games = games.get("games", [])
+        out = {}
+        for g in games or []:
+            name = g.get("app_name")
+            metadata = g.get("metadata") or {}
+            images = {}
+            for img in metadata.get("keyImages") or []:
+                kind = img.get("type")
+                url = img.get("url")
+                if kind and url:
+                    images[kind] = url
+            if name and images:
+                out[name] = images
+        return out
+
     # -- install / launch / uninstall ------------------------------------
     async def game_size(self, app_name: str):
         """Return {'download': bytes, 'disk': bytes} for a title.
@@ -328,13 +376,20 @@ class Legendary:
         args += ["-y"]  # assume yes to any prompt
         return await self._run(*args, timeout=3600.0)
 
-    async def launch(self, app_name: str, extra_args: str = ""):
+    async def launch(self, app_name: str, extra_args: str = "", wine: str = ""):
         """Launch an installed title.
 
         Arguments after the app name go straight to the game (Legendary uses
         REMAINDER), which is how per-game compatibility flags reach it.
+
+        `wine` is the "binary" Legendary puts in front of the game executable.
+        It does not have to be wine at all — any command works — which is how
+        Windows titles are handed to Steam's Proton (see py_modules/proton.py).
         """
-        cmd = ["launch", app_name]
+        cmd = ["launch"]
+        if wine:
+            cmd += ["--wine", wine]
+        cmd.append(app_name)
         if extra_args and extra_args.strip():
             cmd += shlex.split(extra_args)
         return await self._run(*cmd, timeout=60.0)

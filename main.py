@@ -29,7 +29,13 @@ from py_modules.epic_api import (
 )
 from py_modules.legendary import Legendary, LegendaryError, LegendaryNotFound
 from py_modules.paths import default_games_dir, ensure_dir, free_bytes, pretty_free
-from py_modules.steam import SteamShortcuts, SteamError, open_steam_protocol
+from py_modules.steam import (
+    SteamShortcuts,
+    SteamError,
+    appid_for,
+    open_steam_protocol,
+)
+from py_modules import artwork, proton
 from py_modules.legendary_installer import (
     InstallerError,
     default_install_dir,
@@ -94,6 +100,9 @@ class Plugin:
         self._install_tasks = {}
         self._meta_task = None
         self._meta_done = False
+        # app_name -> {image_type: url}; one `legendary list` fills it for the
+        # whole library, so artwork for several games costs one call.
+        self._image_cache = None
 
         # Shortcuts created by older versions lack the locale export and the
         # "$@" forwarding; rewriting them costs nothing and fixes game language.
@@ -924,9 +933,22 @@ class Plugin:
         return info
 
     async def launch(self, app_name: str):
+        """Launch from inside the plugin (the Steam shortcut path is below).
+
+        Windows titles get the same Proton wrapper the shortcut uses; without
+        it Legendary would try to exec a `wine` that SteamOS does not have.
+        """
         try:
-            await self.legendary.launch(app_name, self._own_launch_args(app_name))
-            return {"ok": True}
+            title = await self._installed_title(app_name) or app_name
+            appid = self.steam_appid(app_name, title)
+            wine = self._wine_wrapper(app_name, appid)
+            note = ""
+            if wine and not os.path.isdir(os.path.join(proton.compatdata_dir(appid), "pfx")):
+                note = "首次通过 Proton 启动要初始化兼容层，可能黑屏 1~2 分钟，请耐心等"
+            await self.legendary.launch(
+                app_name, self._own_launch_args(app_name), wine=wine
+            )
+            return {"ok": True, "note": note, "proton": bool(wine)}
         except LegendaryError as e:
             return {"ok": False, "error": str(e)}
 
@@ -944,9 +966,108 @@ class Plugin:
         return {"ok": True}
 
     # -- steam integration ------------------------------------------------
+    def _proton_dir(self) -> str:
+        """Where the per-game Proton wrappers live (next to the launchers)."""
+        return os.path.join(os.path.dirname(self._launcher_dir()), "proton")
+
+    def steam_appid(self, app_name: str, title: str = "") -> int:
+        """appid of this game's shortcut, or the one it is about to get.
+
+        An existing entry wins: its appid was fixed when it was written and the
+        user may since have renamed the shortcut in Steam.
+        """
+        entry = self.steam.find_by_exe(self._launcher_script_path(app_name))
+        if entry is not None:
+            return entry.appid
+        display = (title or "").strip() or app_name
+        return appid_for(self._launcher_script_path(app_name), display)
+
+    def _wine_wrapper(self, app_name: str, appid: int) -> str:
+        """Path to a Proton wrapper for a Windows title, or "" when not needed.
+
+        Linux-native titles keep using the plain launcher: handing them to
+        Proton would only add a container (and a broken one).
+        """
+        try:
+            if not proton.is_windows(self.legendary.installed_platform(app_name)):
+                return ""
+            if not self.config.get("use_proton", True):
+                return ""
+            binary = proton.choose_proton(self.config.get("proton_path", ""))
+            if not binary:
+                decky.logger.warning(
+                    "%s is a Windows title but no Proton build was found", app_name
+                )
+                return ""
+            path = os.path.join(self._proton_dir(), "%s.sh" % app_name)
+            return proton.write_wrapper(path, appid, binary)
+        except Exception as e:
+            decky.logger.error("proton wrapper for %s failed: %s", app_name, e)
+            return ""
+
+    async def _ensure_image_cache(self):
+        """Load Epic's per-game artwork URLs once per session."""
+        if self._image_cache is not None:
+            return
+        try:
+            self._image_cache = await self.legendary.key_images()
+        except Exception as e:
+            decky.logger.warning("artwork metadata unavailable: %s", e)
+            self._image_cache = {}
+
+    async def _apply_artwork(self, app_name: str, appid: int, overwrite: bool = False):
+        """Download Epic's art into Steam's grid folder.
+
+        Returns ``{"icon": path, "written": n}``: the icon path is what the
+        shortcut's `icon` field should point at, and `written` tells callers
+        whether anything actually changed on disk.
+        """
+        empty = {"icon": "", "written": 0}
+        if not self.config.get("auto_cover", True) or not appid:
+            return empty
+        grid = self.steam.grid_dir()
+        if not grid:
+            decky.logger.warning("no Steam userdata dir; artwork skipped")
+            return empty
+
+        # Every slot already on disk: nothing to download, nothing to rewrite.
+        # Only the missing ones are fetched below, so a resync is cheap.
+        if not overwrite:
+            existing = [
+                artwork.find_existing(grid, appid, suffix) for suffix, _ in artwork.SLOTS
+            ]
+            if all(existing):
+                return {"icon": existing[-1] or existing[0], "written": 0}
+
+        await self._ensure_image_cache()
+        images = (self._image_cache or {}).get(app_name) or {}
+        if not images:
+            return empty
+
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                None, artwork.ensure_artwork, grid, appid, images, overwrite
+            )
+        except Exception as e:
+            decky.logger.warning("artwork for %s failed: %s", app_name, e)
+            return empty
+        if result.get("written"):
+            decky.logger.info(
+                "artwork: %d file(s) for %s", len(result["written"]), app_name
+            )
+        return {"icon": result.get("icon") or "", "written": len(result.get("written") or [])}
+
     async def _add_to_steam(self, app_name: str, title: str = ""):
-        exe = await self._ensure_launcher_script(app_name)
-        return self.steam.add_game(app_name, exe, title=title, icon=self._steam_icon())
+        display = (title or "").strip() or await self._installed_title(app_name) or app_name
+        appid = self.steam_appid(app_name, display)
+        # The wrapper has to exist before the shortcut does: Steam starts the
+        # launcher script, and the script is what carries `--wine`.
+        wine = self._wine_wrapper(app_name, appid)
+        exe = self._write_launcher_script(app_name, title=display, wine=wine)
+        art = await self._apply_artwork(app_name, appid)
+        icon = art.get("icon") or self._steam_icon()
+        return self.steam.add_game(app_name, exe, title=display, icon=icon)
 
     def _steam_icon(self) -> str:
         """Absolute path to the icon Steam should show for our shortcuts.
@@ -1033,15 +1154,18 @@ class Plugin:
         """
         return os.path.join(self._launcher_dir(), "%s.sh" % app_name)
 
-    def _write_launcher_script(self, app_name: str, exe: str = None) -> str:
+    def _write_launcher_script(self, app_name: str, exe: str = None,
+                               title: str = "", wine: str = "") -> str:
         """(Re)write the wrapper Steam points at for this game.
 
-        Three things go in here:
+        Four things go in here:
           * a POSIX locale derived from Steam's language, because Game Mode
             exports no LANG and Legendary would otherwise launch every game
             in English;
           * the user's per-game arguments (or the ones Heroic left in
             Legendary's own config.ini);
+          * `--wine <proton wrapper>` for Windows titles, because SteamOS has
+            no wine (see py_modules/proton.py);
           * `"$@"`, so whatever the user types into Steam's "launch options"
             box is appended to the game command line.
         """
@@ -1056,6 +1180,8 @@ class Plugin:
         if extra:
             extra_shell = " " + " ".join(shlex.quote(a) for a in shlex.split(extra))
 
+        wine_shell = " --wine %s" % shlex.quote(wine) if wine else ""
+
         script_dir = self._launcher_dir()
         os.makedirs(script_dir, exist_ok=True)
         script = os.path.join(script_dir, f"{app_name}.sh")
@@ -1064,21 +1190,30 @@ class Plugin:
             "# Generated by EpicDeck, rewritten whenever launch options change.\n"
             f'export LANG="{locale}"\n'
             f'export LC_ALL="{locale}"\n'
-            f'exec {shlex.quote(exe)} launch {shlex.quote(app_name)}{extra_shell} "$@"\n'
+            f'exec {shlex.quote(exe)} launch{wine_shell} {shlex.quote(app_name)}'
+            f'{extra_shell} "$@"\n'
         )
         with open(script, "w", encoding="utf-8") as f:
             f.write(content)
         os.chmod(script, 0o755)
         return script
 
-    async def _ensure_launcher_script(self, app_name: str):
+    async def _ensure_launcher_script(self, app_name: str, title: str = ""):
         # Let _write_launcher_script resolve the binary itself: it prefers the
         # bundled copy in data/bin, while shutil.which() only sees PATH and may
         # pick up an unrelated system-wide legendary.
-        return self._write_launcher_script(app_name)
+        appid = self.steam_appid(app_name, title)
+        return self._write_launcher_script(
+            app_name, title=title, wine=self._wine_wrapper(app_name, appid)
+        )
 
     def _sync_launcher_scripts(self):
-        """Refresh wrappers created by older versions (locale + arg forwarding)."""
+        """Refresh wrappers created by older versions.
+
+        Two things changed since those were written: the locale/args handling,
+        and the Proton wrapper for Windows titles. Both are idempotent, so a
+        rewrite on every load is the cheapest way to keep them honest.
+        """
         try:
             entries = self.steam.list_shortcuts()
         except Exception as e:
@@ -1090,8 +1225,13 @@ class Plugin:
                 if os.path.realpath(os.path.dirname(entry.exe)) != launchers:
                     continue
                 app_name = os.path.splitext(os.path.basename(entry.exe))[0]
-                self._write_launcher_script(app_name)
-                decky.logger.info("launcher refreshed for %s", app_name)
+                wine = self._wine_wrapper(app_name, entry.appid)
+                self._write_launcher_script(
+                    app_name, title=entry.app_name, wine=wine
+                )
+                decky.logger.info(
+                    "launcher refreshed for %s (proton=%s)", app_name, bool(wine)
+                )
             except Exception as e:
                 decky.logger.warning("launcher refresh failed for %s: %s", entry.exe, e)
 
@@ -1165,8 +1305,7 @@ class Plugin:
 
         # Keep the Steam wrapper in sync so the next launch uses the new args.
         try:
-            if self.steam.find_game(app_name) is not None:
-                self._write_launcher_script(app_name)
+            await self._ensure_launcher_script(app_name)
         except Exception as e:
             decky.logger.warning("launcher rewrite failed for %s: %s", app_name, e)
             return {"ok": True, "args": stored[app_name], "warning": str(e)}
@@ -1207,6 +1346,83 @@ class Plugin:
             return {"ok": True}
         except SteamError as e:
             return {"ok": False, "error": str(e)}
+
+    # -- proton / artwork --------------------------------------------------
+    async def get_proton_options(self):
+        """Proton builds available on this device, for the settings dropdown."""
+        try:
+            builds = proton.find_protons()
+        except Exception as e:
+            decky.logger.warning("proton scan failed: %s", e)
+            builds = []
+        auto_label = (
+            "自动（%s）" % builds[0]["name"] if builds else "自动（未找到 Proton）"
+        )
+        options = [{"data": "", "label": auto_label}]
+        options += [{"data": b["path"], "label": b["name"]} for b in builds]
+        return {
+            "ok": True,
+            "options": options,
+            "current": (self.config.get("proton_path") or "").strip(),
+            "found": len(builds),
+        }
+
+    async def refresh_artwork(self, app_name: str = ""):
+        """Fill in missing cover art for games that are already in Steam.
+
+        Only missing slots are downloaded, so this is safe to run again after
+        adding games or after a Steam update cleared the cache.
+        """
+        try:
+            entries = self.steam.list_shortcuts()
+        except SteamError as e:
+            return {"ok": False, "error": str(e)}
+
+        launchers = os.path.realpath(self._launcher_dir())
+        targets = []
+        for entry in entries:
+            try:
+                if os.path.realpath(os.path.dirname(entry.exe)) != launchers:
+                    continue
+            except Exception:
+                continue
+            name = os.path.splitext(os.path.basename(entry.exe))[0]
+            if app_name and name != app_name:
+                continue
+            targets.append((name, entry))
+        if not targets:
+            return {
+                "ok": True,
+                "updated": 0,
+                "note": "Steam 里还没有 Epic 游戏，先添加一个再来",
+            }
+
+        await self._ensure_image_cache()
+        icons = {}
+        updated = 0
+        for name, entry in targets:
+            art = await self._apply_artwork(name, entry.appid)
+            if art.get("written"):
+                updated += 1
+            if art.get("icon"):
+                icons[entry.appid] = art["icon"]
+
+        # One write for all icons: 20 shortcuts should not mean 20 rewrites of
+        # shortcuts.vdf (each one takes a backup and re-parses the file).
+        changed = 0
+        if icons:
+            try:
+                changed = self.steam.set_icons(icons)
+            except SteamError as e:
+                decky.logger.warning("icon update failed: %s", e)
+
+        return {
+            "ok": True,
+            "updated": updated,
+            "icons": changed,
+            "total": len(targets),
+            "note": "重启 Steam 后封面才会显示" if updated else "封面都已齐全",
+        }
 
     # -- settings ---------------------------------------------------------
     async def get_settings(self):
@@ -1303,9 +1519,16 @@ class Plugin:
         except Exception as e:
             decky.logger.error("check_environment: %s", e)
             resolved = None
+        try:
+            proton_bin = proton.choose_proton(self.config.get("proton_path", ""))
+        except Exception:
+            proton_bin = ""
         return {
             "legendary_installed": resolved is not None,
             "legendary_path": resolved or "",
+            "proton_path": proton_bin,
+            "proton_installed": bool(proton_bin),
+            "use_proton": bool(self.config.get("use_proton", True)),
         }
 
     async def install_legendary(self):

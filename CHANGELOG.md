@@ -7,6 +7,25 @@
 
 ## [未发布]
 
+## [0.7.0] - 2026-11-03
+
+**Windows 游戏能玩了：走 Steam 自带的 Proton；非 Steam 条目有封面了**
+
+- **修复 Windows 版游戏启动必然失败**：设备上没有 `wine`，Legendary 启动 Windows 游戏时会 `exec wine`，直接 `FileNotFoundError` 秒退。现在新增 `py_modules/proton.py`，为每个 Windows 游戏生成一层包装脚本（`~/homebrew/data/EpicDeck/proton/<app_name>.sh`），通过 `legendary launch --wine <包装脚本>` 把游戏交给 Steam 自带的 Proton 运行。
+  - Proton 选择顺序：设置里指定的路径 → `compatibilitytools.d` 里的 GE-Proton（版本号最大）→ Steam 自带的正式版 Proton（跳过 Beta / Experimental / Hotfix）。
+  - 兼容层目录（compatdata）按 Steam 快捷方式的 appid 建，和库里那条目一一对应，存档落在 `compatdata/<appid>/pfx`。
+  - 包装脚本会 `unset WINEPREFIX`：Proton 只认 `STEAM_COMPAT_DATA_PATH`，残留的 WINEPREFIX 会干扰容器初始化。
+  - 首次启动要初始化兼容层，界面会提示「可能黑屏 1~2 分钟」。
+  - 设置里可关掉（「Windows 游戏用 Proton 运行」），也可手动指定 Proton 版本。
+- **修复非 Steam 条目没有封面**：插件以前只写 `icon` 字段，从没写过 Steam 的 grid 目录，所以竖版封面/横幅/图标全缺。现在新增 `py_modules/artwork.py`，从 Epic 库元数据里取图并写入 `userdata/<uid>/config/grid/`：
+  - `<appid>p.jpg`（竖版封面，DieselGameBoxTall）、`<appid>.jpg`（横版，DieselGameBox）、`<appid>_hero.jpg`（详情页横幅，DieselStoreFrontWide）、`<appid>_icon.jpg`（小图标）。
+  - 不转码：Steam 按扩展名解码，设备上也没有 Pillow；文件扩展名按图片魔数嗅探，CDN 给 PNG 也不会存成 `.jpg`。
+  - 只补缺失的槽位，重复同步不会重新下载；同一张图被两个槽位复用时只下载一次。
+  - 快捷方式的 `icon` 改为指向每个游戏自己的图标，不再人人共用插件 logo。
+  - 设置里新增「补齐封面与图标」按钮，可给 Steam 里已有的条目补图。
+- 启动参数保存后现在会无条件重写启动脚本（原来只在找不到快捷方式时才判断，条件写反了）。
+- 插件加载时会重新生成启动脚本，Windows 游戏自动带上 Proton 包装，无需重新添加一次。
+
 ## [0.6.0] - 2026-11-02
 
 **修掉「明明已登录却还让你登录」，登录改为直接从页面取码**

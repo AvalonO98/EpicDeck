@@ -44,6 +44,14 @@ DEFAULTS = {
     # which is different from "no opinion" (key absent -> import from
     # Legendary's own config.ini, where Heroic stores per-game args).
     "launch_args": {},
+    # Windows titles are run through Steam's Proton: SteamOS has no wine, and
+    # without it the launch dies before the game starts.
+    "use_proton": True,
+    # "" = pick the best installed build automatically (GE-Proton first).
+    "proton_path": "",
+    # Download Epic's box art into Steam's grid folder, so non-Steam entries
+    # get a real cover instead of a grey tile.
+    "auto_cover": True,
 }
 
 
