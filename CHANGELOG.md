@@ -11,13 +11,27 @@
 
 任何版本都要等用户确认后才打 tag 发版。
 
-## [未发布]
+## [0.8.4] - 2026-11-04
 
-- **仓库结构整理**：构建 / 打包 / 部署脚本从根目录移到 `scripts/`
-  （`build_zip.py` / `build_icon.py` / `deploy.sh` / `deploy_from_windows.bat` / `.ps1`），
-  命令相应改为 `python scripts/build_zip.py`、`./scripts/deploy.sh`；CI 与 `pnpm package` 已同步。
-  插件运行必需的文件（`main.py` / `plugin.json` / `package.json` / `py_modules/` / `dist/`）
-  仍留在根目录——Decky 按这个结构加载，不能动。纯工程整理，不影响插件行为，随下个版本一起走。
+工程整理，不影响插件行为。
+
+### 优化
+
+- **目录结构**：根目录只留插件运行必需的文件与文档，构建 / 打包 / 部署脚本移入 `scripts/`
+  （`build_zip.py` / `build_icon.py` / `deploy.sh` / `deploy_from_windows.bat` / `.ps1`）。
+  `main.py` / `plugin.json` / `package.json` / `py_modules/` / `dist/` 位置不变——Decky 按这个
+  结构加载，挪了插件就不认。
+- **命令同步**：`python scripts/build_zip.py`、`./scripts/deploy.sh`；CI 与 `pnpm package` 已更新，
+  README / CONTRIBUTING 补了目录约定。
+
+### 修复
+
+- **部署脚本会把整个仓库拷进插件目录**：原来同步的是整个项目（连 `src/`、`.github/`、脚本一起），
+  设备上插件目录很乱。改为白名单复制——只传 `main.py` / `plugin.json` / `package.json` /
+  `dist/` / `py_modules/` / `assets/` 和几份文档，并顺手清掉历史遗留的开发文件。
+- **部署脚本不再依赖 rsync**：SteamOS 默认没有 rsync，原来那条分支从未真正生效，实际一直走 cp 兜底。
+- **Windows 部署脚本的路径算错**：`deploy_from_windows.{bat,ps1}` 原本按「脚本在子目录」推导
+  项目根目录，放在根目录时算成了仓库的**父目录**（打错包）。脚本移入 `scripts/` 后与推导一致。
 
 ## [0.8.3] - 2026-11-04
 

@@ -8,7 +8,7 @@
 #
 # 功能:
 #   1. 检测/安装 Legendary
-#   2. 安装插件文件到 Decky 插件目录
+#   2. 安装插件文件到 Decky 插件目录(只拷运行必需的文件)
 #   3. 重载 Decky Loader
 #
 # 前置:已开启 SSH。脚本在 scripts/ 下,项目根目录取它的上一级,通过 scp 传到 Steam Deck
@@ -78,23 +78,36 @@ install_plugin() {
   info "创建插件目录: ${PLUGIN_DIR}"
   mkdir -p "${PLUGIN_DIR}"
 
-  info "同步项目文件..."
-  # 用 rsync 若可用,否则用 cp
-  if command -v rsync >/dev/null 2>&1; then
-    rsync -a --delete \
-      --exclude node_modules \
-      --exclude .git \
-      --exclude HANDOFF.md \
-      --exclude scripts \
-      "${PROJECT_DIR}/" "${PLUGIN_DIR}/"
-  else
-    warn "rsync 不可用,改用 cp (不清除旧文件)"
-    cp -r "${PROJECT_DIR}/main.py" "${PLUGIN_DIR}/"
-    cp -r "${PROJECT_DIR}/py_modules" "${PLUGIN_DIR}/"
-    cp -r "${PROJECT_DIR}/dist" "${PLUGIN_DIR}/"
-    cp "${PROJECT_DIR}/plugin.json" "${PLUGIN_DIR}/"
-    cp "${PROJECT_DIR}/package.json" "${PLUGIN_DIR}/"
-  fi
+  info "同步插件文件..."
+  # 只拷插件运行必需的东西。以前是整个仓库 rsync 过去(连 src/、CI 配置、脚本都进了
+  # 插件目录);SteamOS 默认没有 rsync,那条路径其实从没生效过,一直走的是下面的 cp 兜底。
+  # 现在统一用显式列表,不依赖 rsync。
+  mkdir -p "${PLUGIN_DIR}/dist"
+
+  cp -f "${PROJECT_DIR}/main.py" \
+        "${PROJECT_DIR}/plugin.json" \
+        "${PROJECT_DIR}/package.json" "${PLUGIN_DIR}/"
+  cp -f "${PROJECT_DIR}/dist/index.js" "${PLUGIN_DIR}/dist/index.js"
+
+  # 文档:Decky 面板不读,但带上便于在设备上排查
+  for f in README.md LICENSE NOTICE SECURITY.md CHANGELOG.md; do
+    [ -f "${PROJECT_DIR}/$f" ] && cp -f "${PROJECT_DIR}/$f" "${PLUGIN_DIR}/"
+  done
+
+  # 目录型:先删后拷,避免旧模块残留(legendary.py 之类改名后会留下孤儿文件)
+  rm -rf "${PLUGIN_DIR}/py_modules" "${PLUGIN_DIR}/assets"
+  cp -r "${PROJECT_DIR}/py_modules" "${PLUGIN_DIR}/py_modules"
+  [ -d "${PROJECT_DIR}/assets" ] && cp -r "${PROJECT_DIR}/assets" "${PLUGIN_DIR}/assets"
+
+  rm -rf "${PLUGIN_DIR}/__pycache__" "${PLUGIN_DIR}/py_modules/__pycache__"
+
+  # 清掉旧脚本误同步进插件目录的开发文件(老版本 rsync 会带进来)
+  for stale in \
+    src scripts .github node_modules \
+    rollup.config.js tsconfig.json pnpm-lock.yaml decky.pyi HANDOFF.md
+  do
+    rm -rf "${PLUGIN_DIR:?}/$stale"
+  done
 
   info "插件文件已安装到 ${PLUGIN_DIR}"
   echo "  目录内容:"
