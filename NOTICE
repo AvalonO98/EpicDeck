@@ -37,6 +37,32 @@ EpicDeck 基于以下开源项目构建,特此致谢并声明其许可证:
 - 项目地址:https://github.com/MixV2/EpicResearch
 - 用途:Epic OAuth / device code 授权流程的参考,以及 `fortniteNewSwitchGameClient` 公共客户端凭据的来源。凭据为 Epic 官方客户端反编译得到的公开常量。
 
+### 6. GameBridge (设计参考,未包含其代码)
+
+- 项目地址:https://github.com/FelPikachu/GameBridge
+- 许可证:Mozilla Public License 2.0 (MPL-2.0)
+- 用途:同为 SteamOS / Steam Deck 上的第三方游戏库 Decky 插件。EpicDeck 在 2026-11
+  的迭代中参考了它公开的**设计思路与实机踩坑结论**,包括:Steam 卡片生命周期应原地
+  更新同一 AppID、外部组件下载采用固定版本 + 散列校验、游戏进程需由启动器持有以让
+  Steam 正确统计时长、云存档的覆盖前备份/空存档拦截、以及「验收结论分级」的文档方法。
+- **本项目未包含 GameBridge 的任何源代码文件。** MPL-2.0 是文件级 copyleft:若要直接
+  复制其源码文件进本仓库,该文件须继续以 MPL-2.0 授权并公开其修改,因此本项目刻意只
+  借鉴设计、按自身代码风格重写实现。
+- 版权:Copyright (c) FelPikachu 及 GameBridge 贡献者。
+- 本项目与 GameBridge 无隶属、合作或背书关系,双方均为独立开发的非官方项目。
+
+## 网络组件的来源声明
+
+EpicDeck 不内置任何私有下载网关或第三方加速服务。当 `github.com` 直连不可用时,
+Legendary 二进制的下载会依次尝试以下**公开的 GitHub 前缀代理镜像**,并仍然对结果做
+SHA-256 校验;校验不通过即拒绝安装:
+
+- https://gh-proxy.com/
+- https://ghfast.top/
+- https://gh-proxy.net/
+
+这些镜像只代理 URL,不参与代码执行,也不属于本项目的依赖。
+
 ## 商标声明
 
 - "Epic"、"Epic Games" 及其相关商标为 Epic Games, Inc. 的商标。本项目与其无任何隶属、赞助或背书关系。

@@ -9,6 +9,7 @@ prebuilt Linux binary (built with PyInstaller, no Python required) from
 GitHub Releases into a user-writable directory.
 """
 
+import hashlib
 import os
 import platform
 import shutil
@@ -18,6 +19,30 @@ import urllib.request
 
 # Legendary GitHub Releases API and known asset names per platform.
 RELEASES_API = "https://api.github.com/repos/legendary-gl/legendary/releases/latest"
+
+# Pinned release for the platforms we can verify. Following `releases/latest`
+# meant the same version string could resolve to different bytes over time:
+# the download was whatever the CDN served that day, and nothing checked it.
+# Pinning the tag plus the SHA-256 makes the install reproducible and turns a
+# tampered or truncated mirror response into a hard failure instead of a
+# silently broken binary. Platforms without a pinned hash fall back to the
+# latest-release lookup and log that the download is unverified.
+PINNED_RELEASE = "0.21.1"
+RELEASE_ASSET_URL = (
+    "https://github.com/legendary-gl/legendary/releases/download/%s/%s"
+)
+PINNED_SHA256 = {
+    "legendary_linux_x64": (
+        "dbed33bbe96031e65858233e4badf0a1d401bb6cb0cc995d1237cf3a0c826a45"
+    ),
+    "legendary_linux_arm64": (
+        "e901cb52ada10d5cef6ffb2a0985099958124457bfb455a571023d1e042143d9"
+    ),
+}
+
+# The real binary is ~14 MB; anything much larger is either the wrong asset or
+# a hostile response. Cap the stream so a bad mirror cannot fill the disk.
+MAX_BINARY_SIZE = 80 * 1024 * 1024
 
 # GitHub acceleration mirrors (URL-prefix proxies) tried in order when the
 # direct github.com download is unreachable. Each mirrors a full
@@ -118,8 +143,20 @@ def _http_get_json(url):
 
 
 def get_download_info():
-    """Return (asset_name, download_url, api_asset_url, version) for this platform."""
+    """Return (asset_name, download_url, api_asset_url, version) for this platform.
+
+    Pinned platforms return a fixed tag URL and empty api_asset_url; the
+    caller verifies the hash. Anything else asks GitHub for the latest
+    release and comes back unverified.
+    """
     asset_name = asset_name_for_platform()
+    if asset_name in PINNED_SHA256:
+        return (
+            asset_name,
+            RELEASE_ASSET_URL % (PINNED_RELEASE, asset_name),
+            "",
+            PINNED_RELEASE,
+        )
     data = _http_get_json(RELEASES_API)
     version = data.get("tag_name", "")
     for asset in data.get("assets", []):
@@ -135,11 +172,36 @@ def get_download_info():
     )
 
 
-def _download_from(url: str, headers: dict, tmp: str, timeout: int):
-    """Download `url` into `tmp`. Raises on any network/HTTP error."""
+def _download_from(url: str, headers: dict, tmp: str, timeout: int,
+                   limit: int = MAX_BINARY_SIZE):
+    """Download `url` into `tmp`, enforcing `limit`. Returns the SHA-256 hex.
+
+    Streams in 1 MiB chunks so a wrong Content-Length cannot bypass the cap.
+    """
+    digest = hashlib.sha256()
+    received = 0
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp, open(tmp, "wb") as f:
-        shutil.copyfileobj(resp, f)
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+        declared = int(resp.headers.get("Content-Length") or 0)
+        if declared > limit:
+            raise InstallerError(
+                "下载体积异常(%d 字节,上限 %d),已中止" % (declared, limit)
+            )
+        with open(tmp, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > limit:
+                    raise InstallerError(
+                        "下载体积超过上限(%d 字节),已中止" % limit
+                    )
+                digest.update(chunk)
+                f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+    return digest.hexdigest()
 
 
 def download_legendary(dest_dir: str):
@@ -147,9 +209,12 @@ def download_legendary(dest_dir: str):
 
     Tries several download sources in order, so the install still works when
     github.com is blocked (common behind the GFW): direct -> mirrors -> API
-    asset endpoint.
+    asset endpoint. When the asset is pinned, every candidate must reproduce
+    the expected SHA-256; a mismatch is retried on the next mirror and finally
+    reported with the hash we actually got, never installed.
     """
     asset_name, url, api_url, version = get_download_info()
+    expected = PINNED_SHA256.get(asset_name)
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, "legendary")
     if os.name == "nt":
@@ -166,33 +231,48 @@ def download_legendary(dest_dir: str):
         candidates.append(api_url)  # api.github.com asset endpoint (redirects)
 
     last_err = None
+    mismatched = []
     for candidate in candidates:
         try:
             headers = dict(base_headers)
             if candidate == api_url:
                 headers["Accept"] = "application/octet-stream"
             # Fail fast (10s) on each candidate so a blocked host doesn't stall
-            # the whole install; the binary is only ~3 MB.
-            _download_from(candidate, headers, tmp, timeout=10)
+            # the whole install; the binary is only ~14 MB.
+            actual = _download_from(candidate, headers, tmp, timeout=10)
+            if expected and actual != expected:
+                mismatched.append((candidate, actual))
+                _remove(tmp)
+                continue
+            os.replace(tmp, dest)
             break
         except Exception as e:
             last_err = e
             # Remove the partial file so the next attempt starts clean.
-            if os.path.isfile(tmp):
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+            _remove(tmp)
             continue
     else:
+        if mismatched:
+            candidate, actual = mismatched[-1]
+            raise InstallerError(
+                "Legendary 校验失败:期望 SHA-256 %s,实际 %s(%s)。出于安全考虑已中止安装。"
+                % (expected, actual, candidate)
+            )
         raise InstallerError(
             "Legendary 下载失败(直连与镜像均不可用): %s" % last_err
         )
 
-    os.replace(tmp, dest)
     if os.name != "nt":
         os.chmod(dest, os.stat(dest).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return dest, version
+
+
+def _remove(path: str):
+    if os.path.isfile(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def is_legendary_installed(binary_path: str) -> bool:

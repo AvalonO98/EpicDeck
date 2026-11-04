@@ -84,9 +84,13 @@ install_plugin() {
   # 现在统一用显式列表,不依赖 rsync。
   mkdir -p "${PLUGIN_DIR}/dist"
 
-  cp -f "${PROJECT_DIR}/main.py" \
-        "${PROJECT_DIR}/plugin.json" \
-        "${PROJECT_DIR}/package.json" "${PLUGIN_DIR}/"
+  cp -f "${PROJECT_DIR}/main.py" "${PLUGIN_DIR}/"
+  cp -f "${PROJECT_DIR}/package.json" "${PLUGIN_DIR}/"
+  # plugin.json 在设备上通常属主是 root(首次经 Decky 装 zip 时创建),deck 用户无法
+  # 覆盖。写它失败曾让 set -e 直接中断整次部署(main.py 拷了、py_modules 没拷),
+  # 所以这里单独处理:失败只提示。它只影响商店展示,不影响运行。
+  cp -f "${PROJECT_DIR}/plugin.json" "${PLUGIN_DIR}/" 2>/dev/null \
+    || warn "plugin.json 属主是 root,已跳过更新(只影响商店展示,不影响运行)"
   cp -f "${PROJECT_DIR}/dist/index.js" "${PLUGIN_DIR}/dist/index.js"
 
   # 文档:Decky 面板不读,但带上便于在设备上排查
@@ -94,19 +98,28 @@ install_plugin() {
     [ -f "${PROJECT_DIR}/$f" ] && cp -f "${PROJECT_DIR}/$f" "${PLUGIN_DIR}/"
   done
 
-  # 目录型:先删后拷,避免旧模块残留(legendary.py 之类改名后会留下孤儿文件)
-  rm -rf "${PLUGIN_DIR}/py_modules" "${PLUGIN_DIR}/assets"
-  cp -r "${PROJECT_DIR}/py_modules" "${PLUGIN_DIR}/py_modules"
-  [ -d "${PROJECT_DIR}/assets" ] && cp -r "${PROJECT_DIR}/assets" "${PLUGIN_DIR}/assets"
+  # 目录型:先清空再拷,避免旧模块残留(统一改名后会留下孤儿文件)。
+  # 坑:插件目录本身在 Decky 装 zip 后属主是 root,deck 用户对它有读+进入权但没有
+  # 写权 —— 于是 `rm -rf py_modules` 会失败(要改父目录),而它之前已经清空了内容,
+  # 等于把后端删空却装的失败。所以只清子项,不删目录本身。
+  mkdir -p "${PLUGIN_DIR}/py_modules"
+  find "${PLUGIN_DIR}/py_modules" -mindepth 1 -delete
+  cp -R "${PROJECT_DIR}/py_modules/." "${PLUGIN_DIR}/py_modules/"
 
-  rm -rf "${PLUGIN_DIR}/__pycache__" "${PLUGIN_DIR}/py_modules/__pycache__"
+  if [ -d "${PROJECT_DIR}/assets" ]; then
+    mkdir -p "${PLUGIN_DIR}/assets"
+    find "${PLUGIN_DIR}/assets" -mindepth 1 -delete
+    cp -R "${PROJECT_DIR}/assets/." "${PLUGIN_DIR}/assets/"
+  fi
+
+  rm -rf "${PLUGIN_DIR}/py_modules/__pycache__" 2>/dev/null || true
 
   # 清掉旧脚本误同步进插件目录的开发文件(老版本 rsync 会带进来)
   for stale in \
     src scripts .github node_modules \
     rollup.config.js tsconfig.json pnpm-lock.yaml decky.pyi HANDOFF.md
   do
-    rm -rf "${PLUGIN_DIR:?}/$stale"
+    rm -rf "${PLUGIN_DIR:?}/$stale" 2>/dev/null || true
   done
 
   info "插件文件已安装到 ${PLUGIN_DIR}"

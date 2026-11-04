@@ -59,6 +59,7 @@ class Config:
     def __init__(self, path: str):
         self.path = path
         self._data = dict(DEFAULTS)
+        self._corrupt = False
 
     def load(self):
         try:
@@ -66,10 +67,28 @@ class Config:
                 data = json.load(f)
             if isinstance(data, dict):
                 self._data.update(data)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            # Missing or corrupt -> keep defaults.
-            pass
+            self._corrupt = False
+        except FileNotFoundError:
+            self._corrupt = False
+        except (json.JSONDecodeError, OSError):
+            # Missing or corrupt -> keep defaults, but keep the broken file
+            # around: the next `set()` writes defaults over it, which would
+            # otherwise silently drop install_dir / first_seen / caches with no
+            # way back.
+            self._corrupt = True
+            self._quarantine()
         return self._data
+
+    def _quarantine(self):
+        """Copy an unreadable config aside before defaults overwrite it."""
+        try:
+            if not os.path.isfile(self.path):
+                return
+            backup = self.path + ".corrupt"
+            if not os.path.exists(backup):
+                shutil.copy2(self.path, backup)
+        except OSError:
+            pass
 
     def get(self, key, default=None):
         return self._data.get(key, default)

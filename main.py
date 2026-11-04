@@ -162,6 +162,73 @@ _NETWORK_MARKERS = (
 )
 
 
+_GAME_SESSION_KEYS = (
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_SESSION_TYPE",
+    "PULSE_SERVER",
+)
+
+
+def _steam_session_vars() -> dict:
+    """Session variables of the running Steam client.
+
+    The plugin backend is a systemd child and inherits none of them, so games
+    started from the plugin had no `DISPLAY` and never appeared. Reading them
+    from Steam beats hardcoding `:0`: Desktop Mode uses a different display and
+    a Wayland session also needs `WAYLAND_DISPLAY`. Returns {} when Steam's pid
+    file is missing; callers fall back to the Game Mode defaults.
+    """
+    found = {}
+    try:
+        with open(os.path.expanduser("~/.steam/steam.pid"), "r", encoding="utf-8") as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        return found
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return found
+    for item in raw.split(b"\0"):
+        key, sep, value = item.partition(b"=")
+        if not sep:
+            continue
+        name = key.decode("utf-8", "replace")
+        if name in _GAME_SESSION_KEYS and name not in found:
+            found[name] = value.decode("utf-8", "replace")
+    return found
+
+
+def _posix_path(path: str) -> str:
+    """Rewrite a path for the generated bash launcher.
+
+    The launcher script is bash, but the plugin also runs on Windows during
+    development, where a backslash is an escape character and `C:\\x\\y.sh`
+    arrives mangled. Linux paths never contain backslashes, so this is a no-op
+    on the device itself.
+    """
+    if not path or os.sep == "/":
+        return path
+    return path.replace("\\", "/")
+
+
+def _valid_game_row(row) -> bool:
+    """A library row we can render without blowing up.
+
+    The snapshot on disk is shared with older builds and is editable by hand, so
+    a row may lack `app_name`; indexing it later raised KeyError straight out of
+    the Decky callable and the UI showed an empty library with no error.
+    """
+    if not isinstance(row, dict):
+        return False
+    app_name = row.get("app_name")
+    return isinstance(app_name, str) and bool(app_name.strip())
+
+
 def classify_error(exc) -> tuple:
     """Map a Legendary failure to (kind, human message).
 
@@ -196,6 +263,9 @@ class Plugin:
 
         # app_name -> asyncio.Task for active installs.
         self._install_tasks = {}
+        # Background waiters for games started from the plugin, so a finished
+        # game does not stay a zombie while the callable returns immediately.
+        self._launch_reapers = set()
         self._meta_task = None
         self._meta_done = False
         # app_name -> {image_type: url}; one `legendary list` fills it for the
@@ -220,16 +290,20 @@ class Plugin:
             decky.logger.warning("launcher sync failed: %s", e)
 
         # Warm the cache right after load so the first panel open is instant.
-        asyncio.create_task(self._warm_library())
+        # Keep a reference: an unreferenced task cannot be cancelled on unload
+        # and would keep emitting events / writing the cache after the plugin
+        # is gone (two instances writing the same library.json).
+        self._unloaded = False
+        self._warm_task = asyncio.create_task(self._warm_library())
 
     async def _unload(self):
+        # Flip the flag first: background jobs check it before each emit / write,
+        # so nothing from this instance touches the cache once we are gone.
+        self._unloaded = True
         for task in getattr(self, "_install_tasks", {}).values():
             if not task.done():
                 task.cancel()
-        meta = getattr(self, "_meta_task", None)
-        if meta is not None and not meta.done():
-            meta.cancel()
-        for name in ("_lib_task", "_playtime_task"):
+        for name in ("_meta_task", "_lib_task", "_playtime_task", "_warm_task"):
             task = getattr(self, name, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -680,9 +754,22 @@ class Plugin:
         """
         cached = getattr(self, "_lib_cache", None)
         age = time.time() - getattr(self, "_lib_cache_at", 0.0)
+        # A clock that jumped backwards (VM restore, manual edit) makes `age`
+        # negative, and `age < TTL` would then hold forever: the snapshot would
+        # never refresh and newly bought games would never show up.
+        if age < 0:
+            age = LIBRARY_TTL + 1.0
 
         if cached and not force and age < LIBRARY_TTL:
-            return self._library_payload(cached)
+            try:
+                return self._library_payload(cached)
+            except Exception as e:  # noqa: BLE001 - a bad snapshot must not kill the panel
+                # One malformed row (older format, hand-edited file) used to
+                # raise out of the callable, which made the UI show an empty
+                # library with no error at all. Drop the snapshot and refetch.
+                decky.logger.warning("library cache unusable, refetching: %s", e)
+                self._lib_cache = None
+                cached = None
 
         # Stale but usable: never make the user wait for the network.
         if cached and not force:
@@ -785,7 +872,7 @@ class Plugin:
             games = data.get("games")
             if not isinstance(games, list):
                 return
-            self._lib_cache = [g for g in games if isinstance(g, dict)]
+            self._lib_cache = [g for g in games if _valid_game_row(g)]
             self._lib_cache_at = float(data.get("ts") or 0)
             self._lib_locale = str(data.get("locale") or "")
             decky.logger.info("library cache: %d games", len(self._lib_cache))
@@ -837,8 +924,12 @@ class Plugin:
         )
         out = []
         for g in games:
+            if not _valid_game_row(g):
+                continue
             item = dict(g)
             item["playtime_seconds"] = int(playtime.get(g["app_name"]) or 0)
+            if not item.get("title"):
+                item["title"] = self._title_for(g["app_name"]) or g["app_name"]
             out.append(item)
         # A refresh may have landed new titles/sizes since the snapshot.
         self._apply_cached_metadata(out, locale)
@@ -868,6 +959,8 @@ class Plugin:
         self._lib_task = asyncio.create_task(self._refresh_library_background())
 
     async def _refresh_library_background(self):
+        if getattr(self, "_unloaded", False):
+            return
         try:
             games = await self._fetch_library()
         except asyncio.CancelledError:
@@ -880,6 +973,8 @@ class Plugin:
             except Exception:
                 pass
             return
+        if getattr(self, "_unloaded", False):
+            return
         self._store_library(games)
         try:
             await decky.emit("library_full", self._library_payload(games))
@@ -889,9 +984,13 @@ class Plugin:
     async def _warm_library(self):
         """Prime the cache after plugin load so the first open is instant."""
         await asyncio.sleep(1.0)
+        if getattr(self, "_unloaded", False):
+            return
         try:
             status = await self.legendary.auth_status()
         except Exception:
+            return
+        if getattr(self, "_unloaded", False):
             return
         if not status.get("logged_in"):
             return
@@ -937,6 +1036,26 @@ class Plugin:
             decky.logger.warning("playtime patch failed: %s", e)
 
     # -- library enrichment ----------------------------------------------
+    def _title_for(self, app_name: str) -> str:
+        """Best known display title for an app_name, without a network call."""
+        locale = self._lib_locale or detect_locale(
+            self.config.get("title_locale", "auto")
+        )
+        cache = self.config.get("title_cache") or {}
+        if isinstance(cache, dict):
+            titles = cache.get(locale) or {}
+            if isinstance(titles, dict):
+                title = titles.get(app_name)
+                if isinstance(title, str) and title.strip():
+                    return title.strip()
+            # Any locale beats the 32-char hash.
+            for other in cache.values():
+                if isinstance(other, dict):
+                    title = other.get(app_name)
+                    if isinstance(title, str) and title.strip():
+                        return title.strip()
+        return ""
+
     def _apply_cached_metadata(self, games, locale):
         """Overlay cached localised titles and cached install sizes."""
         titles = (self.config.get("title_cache") or {}).get(locale) or {}
@@ -1017,7 +1136,10 @@ class Plugin:
             todo.append(g["app_name"])
         if not todo:
             self._meta_done = True
-            await decky.emit("library_patch", {}, 0)
+            try:
+                await decky.emit("library_patch", {}, 0)
+            except Exception as e:
+                decky.logger.warning("library_patch emit failed: %s", e)
             return
 
         decky.logger.info("fetching sizes for %d games", len(todo))
@@ -1049,7 +1171,13 @@ class Plugin:
                 # Flush in batches: per-game IPC would mean 138 events.
                 due = len(patch) >= 6 or (time.time() - flush_at[0]) > 3.0
                 if patch and (due or remaining[0] == 0):
-                    await decky.emit("library_patch", dict(patch), remaining[0])
+                    try:
+                        await decky.emit("library_patch", dict(patch), remaining[0])
+                    except Exception as e:  # noqa: BLE001 - the panel may be gone
+                        # Swallowing this used to tear down the whole gather on
+                        # a transient bridge hiccup, leaving `_meta_done` false
+                        # and re-downloading every manifest on the next open.
+                        decky.logger.warning("library_patch emit failed: %s", e)
                     patch.clear()
                     flush_at[0] = time.time()
                     if dirty[0]:
@@ -1073,7 +1201,10 @@ class Plugin:
         except OSError as e:
             decky.logger.warning("size cache save failed: %s", e)
         self._meta_done = True
-        await decky.emit("library_patch", {}, 0)
+        try:
+            await decky.emit("library_patch", {}, 0)
+        except Exception as e:
+            decky.logger.warning("library_patch emit failed: %s", e)
         decky.logger.info("size fetch complete (%d games)", len(todo))
 
     async def get_game_size(self, app_name: str):
@@ -1110,6 +1241,13 @@ class Plugin:
     async def install(self, app_name: str, install_dir: str = ""):
         if app_name in self._install_tasks and not self._install_tasks[app_name].done():
             return {"ok": False, "error": "该游戏正在下载中"}
+        # Fail before the UI shows "开始下载": otherwise the row flips from
+        # starting to error ~0.1s later and the user cannot tell what happened.
+        if self.legendary._resolve() is None:
+            return {
+                "ok": False,
+                "error": "Legendary 未安装，请先在设置里点「一键安装 Legendary」",
+            }
 
         # Per-game override wins over the global default set in Settings.
         target = (install_dir or "").strip() or (self.config.get("install_dir") or "").strip()
@@ -1134,7 +1272,7 @@ class Plugin:
                 await decky.emit("install_progress", app_name, "starting", 0.0, "")
                 await self._install_streaming(app_name, target)
                 await decky.emit("install_progress", app_name, "done", 100.0, "")
-                if self.config.get("auto_add_to_steam"):
+                if self.config.get("auto_add_to_steam") and await self._still_logged_in():
                     await self._add_to_steam(app_name, await self._installed_title(app_name))
             except asyncio.CancelledError:
                 await decky.emit("install_progress", app_name, "cancelled", 0.0, "")
@@ -1146,6 +1284,20 @@ class Plugin:
         task = asyncio.create_task(_run())
         self._install_tasks[app_name] = task
         return {"ok": True, "install_dir": target}
+
+    async def _still_logged_in(self) -> bool:
+        """True when the account that started the download is still signed in.
+
+        A logout (or account switch) in the middle of an install used to still
+        end with a shortcut written under the *new* account's library, complete
+        with the old account's title and cover.
+        """
+        try:
+            status = await self.legendary.auth_status()
+        except Exception as e:
+            decky.logger.warning("install: auth re-check failed: %s", e)
+            return False
+        return bool(status.get("logged_in"))
 
     async def _install_streaming(self, app_name: str, install_dir: str):
         # Must go through _resolve(): the plugin ships its own legendary in
@@ -1168,12 +1320,18 @@ class Plugin:
             )
         except (OSError, PermissionError, FileNotFoundError) as e:
             raise LegendaryNotFound("无法启动 Legendary(%s): %s" % (exe, e))
+        last_error = ""
         try:
             while True:
                 line = await proc.stdout.readline()
                 if not line:
                     break
                 decoded = line.decode("utf-8", errors="replace").strip()
+                if "error" in decoded.lower():
+                    # Keep the most specific line legendary gave us: "Not
+                    # enough free disk space" tells the user what to fix,
+                    # "退出码 1" does not.
+                    last_error = decoded
                 # Classify the activity from the log line.
                 state = self._classify_activity(decoded)
                 if state == "progress":
@@ -1201,7 +1359,10 @@ class Plugin:
             await proc.wait()
 
         if proc.returncode != 0:
-            raise LegendaryError("安装失败 (退出码 %s)" % proc.returncode)
+            detail = last_error.strip()
+            raise LegendaryError(
+                "安装失败 (退出码 %s)%s" % (proc.returncode, ": " + detail if detail else "")
+            )
 
     @staticmethod
     def _classify_activity(line: str):
@@ -1236,25 +1397,92 @@ class Plugin:
             info["eta"] = e.group(1)
         return info
 
-    async def launch(self, app_name: str):
-        """Launch from inside the plugin (the Steam shortcut path is below).
+    async def launch(self, app_name: str, direct: bool = False):
+        """Prepare a launch. By default Steam starts the game, not us.
 
-        Windows titles get the same Proton wrapper the shortcut uses; without
-        it Legendary would try to exec a `wine` that SteamOS does not have.
+        Steam has to be the one that spawns it: gamescope only switches the
+        session when Steam believes a game is running. Starting the wrapper
+        from this backend did launch the game — sound and all — but the screen
+        stayed on the Steam UI, because nothing told the compositor to switch.
+        So the normal path returns the shortcut's appid and the frontend calls
+        `SteamClient.Apps.RunGame`, which is exactly what pressing play in the
+        library does.
+
+        `direct=True` keeps the old behaviour (run the wrapper ourselves) as a
+        fallback for when that API is unavailable. The game works, it just does
+        not take over the screen.
         """
         try:
             title = await self._installed_title(app_name) or app_name
             appid = self.steam_appid(app_name, title)
             wine = self._wine_wrapper(app_name, appid)
+            script = await self._ensure_launcher_script(app_name, title)
             note = ""
             if wine and not os.path.isdir(os.path.join(proton.compatdata_dir(appid), "pfx")):
                 note = "首次通过 Proton 启动要初始化兼容层，可能黑屏 1~2 分钟，请耐心等"
-            await self.legendary.launch(
-                app_name, self._own_launch_args(app_name), wine=wine
+
+            if not direct:
+                decky.logger.info("launch %s -> steam appid %s", app_name, appid)
+                return {
+                    "ok": True, "appid": appid, "via": "steam",
+                    "note": note, "proton": bool(wine),
+                }
+
+            env = self._game_session_env(appid)
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/bash", script,
+                env=env,
+                cwd=os.path.expanduser("~"),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                # Own session: closing the QAM or reloading the plugin must not
+                # take the game down with it (same reason the shim forwards
+                # signals itself).
+                start_new_session=True,
             )
-            return {"ok": True, "note": note, "proton": bool(wine)}
-        except LegendaryError as e:
+            # Reap it in the background so a finished game does not linger as a
+            # zombie, but never block this callable on it.
+            reaper = asyncio.ensure_future(self._reap(proc))
+            self._launch_reapers.add(reaper)
+            reaper.add_done_callback(self._launch_reapers.discard)
+            decky.logger.info("launch %s direct via %s (pid=%s)", app_name, script,
+                              getattr(proc, "pid", "?"))
+            return {
+                "ok": True, "appid": appid, "via": "direct",
+                "note": note, "proton": bool(wine),
+            }
+        except (LegendaryError, OSError) as e:
+            # Writing the Proton wrapper can fail on a full/read-only disk; that
+            # used to escape the callable and leave the button dead.
             return {"ok": False, "error": str(e)}
+
+    async def _reap(self, proc):
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+
+    def _game_session_env(self, appid: int) -> dict:
+        """Environment for a game started from the plugin.
+
+        Steam sets these when it launches the shortcut itself; a systemd child
+        has none of them. Values come from the running Steam client when
+        possible so Desktop Mode / Wayland sessions work too, with the Game Mode
+        values as a fallback (that is what the login page already relies on).
+        """
+        env = os.environ.copy()
+        uid = os.getuid()
+        env.setdefault("DISPLAY", ":0")
+        env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % uid)
+        env.setdefault("XDG_SESSION_TYPE", "x11")
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/%d/bus" % uid)
+        for key, value in _steam_session_vars().items():
+            env.setdefault(key, value)
+        env["SteamAppId"] = str(appid)
+        env["SteamGameId"] = str(appid)
+        env["SteamDeck"] = "1"
+        return env
 
     async def uninstall(self, app_name: str):
         try:
@@ -1458,6 +1686,20 @@ class Plugin:
         """
         return os.path.join(self._launcher_dir(), "%s.sh" % app_name)
 
+    def _launch_helper_path(self):
+        """Absolute path of the two-stage launch shim that ships with us."""
+        return os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "py_modules", "launchshim.py"
+        )
+
+    def _launch_log_path(self, app_name: str) -> str:
+        base = (
+            getattr(decky, "DECKY_PLUGIN_RUNTIME_DIR", None)
+            or getattr(decky, "DECKY_RUNTIME_DIR", None)
+            or os.path.join(decky.HOME, ".epicdeck")
+        )
+        return os.path.join(base, "logs", "launch-%s.log" % app_name)
+
     def _write_launcher_script(self, app_name: str, exe: str = None,
                                title: str = "", wine: str = "") -> str:
         """(Re)write the wrapper Steam points at for this game.
@@ -1477,6 +1719,7 @@ class Plugin:
             exe = self.legendary._resolve()
         if exe is None:
             raise LegendaryNotFound("Legendary 未安装")
+        exe = _posix_path(exe)
 
         locale = steam_posix_locale()
         extra = self._own_launch_args(app_name)
@@ -1486,6 +1729,20 @@ class Plugin:
 
         wine_shell = " --wine %s" % shlex.quote(wine) if wine else ""
 
+        # Two-stage launch: `legendary launch` returns as soon as the game is
+        # spawned, so Steam (which is watching this script) thinks the game
+        # stopped immediately and never counts playtime. The shim asks
+        # legendary for the `--json` launch plan, starts the game itself and
+        # waits for it. Everything it needs is written in here, because the
+        # script runs outside the plugin process.
+        helper = _posix_path(self._launch_helper_path())
+        helper_shell = "--legendary %s --app %s" % (
+            shlex.quote(exe), shlex.quote(app_name),
+        )
+        if wine:
+            helper_shell += " --wine %s" % shlex.quote(_posix_path(wine))
+        helper_shell += " --log %s" % shlex.quote(_posix_path(self._launch_log_path(app_name)))
+
         script_dir = self._launcher_dir()
         os.makedirs(script_dir, exist_ok=True)
         script = os.path.join(script_dir, f"{app_name}.sh")
@@ -1494,6 +1751,17 @@ class Plugin:
             "# Generated by EpicDeck, rewritten whenever launch options change.\n"
             f'export LANG="{locale}"\n'
             f'export LC_ALL="{locale}"\n'
+            f'EPICDECK_SHIM="{helper}"\n'
+            'for EPICDECK_PY in /usr/bin/python3 /usr/bin/python3.11 /usr/bin/python; do\n'
+            '  if [ -x "$EPICDECK_PY" ] && [ -f "$EPICDECK_SHIM" ]; then\n'
+            f'    "$EPICDECK_PY" "$EPICDECK_SHIM" {helper_shell} --{extra_shell} "$@"\n'
+            '    EPICDECK_RC=$?\n'
+            '    # 90 means the shim never started a game; fall through to the plain\n'
+            '    # launch below instead of leaving the user with a dead entry.\n'
+            '    [ "$EPICDECK_RC" -eq 90 ] || exit "$EPICDECK_RC"\n'
+            '    break\n'
+            '  fi\n'
+            'done\n'
             f'exec {shlex.quote(exe)} launch{wine_shell} {shlex.quote(app_name)}'
             f'{extra_shell} "$@"\n'
         )
@@ -1621,13 +1889,23 @@ class Plugin:
             return {"ok": True, "appid": appid}
         except (SteamError, LegendaryError) as e:
             return {"ok": False, "error": str(e)}
+        except OSError as e:
+            # Disk full / read-only mount / a file squatting on launchers: an
+            # escaping OSError rejects the Decky call, the UI's `finally` never
+            # runs and the button stays on "正在添加…" forever.
+            decky.logger.error("add_to_steam %s: %s", app_name, e)
+            return {"ok": False, "error": "写入失败: %s" % e}
 
     async def remove_from_steam(self, app_name: str):
         try:
-            self.steam.remove_by_exe(self._launcher_script_path(app_name))
-            return {"ok": True}
-        except SteamError as e:
+            removed = self.steam.remove_by_exe(self._launcher_script_path(app_name))
+        except (SteamError, OSError) as e:
             return {"ok": False, "error": str(e)}
+        if not removed:
+            # Nothing matched (already gone, or the user rewrote Exe). Reporting
+            # ok made the UI flip to "未在 Steam 中" while the shortcut stayed.
+            return {"ok": False, "error": "没有找到这个游戏的 Steam 快捷方式"}
+        return {"ok": True}
 
     async def is_in_steam(self, app_name: str):
         return {

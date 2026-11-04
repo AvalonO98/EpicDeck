@@ -67,7 +67,10 @@ def vdf_loads(raw: bytes) -> dict:
         end = raw.find(b"\x00", pos)
         if end < 0:
             raise VdfError("字符串未终止 (offset %d)" % pos)
-        value = raw[pos:end].decode("utf-8", "replace")
+        # surrogateescape keeps bytes that are not valid UTF-8 (older tools /
+        # Windows-era entries wrote GBK): they survive the round-trip instead of
+        # being flattened to U+FFFD by "replace".
+        value = raw[pos:end].decode("utf-8", "surrogateescape")
         pos = end + 1
         return value
 
@@ -120,7 +123,7 @@ def vdf_dumps(data: dict) -> bytes:
         if depth > 32:
             raise VdfError("嵌套层级过深")
         for key, value in node.items():
-            k = str(key).encode("utf-8") + b"\x00"
+            k = str(key).encode("utf-8", "surrogateescape") + b"\x00"
             if isinstance(value, dict):
                 buf.extend(bytes([TYPE_BLOCK]) + k)
                 write_block(value, depth + 1)
@@ -138,7 +141,10 @@ def vdf_dumps(data: dict) -> bytes:
                 buf.extend(bytes([TYPE_FLOAT32]) + k + struct.pack("<f", value))
             else:
                 buf.extend(
-                    bytes([TYPE_STRING]) + k + str(value).encode("utf-8") + b"\x00"
+                    bytes([TYPE_STRING])
+                    + k
+                    + str(value).encode("utf-8", "surrogateescape")
+                    + b"\x00"
                 )
 
     write_block(data)
@@ -453,7 +459,6 @@ class SteamShortcuts:
         exe_q = _quote(exe)
         start_dir_q = _quote(start_dir or os.path.dirname(exe))
         target_exe = _unquote(exe_q)
-        appid = make_appid(target_exe, display)
 
         # Match on Exe first: the wrapper path comes from app_name and never
         # changes, while AppName follows the localised title and can be edited
@@ -484,6 +489,19 @@ class SteamShortcuts:
             entry = {}
             shortcuts[target_key] = entry
 
+        # An existing entry owns its appid: it was fixed when the shortcut was
+        # first written, and grid art / compatdata are keyed by it. Recomputing
+        # from the current display name would renumber the shortcut whenever the
+        # title changed (localised name, failed `list-installed`, user rename)
+        # and orphan the old prefix + covers. Only a brand-new entry gets a
+        # freshly derived appid.
+        appid = make_appid(target_exe, display)
+        existing_appid = entry.get("appid")
+        if isinstance(existing_appid, int) and existing_appid:
+            # Stored as signed int32: 4109903615 reads back as a negative number
+            # and would otherwise fail a `> 0` test and renumber the shortcut.
+            appid = existing_appid & 0xFFFFFFFF
+
         tag_map = {}
         for i, tag in enumerate(tags or []):
             tag_map[str(i)] = str(tag)
@@ -491,7 +509,13 @@ class SteamShortcuts:
         # Keep whatever Steam or another plugin already stored, only touch the
         # fields we own.
         entry["appid"] = appid
-        entry["AppName"] = display
+        # Keep a name the user edited in Steam, but do repair our own fallback:
+        # when `list-installed` failed the shortcut was named after the 32-char
+        # app_name, and that placeholder must be replaced once the real title is
+        # known again.
+        stored_name = str(entry.get("AppName") or "")
+        if not stored_name or stored_name == app_name:
+            entry["AppName"] = display
         entry["Exe"] = exe_q
         entry["StartDir"] = start_dir_q
         # An icon we supply must win over the empty placeholder earlier
@@ -502,7 +526,13 @@ class SteamShortcuts:
         else:
             entry.setdefault("icon", "")
         entry.setdefault("ShortcutPath", "")
-        entry["LaunchOptions"] = launch_options or ""
+        # Only write launch options we actually have. Steam lets the user add
+        # their own (`MANGOHUD=1 %command%`, gamemoderun, ...) and clobbering
+        # them on every sync silently removes their tweaks.
+        if launch_options:
+            entry["LaunchOptions"] = launch_options
+        else:
+            entry.setdefault("LaunchOptions", "")
         entry.setdefault("IsHidden", 0)
         entry.setdefault("AllowDesktopConfig", 1)
         entry.setdefault("AllowOverlay", 1)

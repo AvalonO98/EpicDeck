@@ -69,6 +69,10 @@ export function rememberFocus(el: HTMLElement | null | undefined) {
 function usable(el: HTMLElement | null | undefined, root: HTMLElement): el is HTMLElement {
   if (!el || !el.isConnected) return false;
   if (!root.contains(el)) return false;
+  // A container must never be the navigation origin: `active.contains(el)` would
+  // then skip every child and the move silently fails, which hands the key back
+  // to Steam — the reason "down" from the tab row landed on the pager.
+  if (!isLeafFocusable(el)) return false;
   return isVisible(el, root.ownerDocument);
 }
 
@@ -84,7 +88,12 @@ function usable(el: HTMLElement | null | undefined, root: HTMLElement): el is HT
 export function currentFocused(root: HTMLElement): HTMLElement | null {
   const doc = root.ownerDocument;
   const active = doc.activeElement as HTMLElement | null;
-  if (active && root.contains(active) && GPFOCUS_RE.test(String(active.className || ""))) {
+  if (
+    active &&
+    root.contains(active) &&
+    isLeafFocusable(active) &&
+    GPFOCUS_RE.test(String(active.className || ""))
+  ) {
     return active;
   }
 
@@ -106,7 +115,7 @@ export function currentFocused(root: HTMLElement): HTMLElement | null {
     return marked[0];
   }
 
-  return active && root.contains(active) ? active : null;
+  return active && root.contains(active) && isLeafFocusable(active) ? active : null;
 }
 
 /**
@@ -145,12 +154,17 @@ export function moveFocus(button: number, scope?: HTMLElement | null): boolean {
     return false;
   }
 
-  // Two passes so "nearest in that direction" does not jump rows:
-  //   1)候选只取**同一行/同一列带内**（副轴偏移小）的元素，按曼哈顿距离取最近；
-  //   2)带内没有目标时，才放宽到 60° 方向锥内，仍取最近。
+  // 两轮，规则先说清楚（这是"符合常识"的部分）：
+  //   1) 严格轮：左右只在**同一行**里找（垂直中心差 ≤ 较矮元素高度的一半）；
+  //      上下只在**同一列**里找（水平投影重叠 ≥ 较窄元素宽度的一半）。
+  //   2) 放宽轮：同区域里没有严格目标时，才允许斜向，但副轴按 2.5 倍惩罚，
+  //      保证"先走主轴、再走副轴"，不会出现按右却跳到下一行最右的按钮。
+  //
+  // 之前用的是 60° 方向锥 + 曼哈顿距离：锥太宽，斜下方的元素也算候选，
+  // 所以左右会串行、上下会串列 —— 手感就是"不听话"。
   let best: HTMLElement | null = null;
 
-  const collect = (bandOnly: boolean): HTMLElement | null => {
+  const collect = (strict: boolean): HTMLElement | null => {
     let pick: HTMLElement | null = null;
     let pickScore = Number.POSITIVE_INFINITY;
     for (const el of all) {
@@ -172,15 +186,19 @@ export function moveFocus(button: number, scope?: HTMLElement | null): boolean {
       const primary = horizontal ? Math.abs(dx) : Math.abs(dy);
       const secondary = horizontal ? Math.abs(dy) : Math.abs(dx);
 
-      if (bandOnly) {
-        // “同一行”按当前元素的高度判断，“同一列”按宽度判断。
-        const band = horizontal ? Math.max(12, from.height * 0.6) : Math.max(12, from.width * 0.6);
-        if (secondary > band) continue;
-      } else if (secondary > primary * 1.7 + 12) {
-        continue; // 超过 60°，不算这个方向上的目标
+      if (strict) {
+        if (horizontal) {
+          const band = Math.max(10, Math.min(from.height, r.height) * 0.5);
+          if (Math.abs(dy) > band) continue;
+        } else {
+          // "同一列"按矩形水平投影重叠判断，比中心差更接近人眼判断。
+          const overlap = Math.min(from.right, r.right) - Math.max(from.left, r.left);
+          const narrower = Math.min(from.width, r.width);
+          if (narrower <= 0 || overlap < narrower * 0.5) continue;
+        }
       }
 
-      const score = primary + secondary;
+      const score = strict ? primary + secondary * 0.25 : primary + secondary * 2.5;
       if (score < pickScore) {
         pickScore = score;
         pick = el;
@@ -197,8 +215,31 @@ export function moveFocus(button: number, scope?: HTMLElement | null): boolean {
   } catch {
     return false;
   }
+  claimFocusRing(best, root);
   remembered = best;
   return true;
+}
+
+/**
+ * Only the element we just moved to may look focused.
+ *
+ * Steam keeps `gpfocus` on elements it focused earlier, and our stylesheet
+ * matches both `.gpfocus` and `.ed-focus` — so after a few moves several
+ * buttons stayed highlighted at once. The focusin listener alone cannot fix
+ * this: Steam can add the class after our handler has already run.
+ */
+export function claimFocusRing(target: HTMLElement, root: HTMLElement) {
+  try {
+    for (const el of Array.from(root.querySelectorAll(".ed-focus, .gpfocus"))) {
+      if (el !== target) {
+        el.classList.remove("ed-focus");
+        el.classList.remove("gpfocus");
+      }
+    }
+    target.classList.add("ed-focus");
+  } catch {
+    /* styling only — never let this break navigation */
+  }
 }
 
 export const DIRECTION_BUTTONS = [DIR_LEFT, DIR_UP, DIR_RIGHT, DIR_DOWN];

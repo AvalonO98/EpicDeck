@@ -10,7 +10,7 @@
 
 import { ButtonItem, DialogButton, Dropdown, Field, PanelSection, PanelSectionRow, TextField } from "@decky/ui";
 import { toaster } from "@decky/api";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FaCog, FaDownload, FaSteamSymbol, FaThLarge } from "react-icons/fa";
 import {
   completeFirstRun,
@@ -187,10 +187,49 @@ function FirstRunView({
 function QuickPanel({ onLogout }: { onLogout: () => void }) {
   const { auth, games, progress, error, refreshing, cachedAt } = usePluginState();
   const [booting, setBooting] = useState<boolean>(false);
+  const topRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!games.length) setBooting(true);
     ensureBoot().finally(() => setBooting(false));
+  }, []);
+
+  // Keep the panel scrolled to its top when it opens.
+  //
+  // Decky hands focus to the first focusable element in the panel; if that is
+  // the "打开游戏库" button, Steam scrolls it into view and pushes the account
+  // row (and the panel title) out of the viewport. The account row is focusable
+  // now, but Steam may still scroll after that, so we pin it a few times over
+  // the first second and then leave it alone (the user may scroll meanwhile).
+  useEffect(() => {
+    const el = topRef.current;
+    if (!el) return;
+    const doc = el.ownerDocument;
+    const scrollToTop = () => {
+      const view = doc.defaultView;
+      let parent: HTMLElement | null = el.parentElement;
+      while (parent && parent !== doc.body) {
+        // Only real scroll containers. An ancestor with overflow:visible can
+        // still report scrollHeight > clientHeight (Steam's "Panel Focusable"
+        // does) and setting scrollTop on it silently does nothing — that was
+        // why the account row stayed clipped by ~34px.
+        const style = view?.getComputedStyle(parent);
+        const scrollable = /(auto|scroll)/.test(style?.overflowY || "");
+        if (scrollable && parent.scrollHeight > parent.clientHeight + 4) {
+          parent.scrollTop = 0;
+          return;
+        }
+        parent = parent.parentElement;
+      }
+    };
+    const timers = [50, 200, 500, 900].map((delay) =>
+      doc.defaultView?.setTimeout(scrollToTop, delay)
+    );
+    return () => {
+      for (const timer of timers) {
+        if (timer !== undefined) doc.defaultView?.clearTimeout(timer);
+      }
+    };
   }, []);
 
   const installed = games.filter((g) => g.is_installed).length;
@@ -211,6 +250,7 @@ function QuickPanel({ onLogout }: { onLogout: () => void }) {
       <PanelSection>
         <PanelSectionRow>
           <div
+            ref={topRef}
             style={{
               display: "flex",
               justifyContent: "space-between",
@@ -218,7 +258,15 @@ function QuickPanel({ onLogout }: { onLogout: () => void }) {
               padding: "2px 0 6px",
             }}
           >
-            <div style={{ minWidth: 0 }}>
+            {/* tabIndex only: making this a Focusable changed its layout (flex)
+                and squeezed the name into a 1-character column. A plain
+                focusable div keeps the visual and still gives Steam a landing
+                spot at the top of the panel. */}
+            <div
+              tabIndex={0}
+              className="ed-qam-account"
+              style={{ minWidth: 0, flex: "1 1 auto" }}
+            >
               <div style={{ fontWeight: 700, fontSize: "0.98em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {auth?.display_name || "Epic 账号"}
               </div>

@@ -344,6 +344,9 @@ Windows 游戏第一次启动在初始化 Proton 前缀,通常 1~2 分钟,期间
 
 本项目基于 [BSD 3-Clause License](./LICENSE) 开源,来源于 [decky-plugin-template](https://github.com/SteamDeckHomebrew/decky-plugin-template)(BSD 3-Clause)。
 
+仓库内不含 MPL-2.0 或其他 copyleft 代码;对 [GameBridge](https://github.com/FelPikachu/GameBridge)
+的借鉴仅停留在设计思路层面,未复制其源码文件,详见 [NOTICE](./NOTICE)。
+
 相关文档:
 
 - [CHANGELOG.md](./CHANGELOG.md) — 版本变更记录
@@ -359,6 +362,12 @@ Windows 游戏第一次启动在初始化 Proton 前缀,通常 1~2 分钟,期间
 | [decky-plugin-template](https://github.com/SteamDeckHomebrew/decky-plugin-template) | BSD-3-Clause | 插件脚手架与构建配置 |
 | [qrcode](https://github.com/soldair/node-qrcode) | MIT | 登录页二维码 |
 | [react-icons](https://github.com/react-icons/react-icons) | MIT | 界面图标 |
+
+### 设计参考(不包含其代码)
+
+| 项目 | 许可 | 说明 |
+|---|---|---|
+| [GameBridge](https://github.com/FelPikachu/GameBridge) | MPL-2.0 | 同为 SteamOS 上的第三方游戏库 Decky 插件。本项目参考其**公开的设计思路与实机踩坑结论**(Steam 卡片原地更新同一 AppID、组件下载固定版本+散列校验、启动器持有游戏进程以便 Steam 统计时长、云存档覆盖前备份、验收结论分级),**未复制其任何源码文件**。 |
 
 ### 商标与免责声明
 

@@ -129,9 +129,18 @@ export const installGame = callable<
   { ok: boolean; error?: string }
 >("install");
 export const cancelInstall = callable<[app_name: string], { ok: boolean }>("cancel_install");
-export const launchGame = callable<[app_name: string], { ok: boolean; error?: string; note?: string }>(
-  "launch"
-);
+export const launchGame = callable<
+  [app_name: string, direct?: boolean],
+  {
+    ok: boolean;
+    /** Shortcut appid; the frontend hands it to Steam so gamescope switches. */
+    appid?: number;
+    via?: "steam" | "direct";
+    error?: string;
+    note?: string;
+    proton?: boolean;
+  }
+>("launch");
 export const uninstallGame = callable<[app_name: string], { ok: boolean; error?: string }>("uninstall");
 
 export const addToSteam = callable<

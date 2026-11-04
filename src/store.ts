@@ -317,14 +317,29 @@ async function boot() {
 
   // The snapshot path returns in milliseconds; the first run (no cache) still
   // gets a generous ceiling so a dead network cannot hang the UI.
-  const r = await withTimeout(listGames(), 20000, {
-    ok: false,
-    games: [],
-    size_pending: 0,
-    locale: "",
-    error: "读取游戏库超时：Epic 服务器没有响应",
-    error_kind: "network",
-  });
+  // A rejected callable (bad cache row, plugin-side exception) used to abort
+  // boot() right here: no games, no error banner, the page said "游戏库为空".
+  let r: Awaited<ReturnType<typeof listGames>>;
+  try {
+    r = await withTimeout(listGames(), 20000, {
+      ok: false,
+      games: [],
+      size_pending: 0,
+      locale: "",
+      error: "读取游戏库超时：Epic 服务器没有响应",
+      error_kind: "network",
+    });
+  } catch (e) {
+    console.log("EpicDeck: list_games failed", e);
+    r = {
+      ok: false,
+      games: [],
+      size_pending: 0,
+      locale: "",
+      error: "读取游戏库失败：" + String(e),
+      error_kind: "unknown",
+    };
+  }
   if (r.ok) {
     applyPayload(r);
   } else if (mine) {
@@ -375,7 +390,9 @@ export function ensureBoot(): Promise<void> {
 }
 
 export async function reloadGames() {
-  const r = await listGames();
+  // After an install the cached snapshot still says "not installed" (and with
+  // stale:false, so the UI cannot even warn). Ask for a fresh list.
+  const r = await listGames(true);
   if (r.ok) applyPayload(r);
 }
 
@@ -477,8 +494,8 @@ export const actions = {
     }
     return r;
   },
-  async launch(appName: string) {
-    return launchGame(appName);
+  async launch(appName: string, direct = false) {
+    return launchGame(appName, direct);
   },
   async uninstall(appName: string) {
     const r = await uninstallGame(appName);

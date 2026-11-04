@@ -55,15 +55,31 @@ export const GLOBAL_CSS = `
 }
 .ed-chip.gpfocus,
 .ed-chip.ed-focus {
-  background: rgba(74,163,255,0.32);
+  background: rgba(74,163,255,0.38);
   border-color: #4aa3ff;
   color: #fff;
+  box-shadow: 0 0 0 2px rgba(74,163,255,0.55);
 }
+/* The tab that owns the current page is a *state*, not the cursor. Using the
+   same blue fill for both made it look like several buttons were still
+   focused at once. State = faint fill + a short underline; cursor = strong
+   blue fill + ring. */
 .ed-chip[data-active="true"] {
-  background: rgba(74,163,255,0.26);
-  border-color: rgba(74,163,255,0.75);
+  background: rgba(255,255,255,0.10);
+  border-color: rgba(255,255,255,0.22);
   color: #fff;
-  font-weight: 600;
+  font-weight: 700;
+  position: relative;
+}
+.ed-chip[data-active="true"]::after {
+  content: "";
+  position: absolute;
+  left: 26%;
+  right: 26%;
+  bottom: 2px;
+  height: 3px;
+  border-radius: 2px;
+  background: #4aa3ff;
 }
 .ed-action {
   border-radius: 8px;
@@ -99,6 +115,25 @@ export const GLOBAL_CSS = `
 .ed-row.ed-focus {
   background: rgba(74,163,255,0.2);
   box-shadow: inset 0 0 0 2px rgba(74,163,255,0.7);
+}
+/* Read-only information that still needs to be reachable by the stick (the
+   version line at the bottom of settings sits below the last button, and
+   without a focusable box the cursor never scrolls it into view). The border
+   is what tells the user "you can stop here". */
+.ed-info {
+  display: block;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.04);
+  padding: 8px 12px;
+  transition: background 120ms ease-out, border-color 120ms ease-out,
+    box-shadow 120ms ease-out;
+}
+.ed-info.gpfocus,
+.ed-info.ed-focus {
+  border-color: #4aa3ff;
+  background: rgba(74,163,255,0.16);
+  box-shadow: 0 0 0 2px rgba(74,163,255,0.45);
 }
 .ed-scroll {
   scrollbar-width: thin;

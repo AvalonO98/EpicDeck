@@ -48,7 +48,6 @@ import {
   STATE_LABEL,
   checkEnvironment,
   exportLogs,
-  fmtAgo,
   fmtPlaytime,
   fmtSize,
   getGameSize,
@@ -82,7 +81,7 @@ import {
   StatBlock,
   WarningBanner,
 } from "./components";
-import { moveFocus, rememberFocus } from "./geomnav";
+import { claimFocusRing, moveFocus, rememberFocus } from "./geomnav";
 import { LoginPanel } from "./login";
 import {
   actions,
@@ -106,6 +105,33 @@ type TabId = "library" | "downloads" | "settings";
 // Replaced with the real number at build time (see rollup.config.js), so the
 // settings footer can never drift from package.json again.
 const PLUGIN_VERSION = "__EPICDECK_VERSION__";
+
+// Steam does not start games by appid: it uses its own 64-bit GameID. For a
+// non-Steam shortcut the GameID is registered in Steam's appStore once the
+// shortcut is known; appid itself is a different number.
+//
+// Passing the appid to RunGame is what made the launch button look dead: the
+// call resolves without error and nothing starts. Same-app behaviour verified
+// against GameBridge's implementation.
+function shortcutGameId(appid: number): string {
+  const store = (globalThis as any).appStore;
+  const registered = store?.m_mapApps?.get?.(appid)?.gameid;
+  if (typeof registered === "string" && registered.length > 0) return registered;
+  // Fallback formula used when Steam has not indexed the shortcut yet.
+  return ((BigInt(appid) << 32n) | 0x02000000n).toString();
+}
+
+// A shortcut added moments ago may not be in appStore yet; poll briefly before
+// falling back, otherwise Steam gets a GameID it has never heard of.
+async function waitForShortcutGameId(appid: number): Promise<string> {
+  const store = (globalThis as any).appStore;
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const registered = store?.m_mapApps?.get?.(appid)?.gameid;
+    if (typeof registered === "string" && registered.length > 0) return registered;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return shortcutGameId(appid);
+}
 
 const TABS: { id: TabId; label: string; icon: ReactNode }[] = [
   { id: "library", label: "游戏库", icon: <FaThLarge /> },
@@ -732,9 +758,40 @@ function DetailBody({
   const doLaunch = async () => {
     setBusy("launch");
     const r = await actions.launch(game.app_name);
+    if (!r.ok) {
+      setBusy("");
+      toaster.toast({ title: "启动失败", body: r.error ?? "" });
+      return;
+    }
+    // Steam has to start the game: gamescope only switches away from the
+    // Steam UI when Steam itself believes a game is running. RunGame takes
+    // Steam's own GameID (not the appid) and a 4th argument of 100; see
+    // shortcutGameId() above for why the naive call silently does nothing.
+    //
+    // Keep the *object* and call the method on it. Pulling RunGame out into a
+    // local (`const f = apps.RunGame; f(...)`) loses `this` — it is a native
+    // method and throws, which then fell through to the direct-spawn fallback
+    // and produced sound with no picture.
+    const apps = (globalThis as any).SteamClient?.Apps;
+    if (r.appid && apps && typeof apps.RunGame === "function") {
+      try {
+        const gameId = await waitForShortcutGameId(r.appid);
+        await apps.RunGame(gameId, "", -1, 100);
+        setBusy("");
+        if (r.note) toaster.toast({ title: "正在启动", body: r.note });
+        return;
+      } catch (err) {
+        console.warn("SteamClient.Apps.RunGame failed, using direct launch", err);
+        toaster.toast({
+          title: "Steam 启动失败，已改用后台启动",
+          body: String(err).slice(0, 120),
+        });
+      }
+    }
+    const fallback = await actions.launch(game.app_name, true);
     setBusy("");
-    if (!r.ok) toaster.toast({ title: "启动失败", body: r.error ?? "" });
-    else if (r.note) toaster.toast({ title: "正在启动", body: r.note });
+    if (!fallback.ok) toaster.toast({ title: "启动失败", body: fallback.error ?? "" });
+    else if (fallback.note) toaster.toast({ title: "正在启动", body: fallback.note });
   };
 
   const doUninstall = async () => {
@@ -1393,7 +1450,15 @@ function SettingsTab() {
                 <FaRedo /> 检查环境
               </ActionButton>
             </NavRow>
-            <div style={{ marginTop: "12px", fontSize: "0.78em", opacity: 0.45 }}>
+            {/* Focusable on purpose: it sits below the last button, and a
+                focused element is the only thing the navigator scrolls to.
+                `.ed-info` gives it a visible border so the cursor has somewhere
+                to land instead of stopping in mid-air above the version line. */}
+            <div
+              tabIndex={0}
+              className="ed-info"
+              style={{ marginTop: "12px", fontSize: "0.8em", opacity: 0.85 }}
+            >
               Legendary {env.legendary || "未知版本"} · 插件 {PLUGIN_VERSION} · 数据目录
               ~/homebrew/settings/EpicDeck
             </div>
@@ -1551,21 +1616,22 @@ export function FullScreenPage() {
     return () => window.clearTimeout(timer);
   }, []);
 
-  // Give the page a known starting point: the 返回 chip. Without this Steam may
-  // keep its own idea of "focused" from the previous screen, and the first stick
-  // press moves from somewhere the user cannot see.
+  // Opening a game page means "I want to play it": focus the primary action
+  // (启动游戏 / 安装 / 取消) instead of making the user slide down from the
+  // header. Re-runs whenever a different game's page is opened.
   useEffect(() => {
+    if (!detail) return;
     const timer = window.setTimeout(() => {
       const root = surfaceRef.current;
       if (!root) return;
-      const doc = root.ownerDocument;
-      const active = doc.activeElement as HTMLElement | null;
-      if (active && active !== doc.body && root.contains(active)) return;
-      const back = root.querySelector(".ed-chip") as HTMLElement | null;
-      back?.focus();
-    }, 260);
+      const primary = (root.querySelector('.ed-action[data-primary="true"]') ||
+        root.querySelector(".ed-action")) as HTMLElement | null;
+      if (!primary) return;
+      primary.focus();
+      rememberFocus(primary);
+    }, 180);
     return () => window.clearTimeout(timer);
-  }, []);
+  }, [detail]);
 
   // Landing on a tab is the same intent as picking it: switch the page.
   useEffect(() => {
@@ -1613,24 +1679,6 @@ export function FullScreenPage() {
     };
   }, []);
 
-  useEffect(() => {
-    const view = surfaceRef.current?.ownerDocument?.defaultView as any;
-    if (!view) return;
-    view.__epicdeckMoveFocus = moveFocus;
-    // Same path the stick takes: move, then run the landing element's action.
-    view.__epicdeckNav = (button: number) => {
-      const root = surfaceRef.current;
-      if (!root) return false;
-      if (!moveFocus(button, root)) return false;
-      runFocusAction(root.ownerDocument.activeElement as HTMLElement | null);
-      return true;
-    };
-    return () => {
-      delete view.__epicdeckMoveFocus;
-      delete view.__epicdeckNav;
-    };
-  }, []);
-
   // The navigator lives in the plugin window but must act on Big Picture's DOM.
   // Exposing it on the *page* window makes that explicit and gives us a way to
   // drive focus from devtools / CDP when debugging.
@@ -1669,7 +1717,24 @@ export function FullScreenPage() {
   const tabOffset = (delta: number) => {
     const i = TABS.findIndex((t) => t.id === tab);
     const next = (i + delta + TABS.length) % TABS.length;
-    showTab(TABS[next].id);
+    const nextId = TABS[next].id;
+    showTab(nextId);
+    // L1/R1 changes the page, so the cursor must move with it. Without this the
+    // highlight stayed on the old tab (or on a row of the previous page) while
+    // the content had already switched.
+    const root = surfaceRef.current;
+    if (!root) return;
+    const chip = root.querySelector(
+      `[data-ed-focus-action="tab:${nextId}"]`
+    ) as HTMLElement | null;
+    if (!chip) return;
+    try {
+      chip.focus();
+    } catch {
+      /* focus is best-effort */
+    }
+    claimFocusRing(chip, root);
+    rememberFocus(chip);
   };
   // Directional input goes through our own geometric navigator: Steam's nav tree
   // cannot express "rows of rows" in a custom layout, so the stick used to walk
@@ -1689,7 +1754,27 @@ export function FullScreenPage() {
       evt?.stopPropagation?.();
       return;
     }
-    if (moveFocus(button, surfaceRef.current)) {
+    const moved = moveFocus(button, surfaceRef.current);
+    // Diagnostics: a press that never reaches this handler, and a press whose
+    // moveFocus fails, look identical from the outside (Steam moves the cursor
+    // instead). Recording both makes them distinguishable from the console.
+    try {
+      const view = surfaceRef.current?.ownerDocument?.defaultView as any;
+      if (view) {
+        const log = view.__epicdeckNavLog || (view.__epicdeckNavLog = []);
+        const el = surfaceRef.current?.ownerDocument?.activeElement as HTMLElement | null;
+        log.push({
+          b: button,
+          moved: moved,
+          from: (el?.innerText || el?.className || "").trim().replace(/\s+/g, " ").slice(0, 14),
+          at: now,
+        });
+        if (log.length > 40) log.shift();
+      }
+    } catch (e) {
+      /* diagnostics must never break navigation */
+    }
+    if (moved) {
       dirGuardRef.current = { button, at: now };
       runFocusAction(surfaceRef.current?.ownerDocument?.activeElement as HTMLElement | null);
       evt?.preventDefault?.();
@@ -1749,58 +1834,32 @@ export function FullScreenPage() {
     tabOffset(delta);
   };
 
-  // One B press must pop exactly one route entry. Two separate things used to
-  // make it two: Steam runs its own cancel navigation unless the handler claims
-  // the event, and the fallback timer could fire *after* we had already left —
-  // the detached page kept reporting its old pathname, so it looked "still here"
-  // and popped once more.
+  // One B press pops exactly one Steam route entry.
+  //
+  // Do NOT gate this on `location.pathname`: the Big Picture window is an SPA —
+  // its `location.pathname` is always `/index.html` and never changes with the
+  // route. A "did we actually leave?" check based on pathname is therefore
+  // always true, and any fallback timer it guards will fire even after a
+  // successful pop — which is exactly the "back returns to the pre-plugin page,
+  // then ~1s later Steam's own library opens" bug. `NavigateBack()` is the
+  // correct, complete action: it pops the route `Navigate()` pushed on entry.
   const leaveRef = useRef({ busy: false, at: 0 });
-  const leaveTimers = useRef<number[]>([]);
-
-  useEffect(() => {
-    const timers = leaveTimers;
-    return () => {
-      for (const id of timers.current) window.clearTimeout(id);
-      timers.current = [];
-    };
-  }, []);
 
   const goBack = () => {
-    const root = surfaceRef.current;
     const now = Date.now();
-    // Coalesce repeated events (ours + Steam's default, or a held button).
-    if (leaveRef.current.busy || now - leaveRef.current.at < 800) return;
+    // Coalesce repeated events (a held button, or Steam re-delivering the same
+    // cancel after our handler claimed it).
+    if (leaveRef.current.busy || now - leaveRef.current.at < 400) return;
     leaveRef.current = { busy: true, at: now };
-
-    // `NavigateBack()` does **not** throw when Steam's route stack is empty — it
-    // just quietly does nothing (or only restores the focused item, which looks
-    // like "back went to the last button").
-    const pageWindow = root?.ownerDocument?.defaultView as any;
-    const before = String(pageWindow?.location?.pathname || "");
     try {
       Navigation.NavigateBack();
     } catch (e) {
       console.log("EpicDeck: NavigateBack failed", e);
     }
-
-    // Fall back only if this page is *still mounted on the same route*: a
-    // successful pop detaches it almost immediately, and navigating from a
-    // detached page is exactly what caused the extra back.
-    const timer = window.setTimeout(() => {
-      const mount = surfaceRef.current;
-      if (!mount?.isConnected) return;
-      const current = String(mount.ownerDocument?.defaultView?.location?.pathname || "");
-      if (current !== before) return;
-      try {
-        if (Navigation.NavigateToLibraryTab) Navigation.NavigateToLibraryTab();
-        else Navigation.Navigate("/library/home");
-      } catch (e) {
-        console.log("EpicDeck: leave fallback failed", e);
-      }
-      // Still here (or the fallback failed): let the next press try again.
+    // Allow a later press even if this one silently no-ops.
+    window.setTimeout(() => {
       leaveRef.current.busy = false;
-    }, 300);
-    leaveTimers.current.push(timer);
+    }, 400);
   };
 
   // B (CANCEL) walks back up the in-page stack first: detail view → library
@@ -1818,13 +1877,17 @@ export function FullScreenPage() {
     return true;
   };
 
+  // 顶栏就是唯一的导航层：返回 / 游戏库 / 下载 / 设置 / 刷新 排在同一行，
+  // 下面的内容区跟着聚焦的按钮走。返回和刷新没有"对应页面"，聚焦它们时
+  // 内容保持不变 —— 这样光标在顶栏里左右移动时，页面不会莫名其妙地跳。
   const header = (
     <NavRow
       level="header"
       style={{
         alignItems: "center",
-        gap: "0.75em",
+        gap: "0.5em",
         padding: viewport.compact ? "0.3em 1em 0.25em" : "0.5em 1.5em 0.4em",
+        flexWrap: "nowrap",
       }}
     >
       <Focusable
@@ -1833,8 +1896,8 @@ export function FullScreenPage() {
         onClick={goBack}
         onActivate={goBack}
         style={{
-          padding: "0.42em 0.8em",
-          fontSize: "0.86em",
+          padding: "0.45em 0.85em",
+          fontSize: "0.9em",
           display: "flex",
           alignItems: "center",
           gap: "0.4em",
@@ -1843,45 +1906,6 @@ export function FullScreenPage() {
       >
         <FaArrowLeft /> 返回
       </Focusable>
-      <div style={{ display: "flex", alignItems: "baseline", gap: "0.6em", minWidth: 0 }}>
-        <div style={{ fontSize: "1.15em", fontWeight: 800, letterSpacing: "0.01em" }}>EpicDeck</div>
-        {viewport.compact ? null : (
-          <div style={{ fontSize: "0.82em", opacity: 0.45, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {state.auth?.display_name || "未登录"}
-            {state.games.length ? ` · ${state.games.length} 个游戏` : ""}
-            {state.cachedAt ? ` · 更新于 ${fmtAgo(state.cachedAt)}` : ""}
-          </div>
-        )}
-      </div>
-      <div style={{ flex: 1 }} />
-      <Focusable
-        noFocusRing
-        className="ed-chip"
-        onClick={() => {
-          void refreshLibrary(true);
-        }}
-        onActivate={() => {
-          void refreshLibrary(true);
-        }}
-        style={{
-          padding: "0.42em 0.8em",
-          fontSize: "0.86em",
-          display: "flex",
-          alignItems: "center",
-          gap: "0.4em",
-          opacity: state.refreshing ? 0.5 : 1,
-        }}
-      >
-        <FaRedo /> {state.refreshing ? "刷新中…" : "刷新"}
-      </Focusable>
-    </NavRow>
-  );
-
-  const tabBar = (
-    <NavRow
-      level="tabs"
-      style={{ gap: "0.5em", padding: viewport.compact ? "0 1em 0.4em" : "0 1.5em 0.6em" }}
-    >
       {TABS.map((t) => {
         const active = t.id === tab;
         const badge =
@@ -1894,15 +1918,16 @@ export function FullScreenPage() {
             data-active={active ? "true" : "false"}
             onClick={() => showTab(t.id)}
             onActivate={() => showTab(t.id)}
-            // Moving the highlight onto a tab is the same intent as picking it.
+            // 聚焦即切页：光标落到哪个标签，下面就显示哪个页面。
             data-ed-focus-action={`tab:${t.id}`}
             style={{
-              padding: "0.55em 1.05em",
-              fontSize: "0.95em",
+              padding: "0.45em 0.95em",
+              fontSize: "0.9em",
               display: "flex",
               alignItems: "center",
-              gap: "0.5em",
+              gap: "0.45em",
               fontWeight: active ? 700 : 500,
+              flexShrink: 0,
             }}
           >
             {t.icon}
@@ -1924,6 +1949,45 @@ export function FullScreenPage() {
           </Focusable>
         );
       })}
+      <div style={{ flex: 1, minWidth: "0.5em" }} />
+      {viewport.compact ? null : (
+        <div
+          style={{
+            fontSize: "0.78em",
+            opacity: 0.45,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            maxWidth: "22em",
+            flexShrink: 1,
+            minWidth: 0,
+          }}
+        >
+          {state.auth?.display_name || "未登录"}
+          {state.games.length ? ` · ${state.games.length} 个游戏` : ""}
+        </div>
+      )}
+      <Focusable
+        noFocusRing
+        className="ed-chip"
+        onClick={() => {
+          void refreshLibrary(true);
+        }}
+        onActivate={() => {
+          void refreshLibrary(true);
+        }}
+        style={{
+          padding: "0.45em 0.85em",
+          fontSize: "0.9em",
+          display: "flex",
+          alignItems: "center",
+          gap: "0.4em",
+          opacity: state.refreshing ? 0.5 : 1,
+          flexShrink: 0,
+        }}
+      >
+        <FaRedo /> {state.refreshing ? "刷新中…" : "刷新"}
+      </Focusable>
     </NavRow>
   );
 
@@ -1962,7 +2026,6 @@ export function FullScreenPage() {
       }}
     >
       {header}
-      {tabBar}
 
       <div
         style={{

@@ -146,6 +146,23 @@ class Legendary:
         except asyncio.TimeoutError:
             proc.kill()
             raise LegendaryError("命令执行超时: %s" % " ".join(args))
+        except asyncio.CancelledError:
+            # The user pressed "cancel": cancelling the awaiting task must also
+            # take the child down, otherwise `legendary auth --code` keeps
+            # running in the background and can log the account in after the
+            # user was told the attempt was cancelled. `shield` keeps the reap
+            # itself from being cancelled again.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+            try:
+                await asyncio.shield(proc.wait())
+            except Exception:
+                pass
+            raise
         text = out.decode("utf-8", errors="replace")
         if proc.returncode != 0:
             raise LegendaryError(text.strip() or ("命令失败: %s" % " ".join(args)))
