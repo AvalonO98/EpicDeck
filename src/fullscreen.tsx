@@ -1749,13 +1749,33 @@ export function FullScreenPage() {
     tabOffset(delta);
   };
 
+  // One B press must pop exactly one route entry. Two separate things used to
+  // make it two: Steam runs its own cancel navigation unless the handler claims
+  // the event, and the fallback timer could fire *after* we had already left —
+  // the detached page kept reporting its old pathname, so it looked "still here"
+  // and popped once more.
+  const leaveRef = useRef({ busy: false, at: 0 });
+  const leaveTimers = useRef<number[]>([]);
+
+  useEffect(() => {
+    const timers = leaveTimers;
+    return () => {
+      for (const id of timers.current) window.clearTimeout(id);
+      timers.current = [];
+    };
+  }, []);
+
   const goBack = () => {
-    // Leaving the plugin. `NavigateBack()` does **not** throw when Steam's route
-    // stack is empty — it just quietly does nothing (or only restores the
-    // previously focused item, which looks like "back went to the last button").
-    // So ask for it, then check where we actually ended up and force the library
-    // page if we are still on our own route.
-    const pageWindow = surfaceRef.current?.ownerDocument?.defaultView as any;
+    const root = surfaceRef.current;
+    const now = Date.now();
+    // Coalesce repeated events (ours + Steam's default, or a held button).
+    if (leaveRef.current.busy || now - leaveRef.current.at < 800) return;
+    leaveRef.current = { busy: true, at: now };
+
+    // `NavigateBack()` does **not** throw when Steam's route stack is empty — it
+    // just quietly does nothing (or only restores the focused item, which looks
+    // like "back went to the last button").
+    const pageWindow = root?.ownerDocument?.defaultView as any;
     const before = String(pageWindow?.location?.pathname || "");
     try {
       Navigation.NavigateBack();
@@ -1763,37 +1783,39 @@ export function FullScreenPage() {
       console.log("EpicDeck: NavigateBack failed", e);
     }
 
-    const stillHere = () => {
-      const now = String(pageWindow?.location?.pathname || "");
-      return now === before || now.includes(LIBRARY_ROUTE);
-    };
-
-    window.setTimeout(() => {
-      if (!stillHere()) return;
+    // Fall back only if this page is *still mounted on the same route*: a
+    // successful pop detaches it almost immediately, and navigating from a
+    // detached page is exactly what caused the extra back.
+    const timer = window.setTimeout(() => {
+      const mount = surfaceRef.current;
+      if (!mount?.isConnected) return;
+      const current = String(mount.ownerDocument?.defaultView?.location?.pathname || "");
+      if (current !== before) return;
       try {
-        Navigation.NavigateToLibraryTab?.();
+        if (Navigation.NavigateToLibraryTab) Navigation.NavigateToLibraryTab();
+        else Navigation.Navigate("/library/home");
       } catch (e) {
-        console.log("EpicDeck: NavigateToLibraryTab failed", e);
+        console.log("EpicDeck: leave fallback failed", e);
       }
-      window.setTimeout(() => {
-        if (!stillHere()) return;
-        try {
-          Navigation.Navigate("/library/home");
-        } catch (e2) {
-          console.log("EpicDeck: Navigate home failed", e2);
-        }
-      }, 250);
-    }, 220);
+      // Still here (or the fallback failed): let the next press try again.
+      leaveRef.current.busy = false;
+    }, 300);
+    leaveTimers.current.push(timer);
   };
 
   // B (CANCEL) walks back up the in-page stack first: detail view → library
   // list → leave the plugin. Mirrors how Steam pages behave.
-  const onCancel = () => {
+  const onCancel = (evt?: any) => {
+    // Claim the event. Without preventDefault Steam treats B as unhandled and
+    // performs its own route pop on top of ours.
+    evt?.preventDefault?.();
+    evt?.stopPropagation?.();
     if (detail) {
       setDetail(null);
     } else {
       goBack();
     }
+    return true;
   };
 
   const header = (
