@@ -6,7 +6,7 @@ EpicDeck 是一个 [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loa
 
 不需要装 Epic 客户端,不需要退到桌面模式,不需要手动配 wine。
 
-**当前版本 `0.8.6`** · BSD-3-Clause · SteamOS / Steam Deck · Python + Legendary
+**当前版本 `0.8.8`** · BSD-3-Clause · SteamOS / Steam Deck · Python + Legendary
 
 ---
 
@@ -76,6 +76,7 @@ EpicDeck 是把第三种的活干完,再把入口塞进游戏模式:所有操作
 - **秒开**:游戏库快照缓存在内存 + 磁盘,打开面板立即出内容,后台静默刷新(实测冷抓取 3.95 s → 缓存命中 0 ms)
 - **断开也有提示**:Epic 连不上时区分「网络问题」和「登录失效」,给建议 + 重试;有缓存时不清空列表
 - 一键导出诊断日志(环境、登录状态、配置、插件日志打包)
+- **数据位置一目了然**:设置页列出游戏目录、存档、插件数据、Epic 登录记录等路径,每行说明卸载后是否保留,按 A 复制
 
 ---
 
@@ -138,9 +139,17 @@ pnpm package        # 打包成 EpicDeck-v<version>.zip
 | 游戏安装目录 | 用户自选(默认见设置页) |
 | Steam 启动脚本 | `~/homebrew/data/EpicDeck/launchers/<app_name>.sh` |
 | Proton 包装脚本 | `~/homebrew/data/EpicDeck/proton/<app_name>.sh` |
+| Legendary 二进制 + 启动 shim | `~/homebrew/data/EpicDeck/bin/` |
 | 封面图 / 图标 | `~/.local/share/Steam/userdata/<uid>/config/grid/` |
+| 导出的诊断日志 | `~/epicdeck_logs/` |
 
-卸载插件不会删游戏,但这些脚本和配置需要手动清理。
+这些路径在插件设置页的「数据位置」区块里都能看到，每行可聚焦、按 A 复制。
+
+### 卸载与重装
+
+Decky 卸载插件**只删** `~/homebrew/plugins/EpicDeck/`（代码本身）。上面的游戏本体、存档、登录态、安装记录、Steam 快捷方式**全部保留**，重装后已装游戏自动识别、不用重新登录。
+
+启动脚本和 Proton 包装脚本都放在 `~/homebrew/data/EpicDeck/`（不在插件目录里），所以**卸载后 Steam 库里现有的条目仍然能正常启动**——包括游玩时长统计和启动日志。想彻底清干净的话，先删 Steam 库里对应的非 Steam 条目，再删 `~/homebrew/data/EpicDeck` 和 `~/homebrew/settings/EpicDeck`；`~/.config/legendary/` 不要删，删了等于丢登录态和全部安装记录。
 
 ---
 
@@ -167,7 +176,8 @@ py_modules/
   proton.py                    Windows 游戏的 Proton 包装脚本
   artwork.py                   下载 Epic 封面并写入 Steam grid 目录
   epic_api.py                  Epic 官方接口(游玩时长等)
-  paths.py                     安装目录解析、磁盘列表、剩余空间
+  paths.py                     安装目录解析、磁盘列表、剩余空间,以及统一的数据目录(运行时目录)解析
+  launchshim.py                两阶段启动:读取 legendary 的启动计划、持有进程直到游戏退出(让 Steam 正确统计时长)
   clipboard.py                 ctypes 直连 libX11 读剪贴板
   xkey.py                      XTest 注入 Ctrl+A/Ctrl+C(自动取授权码用)
 ```
@@ -189,7 +199,7 @@ Steam ──启动──▶ launchers/<app>.sh ──legendary launch --wine─�
 `add_to_steam` `remove_from_steam` `is_in_steam` `sync_installed_to_steam` `refresh_steam` `launch_steam_game`
 `get_settings` `set_setting` `get_install_dir_options` `resolve_install_dir` `complete_first_run`
 `get_launch_args` `set_launch_args` `get_proton_options` `refresh_artwork`
-`check_environment` `install_legendary` `get_legendary_version` `export_logs`
+`check_environment` `install_legendary` `get_legendary_version` `export_logs` `data_locations`
 
 **事件**:`install_progress(app_name, state, percent, message, speed, eta)`、
 `library_patch(patch, remaining)`、`library_full(games)`、`library_error(message, kind)`。
@@ -314,7 +324,7 @@ Windows 游戏第一次启动在初始化 Proton 前缀,通常 1~2 分钟,期间
 设置里确认「自动添加到 Steam」是开的;也可以在游戏详情页手动「添加到 Steam」。
 
 **换设备 / 重装插件会丢什么?**
-配置和登录态都在 `~/homebrew/settings/EpicDeck/` 与 `~/.config/legendary/`,同一台机器上重装插件不丢;换了机器要重新登录,游戏需重新安装(或迁移安装目录)。
+配置和登录态都在 `~/homebrew/settings/EpicDeck/` 与 `~/.config/legendary/`,同一台机器上卸载再重装插件**什么都不丢**——游戏、存档、登录态、安装记录都在,已装游戏自动识别、不用重新登录。换了机器要重新登录,游戏需重新安装(或迁移安装目录)。
 
 ---
 
