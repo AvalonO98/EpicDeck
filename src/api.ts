@@ -192,6 +192,20 @@ export const exportLogs = callable<[], { ok: boolean; logs?: string; path?: stri
   "export_logs"
 );
 
+export interface DataLocation {
+  key: string;
+  label: string;
+  path: string;
+  note: string;
+}
+
+// Every directory the plugin owns or reads. Shown in Settings so a user can
+// find their games/backups, and so "what survives an uninstall" is answerable
+// without reading the docs (only plugins/<Name> is removed).
+export const dataLocations = callable<[], { ok: boolean; items?: DataLocation[] }>(
+  "data_locations"
+);
+
 // -- formatting helpers --------------------------------------------------
 
 export function fmtSize(bytes: number): string {

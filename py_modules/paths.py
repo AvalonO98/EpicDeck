@@ -90,3 +90,24 @@ def ensure_dir(path: str):
     if not os.access(target, os.W_OK):
         return "", "目录不可写: %s" % target
     return os.path.realpath(target), ""
+
+
+def runtime_dir() -> str:
+    """Writable per-plugin data dir (``~/homebrew/data/<Name>``).
+
+    Decky's uninstall only removes ``plugins/<Name>``, so anything that has to
+    outlive the plugin — launch scripts, the Proton wrapper, the legendary
+    binary — lives here. Every module that writes into it asks this function,
+    because two different fallback chains used to disagree when
+    ``DECKY_PLUGIN_RUNTIME_DIR`` was missing.
+    """
+    try:
+        import decky
+
+        return (
+            getattr(decky, "DECKY_PLUGIN_RUNTIME_DIR", None)
+            or getattr(decky, "DECKY_RUNTIME_DIR", None)
+            or os.path.join(getattr(decky, "HOME", os.path.expanduser("~")), ".epicdeck")
+        )
+    except Exception:
+        return os.path.expanduser("~/.epicdeck")

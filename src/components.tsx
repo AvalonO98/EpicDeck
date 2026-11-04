@@ -22,7 +22,8 @@ export const GLOBAL_CSS = `
 .ed-chip,
 .ed-action,
 .ed-pager,
-.ed-row {
+.ed-row,
+.ed-loc {
   outline: none;
   transition: background 120ms ease-out, box-shadow 120ms ease-out, transform 120ms ease-out;
 }
@@ -134,6 +135,28 @@ export const GLOBAL_CSS = `
   border-color: #4aa3ff;
   background: rgba(74,163,255,0.16);
   box-shadow: 0 0 0 2px rgba(74,163,255,0.45);
+}
+.ed-loc {
+  display: block;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.04);
+  padding: 8px 12px;
+  transition: background 120ms ease-out, border-color 120ms ease-out,
+    box-shadow 120ms ease-out;
+}
+.ed-loc.gpfocus,
+.ed-loc.ed-focus {
+  border-color: #4aa3ff;
+  background: rgba(74,163,255,0.16);
+  box-shadow: 0 0 0 2px rgba(74,163,255,0.45);
+}
+.ed-loc-path {
+  font-family: monospace;
+  font-size: 0.82em;
+  margin-top: 3px;
+  word-break: break-all;
+  user-select: text;
 }
 .ed-scroll {
   scrollbar-width: thin;

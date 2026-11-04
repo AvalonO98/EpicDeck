@@ -30,7 +30,14 @@ from py_modules.epic_api import (
     steam_posix_locale,
 )
 from py_modules.legendary import Legendary, LegendaryError, LegendaryNotFound
-from py_modules.paths import default_games_dir, ensure_dir, free_bytes, pretty_free
+from py_modules.paths import (
+    default_games_dir,
+    ensure_dir,
+    expand as expand_path,
+    free_bytes,
+    pretty_free,
+    runtime_dir,
+)
 from py_modules.steam import (
     SteamShortcuts,
     SteamError,
@@ -1670,13 +1677,19 @@ class Plugin:
             "note": "重启 Steam 后才会出现在库中（库 → 非 Steam 游戏）",
         }
 
+    def _runtime_dir(self):
+        """Writable per-plugin data dir (``~/homebrew/data/<Name>``).
+
+        Everything Steam points at lives here rather than in the plugin dir:
+        Decky's uninstall only removes ``plugins/<Name>``, so anything kept
+        here keeps working after the plugin is gone (see HANDOFF 14). The
+        resolution itself lives in `paths.runtime_dir()` because the legendary
+        installer needs the exact same answer.
+        """
+        return runtime_dir()
+
     def _launcher_dir(self):
-        base = (
-            getattr(decky, "DECKY_PLUGIN_RUNTIME_DIR", None)
-            or getattr(decky, "DECKY_RUNTIME_DIR", None)
-            or os.path.join(decky.HOME, ".epicdeck")
-        )
-        return os.path.join(base, "launchers")
+        return os.path.join(self._runtime_dir(), "launchers")
 
     def _launcher_script_path(self, app_name: str) -> str:
         """Path of the wrapper Steam launches for this game.
@@ -1687,18 +1700,80 @@ class Plugin:
         return os.path.join(self._launcher_dir(), "%s.sh" % app_name)
 
     def _launch_helper_path(self):
-        """Absolute path of the two-stage launch shim that ships with us."""
-        return os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "py_modules", "launchshim.py"
-        )
+        """Path of the launch shim inside the runtime dir.
+
+        Deliberately *not* the copy under the plugin directory: Steam's
+        launcher scripts outlive an uninstall, and a missing shim makes them
+        fall back to the single-stage launch (no playtime, no exit code, no
+        hook for cloud saves). `_stage_launch_helper()` keeps this file fresh.
+        """
+        return os.path.join(self._runtime_dir(), "bin", "launchshim.py")
+
+    def _stage_launch_helper(self) -> str:
+        """Copy the bundled shim next to the runtime dir, return the path.
+
+        Rewritten only when the bytes differ, so a plugin update picks up the
+        new shim without touching the file on every launch.
+
+        There is deliberately no in-memory cache: the content comparison
+        already makes a repeat call a single 11 KB read, and a cached path
+        would go stale if the staged file is deleted underneath us.
+        """
+        source = os.path.join(_PLUGIN_DIR, "py_modules", "launchshim.py")
+        target = self._launch_helper_path()
+        # Per-pid name: a plugin reload can have the old and the new instance
+        # writing at the same time, and they would otherwise share one temp file.
+        tmp = "%s.%d.part" % (target, os.getpid())
+        try:
+            with open(source, "rb") as fh:
+                data = fh.read()
+            try:
+                with open(target, "rb") as fh:
+                    if fh.read() == data:
+                        return target
+            except OSError:
+                pass
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            try:
+                with open(tmp, "wb") as fh:
+                    fh.write(data)
+                    # os.replace() is atomic but says nothing about the bytes
+                    # reaching the disk. Without the flush a power cut can
+                    # leave a zero-length shim behind — python "runs" it fine
+                    # (exit 0), so Steam would believe the game started and
+                    # quit immediately, with nothing in the log to explain it.
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                written = os.path.getsize(tmp)
+                if written != len(data):
+                    raise OSError("short write: %d of %d bytes" % (written, len(data)))
+                os.replace(tmp, target)
+            finally:
+                # A crash between write and replace must not litter the bin dir.
+                if os.path.isfile(tmp):
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+            return target
+        except OSError as e:
+            # A stale-but-present shim beats no shim: the launcher script tests
+            # `-f` at run time and silently degrades to the single-stage launch
+            # when it is missing (no playtime, no exit code, nothing in the log).
+            if os.path.isfile(target):
+                decky.logger.warning(
+                    "launch shim not refreshed (%s), keeping the staged copy", e
+                )
+                return target
+            decky.logger.warning(
+                "launch shim missing (%s), falling back to the bundled path", e
+            )
+            return source
 
     def _launch_log_path(self, app_name: str) -> str:
-        base = (
-            getattr(decky, "DECKY_PLUGIN_RUNTIME_DIR", None)
-            or getattr(decky, "DECKY_RUNTIME_DIR", None)
-            or os.path.join(decky.HOME, ".epicdeck")
+        return os.path.join(
+            self._runtime_dir(), "logs", "launch-%s.log" % app_name
         )
-        return os.path.join(base, "logs", "launch-%s.log" % app_name)
 
     def _write_launcher_script(self, app_name: str, exe: str = None,
                                title: str = "", wine: str = "") -> str:
@@ -1735,7 +1810,7 @@ class Plugin:
         # legendary for the `--json` launch plan, starts the game itself and
         # waits for it. Everything it needs is written in here, because the
         # script runs outside the plugin process.
-        helper = _posix_path(self._launch_helper_path())
+        helper = _posix_path(self._stage_launch_helper())
         helper_shell = "--legendary %s --app %s" % (
             shlex.quote(exe), shlex.quote(app_name),
         )
@@ -1751,7 +1826,9 @@ class Plugin:
             "# Generated by EpicDeck, rewritten whenever launch options change.\n"
             f'export LANG="{locale}"\n'
             f'export LC_ALL="{locale}"\n'
-            f'EPICDECK_SHIM="{helper}"\n'
+            # Quoted, not just wrapped in double quotes: a path containing `$`
+            # or a backtick would otherwise be expanded by bash at run time.
+            f'EPICDECK_SHIM={shlex.quote(helper)}\n'
             'for EPICDECK_PY in /usr/bin/python3 /usr/bin/python3.11 /usr/bin/python; do\n'
             '  if [ -x "$EPICDECK_PY" ] && [ -f "$EPICDECK_SHIM" ]; then\n'
             f'    "$EPICDECK_PY" "$EPICDECK_SHIM" {helper_shell} --{extra_shell} "$@"\n'
@@ -2111,6 +2188,45 @@ class Plugin:
             "proton_path": proton_bin,
             "proton_installed": bool(proton_bin),
             "use_proton": bool(self.config.get("use_proton", True)),
+        }
+
+    async def data_locations(self):
+        """The main directories this plugin owns or reads, for the settings page.
+
+        Not exhaustive — Steam's own userdata/grid is left out on purpose — but
+        it covers what a user needs to find their games, back something up, or
+        clean up after an uninstall (HANDOFF 14).
+        """
+        try:
+            # A hand-edited epicdeck.json can hold a number or an object here;
+            # str() keeps that from turning the whole callable into a rejection.
+            raw = str(self.config.get("install_dir") or "").strip()
+            games = expand_path(raw) or default_games_dir()
+            runtime = self._runtime_dir()
+            settings = getattr(self, "_settings_dir", "")
+            logs = os.path.join(getattr(decky, "HOME", os.path.expanduser("~")), "epicdeck_logs")
+            saves = os.path.join(proton.steam_root(), "steamapps", "compatdata")
+            epic = self.legendary.config_dir()
+        except Exception as e:
+            # This is a read-only info panel; failing it must not look like the
+            # backend is broken.
+            decky.logger.warning("data_locations: %s", e)
+            return {"ok": False, "items": []}
+        items = [
+            ("games", "游戏安装目录", games, "游戏本体在这里，卸载插件通常不会删除"),
+            ("saves", "存档 / 兼容层", saves, "每个游戏一个 appid 子目录；仅默认库，SD 卡库在卡上"),
+            ("runtime", "插件数据", runtime, "启动脚本、legendary、Proton wrapper、启动日志"),
+            ("settings", "插件设置", settings, "设置与库缓存"),
+            ("logs", "导出的诊断日志", logs, "「导出诊断日志」写到这里"),
+            ("legendary", "Epic 登录与安装记录", epic, "删掉会丢失登录态和安装记录"),
+        ]
+        return {
+            "ok": True,
+            "items": [
+                {"key": k, "label": l, "path": p, "note": n}
+                for k, l, p, n in items
+                if p
+            ],
         }
 
     async def install_legendary(self):

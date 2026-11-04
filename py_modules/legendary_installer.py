@@ -101,13 +101,14 @@ def default_install_dir():
     """User-writable directory for the legendary binary.
 
     On Steam Deck this resolves under the Decky runtime dir; elsewhere it
-    falls back to ~/.local/bin (which is on many users' PATH).
+    falls back to ~/.local/bin (which is on many users' PATH). Uses the shared
+    `paths.runtime_dir()` so the location the rest of the plugin reports is
+    the location this actually installs into.
     """
-    import decky  # noqa: F401  (only available at runtime)
-
     try:
-        base = decky.DECKY_PLUGIN_RUNTIME_DIR
-        return os.path.join(base, "bin")
+        from py_modules.paths import runtime_dir
+
+        return os.path.join(runtime_dir(), "bin")
     except Exception:
         return os.path.expanduser("~/.local/bin")
 

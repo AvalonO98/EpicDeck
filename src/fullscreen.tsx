@@ -47,6 +47,7 @@ import {
   SORT_OPTIONS,
   STATE_LABEL,
   checkEnvironment,
+  dataLocations,
   exportLogs,
   fmtPlaytime,
   fmtSize,
@@ -66,6 +67,7 @@ import {
   syncInstalledToSteam,
   completeFirstRun,
   getInstallDirOptions,
+  type DataLocation,
   type Game,
   type InstallFilter,
   type InstallProgress,
@@ -1079,6 +1081,139 @@ function DownloadsTab({ onOpenGame }: { onOpenGame: (appName: string) => void })
 
 // -- settings & account -------------------------------------------------
 
+/**
+ * Copy text from inside Steam's CEF.
+ *
+ * `navigator.clipboard` needs a secure context and a focused document, which
+ * is why the legacy `execCommand` path is the one that usually runs here. Both
+ * operate on the document passed in: `document` in plugin code can be the 1x1
+ * SharedJSContext window, so callers hand in the Big Picture document taken
+ * from a rendered element.
+ */
+async function copyToClipboard(doc: Document, text: string): Promise<boolean> {
+  const view = doc.defaultView;
+  try {
+    const clipboard = view?.navigator?.clipboard;
+    if (clipboard && typeof clipboard.writeText === "function") {
+      await clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* no secure context, or the permission was denied: fall through */
+  }
+  const previous = doc.activeElement as HTMLElement | null;
+  let area: HTMLTextAreaElement | null = null;
+  try {
+    area = doc.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.cssText = "position:fixed;top:0;left:0;opacity:0;pointer-events:none;";
+    doc.body.appendChild(area);
+    area.select();
+    return doc.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    // Leaving the textarea behind leaks a node per press and steals the
+    // gamepad focus; hand both back.
+    if (area) area.remove();
+    if (previous && doc.contains(previous)) {
+      try {
+        previous.focus();
+      } catch {
+        /* focus is best effort */
+      }
+    }
+  }
+}
+
+/**
+ * Where the games, saves, config and logs actually live.
+ *
+ * Decky's uninstall only removes `plugins/<Name>`, so this doubles as the
+ * answer to "if I remove the plugin, what do I lose?" — each row says it in
+ * its note. Focusable on purpose: a plain div cannot be reached with the
+ * stick, and the copy action needs A.
+ */
+function DataLocations() {
+  const [items, setItems] = useState<DataLocation[]>([]);
+  const boxRef = useRef<HTMLDivElement>(null);
+  // Steam can deliver both onClick and onActivate for one A press; without a
+  // guard that shows the toast twice.
+  const lastCopy = useRef(0);
+
+  useEffect(() => {
+    let alive = true;
+    void dataLocations()
+      .then((r) => {
+        if (!alive || !r?.ok) return;
+        setItems(
+          (r.items ?? []).filter((i) => i && typeof i.path === "string" && i.path.length > 0)
+        );
+      })
+      .catch(() => {
+        /* older backend without the callable: the section stays hidden */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  if (!items.length) return null;
+
+  const copy = async (path: string) => {
+    const now = Date.now();
+    if (now - lastCopy.current < 400) return;
+    lastCopy.current = now;
+    // Take the document from our own rendered node: the module-level
+    // `document` may be the hidden 1x1 plugin window, which cannot touch the
+    // Big Picture clipboard.
+    const doc = boxRef.current?.ownerDocument ?? document;
+    const ok = await copyToClipboard(doc, path);
+    toaster.toast({
+      title: ok ? "已复制路径" : "复制失败",
+      body: ok ? path : "剪贴板不可用，请手动记录这一行",
+    });
+  };
+
+  return (
+    <div ref={boxRef}>
+      <SectionTitle hint="卸载插件只删插件代码，下面这些都会保留">数据位置</SectionTitle>
+      <Group>
+        <NavRow flow="vertical" level="storage" style={{ gap: "8px" }}>
+          {items.map((it) => (
+            <Focusable
+              key={it.key}
+              noFocusRing
+              className="ed-loc"
+              // Decky's Focusable defaults to a flex column (that is what
+              // squeezed the QAM account row into one character per line);
+              // block keeps the three lines stacked as written.
+              style={{ display: "block" }}
+              onClick={() => void copy(it.path)}
+              onActivate={() => void copy(it.path)}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "baseline",
+                  gap: "10px",
+                }}
+              >
+                <span style={{ fontWeight: 600, fontSize: "0.9em" }}>{it.label}</span>
+                <span style={{ fontSize: "0.72em", opacity: 0.45, flexShrink: 0 }}>按 A 复制</span>
+              </div>
+              <div className="ed-loc-path">{it.path}</div>
+              <div style={{ fontSize: "0.74em", opacity: 0.5, marginTop: "3px" }}>{it.note}</div>
+            </Focusable>
+          ))}
+        </NavRow>
+      </Group>
+    </div>
+  );
+}
+
 function SettingsTab() {
   const { auth, games, progress } = usePluginState();
   const [settings, setSettings] = useState<Record<string, any>>({});
@@ -1382,6 +1517,8 @@ function SettingsTab() {
             </div>
           </Group>
         </div>
+
+        <DataLocations />
 
         {/* maintenance */}
         <div>
