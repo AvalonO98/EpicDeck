@@ -131,6 +131,12 @@ export const EN_EXTRA: Record<string, string> = {
   "追加在 legendary launch 之后，如 -windowed；留空即不添加":
     "Appended after legendary launch, e.g. -windowed; leave empty for none",
   "开始下载": "Starting download",
+  "安装中": "Installing",
+  "需外部启动器": "External launcher only",
+  "这个条目需要第三方启动器（EA App / Origin 等）才能安装，EpicDeck 暂不支持直接下载。":
+    "This title needs an external launcher (EA App / Origin) to install — EpicDeck cannot download it directly.",
+  "安装完成": "Install complete",
+  "正在添加到 Steam…": "Adding to Steam…",
   "正在下载": "Downloading",
   "正在下载…": "Downloading…",
   "正在继续…": "Resuming…",

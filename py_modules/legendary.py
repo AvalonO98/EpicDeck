@@ -61,6 +61,17 @@ def _installed_path(app_name: str) -> str:
     return ""
 
 
+def non_installable(game: dict) -> bool:
+    """True when Epic returns this entitlement with no downloadable asset.
+
+    Such titles can only be installed by an external launcher (EA App /
+    Origin): It Takes Two, The Sims 4, Mass Effect Legendary Edition, the
+    Star Wars back catalogue… Measured on a 139-game library — every
+    installable title had `asset_infos`, the 9 launcher-only ones had none.
+    """
+    return not bool(game.get("asset_infos"))
+
+
 class LegendaryError(Exception):
     pass
 
@@ -337,18 +348,54 @@ class Legendary:
             inst = inst.get("games", [])
         return [item for item in (inst or []) if isinstance(item, dict)]
 
-    async def list_games(self, include_metadata: bool = True):
+    async def list_games(self, include_metadata: bool = True, force: bool = False):
         """Return the owned game library, merged with install state.
 
         `legendary list --json` yields a flat array whose title lives in
         `app_title` (not `title`); Unreal Engine content is excluded so the
         library only shows real games. Install state comes from a separate
         `list-installed` call, since `list` does not report it.
+
+        `force` re-fetches the *owned games* list, not just metadata. Legendary
+        answers `list` from `entitlements.json`, which it only writes at login
+        time — a title bought afterwards never shows up however often the UI
+        refreshes. Dropping that file makes legendary repopulate it from the
+        API with the stored session (a cheap login), and the old copy is put
+        back if the call fails.
         """
+        ent = os.path.join(self.config_dir(), "entitlements.json")
+        backup = None
+        if force and os.path.isfile(ent):
+            try:
+                backup = ent + ".old"
+                os.replace(ent, backup)
+            except OSError:
+                # Cannot move it — better a slightly stale list than no list.
+                backup = None
+
         try:
-            games = await self._run_json("list", timeout=90.0)
+            # Forced runs also download the entitlement list and any missing
+            # metadata, hence the longer timeout.
+            # `-T` also returns titles legendary cannot install (they must be
+            # activated in EA App / Origin). They come back with `asset_infos`
+            # empty and are flagged `non_installable` below, so the UI can show
+            # them marked instead of hiding them — "I bought this, where is it"
+            # is a worse experience than a badge (7.20).
+            games = await self._run_json("list", "-T", timeout=180.0 if force else 120.0)
         except LegendaryError as e:
+            if backup and not os.path.exists(ent):
+                try:
+                    os.replace(backup, ent)
+                    backup = None
+                except OSError:
+                    pass
             raise LegendaryError("读取游戏库失败: %s" % e)
+        finally:
+            if backup:
+                try:
+                    os.unlink(backup)
+                except OSError:
+                    pass
         if isinstance(games, dict):
             games = games.get("games", [])
 
@@ -376,6 +423,10 @@ class Legendary:
                     or app_name,
                     "version": ins.get("version", "") or g.get("version", ""),
                     "is_installed": bool(ins),
+                    # No downloadable asset => only an external launcher can
+                    # install it (EA App / Origin). Every installable title in a
+                    # 139-game library had `asset_infos`; the 9 extras had none.
+                    "non_installable": non_installable(g),
                     "install_size": g.get("install_size", 0) or 0,
                     "installed_size": ins.get("install_size", 0) or 0,
                     "cover_url": self._extract_cover(g),
@@ -385,7 +436,15 @@ class Legendary:
                     "catalog_item_id": metadata.get("id", "") or "",
                 }
             )
-        result.sort(key=lambda x: (not x["is_installed"], (x["title"] or "").lower()))
+        # Installed first, then installable-not-installed, then the ones we can
+        # only list (non_installable) so they never sit between real options.
+        result.sort(
+            key=lambda x: (
+                not x["is_installed"],
+                x["non_installable"],
+                (x["title"] or "").lower(),
+            )
+        )
         return result
 
     @staticmethod

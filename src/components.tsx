@@ -7,7 +7,7 @@
 import { Focusable, ProgressBar, ScrollPanel, ScrollPanelGroup } from "@decky/ui";
 import { useState, useRef, type CSSProperties, type ReactNode } from "react";
 import { FaExclamationTriangle, FaGamepad, FaRedo } from "react-icons/fa";
-import { STATE_LABEL, fmtSize, isActive, type InstallProgress, type LibraryFailure } from "./api";
+import { STATE_LABEL, fmtEta, fmtSize, isActive, type InstallProgress, type LibraryFailure } from "./api";
 import { t } from "./i18n";
 
 // Steam's Focusable swaps in its own class when gamepad focus lands on an
@@ -396,11 +396,14 @@ export function ProgressInline({
         nProgress={progress.percent >= 0 ? progress.percent : 0}
         indeterminate={progress.percent < 0}
       />
-      {(progress.speed || progress.eta) && (
+      {/* Speed and remaining time only make sense while bytes are flowing: at
+          100% the download is over and the pump is assembling files, so showing
+          "剩余 6:59" there would be a lie. */}
+      {progress.state === "downloading" && (progress.speed || progress.eta) && (
         <div style={{ fontSize: compact ? "0.72em" : "0.8em", opacity: 0.6, marginTop: "4px" }}>
           {progress.speed}
           {progress.speed && progress.eta ? " · " : ""}
-          {progress.eta ? t("剩余 ") + progress.eta : ""}
+          {progress.eta ? t("剩余 ") + fmtEta(progress.eta) : ""}
         </div>
       )}
     </div>

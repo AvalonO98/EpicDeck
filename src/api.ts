@@ -30,6 +30,12 @@ export interface Game {
   download_size?: number;
   disk_size?: number;
   localized_title?: boolean;
+  /**
+   * Owned but not installable by legendary: the entitlement has no downloadable
+   * asset, so it can only be activated in EA App / Origin (It Takes Two, The
+   * Sims 4, …). Listed with a badge instead of silently hidden.
+   */
+  non_installable?: boolean;
 }
 
 export interface InstallDirOption {
@@ -43,6 +49,7 @@ export interface InstallProgress {
   state:
     | "starting"
     | "downloading"
+    | "installing"
     | "verifying"
     | "patching"
     | "prereq"
@@ -59,6 +66,9 @@ export interface InstallProgress {
   // on their own lines), so both may be undefined early in a download.
   downloaded_bytes?: number;
   total_bytes?: number;
+  /** Game title from the backend cache. Survives a progress event overwrite so
+   * the download list never falls back to the raw app_name (see store.ts). */
+  title?: string;
 }
 
 export interface EnvironmentInfo {
@@ -188,6 +198,27 @@ export const getUILanguage = callable<
   [],
   { ok: boolean; lang: "zh" | "en"; steam?: string; source?: string }
 >("get_ui_language");export const setSetting = callable<[key: string, value: any], { ok: boolean }>("set_setting");
+/** One running download as reported by the backend on boot. */
+export interface ActiveInstall {
+  app_name: string;
+  state: InstallProgress["state"];
+  percent: number;
+  message: string;
+  speed: string;
+  eta: string;
+  downloaded_bytes?: number | null;
+  total_bytes?: number | null;
+  /** True when the backend inherited it (started before a plugin reload). */
+  external?: boolean;
+  /** Resolved by the backend, so the list has a name even before the UI's own
+   * library payload lands. */
+  title?: string;
+}
+
+// Downloads that outlived a backend restart (see HANDOFF 7.17). Events alone
+// cannot recover them: they fired before this UI existed.
+export const getActiveInstalls = callable<[], ActiveInstall[]>("get_active_installs");
+
 export const getInstallDirOptions = callable<
   [],
   { options: InstallDirOption[]; current: string }
@@ -315,6 +346,15 @@ export function fmtPlaytime(seconds: number): string {
   return tf("{0} 分钟", Math.max(1, Math.round(seconds / 60)));
 }
 
+/** Legendary prints ETA as `HH:MM:SS`; show it as `m:ss` (or `h:mm:ss`). */
+export function fmtEta(hms: string): string {
+  const m = /^(\d+):(\d{2}):(\d{2})$/.exec((hms || "").trim());
+  if (!m) return hms || "";
+  const h = Number(m[1]);
+  const mmss = `${m[2]}:${m[3]}`;
+  return h > 0 ? `${h}:${mmss}` : `${Number(m[2])}:${m[3]}`;
+}
+
 export function fmtMinutes(totalMinutes: number): string {
   if (!totalMinutes || totalMinutes <= 0) return "—";
   const hours = Math.floor(totalMinutes / 60);
@@ -369,6 +409,7 @@ export function maskPersonal(value: string): string {
 export const STATE_LABEL: Record<string, string> = {
   starting: "准备中",
   downloading: "下载中",
+  installing: "安装中",
   verifying: "校验中",
   patching: "更新中",
   prereq: "安装组件中",
@@ -383,6 +424,7 @@ export function isActive(progress?: InstallProgress): boolean {
   return (
     progress.state === "starting" ||
     progress.state === "downloading" ||
+    progress.state === "installing" ||
     progress.state === "verifying" ||
     progress.state === "patching" ||
     progress.state === "prereq"

@@ -10,6 +10,8 @@ import asyncio
 import configparser
 import shlex
 import shutil
+import signal
+import subprocess
 import hashlib
 from urllib.parse import quote
 
@@ -287,6 +289,13 @@ class Plugin:
         # app_name -> subprocess.Process for the running legendary install, so
         # pause/cancel can stop the actual downloader (not just the task).
         self._install_procs = {}
+        # app_name -> pid for downloads inherited from a previous backend
+        # instance (legendary kept running after we were reloaded). Lets the UI
+        # keep reporting them instead of pretending they vanished. See 7.17.
+        self._external_pids = {}
+        # app_name -> latest progress snapshot. Events alone are not enough: a UI
+        # opened after they were emitted would show nothing (7.17).
+        self._live_progress = {}
         # app_name set of installs being soft-paused (vs cancelled outright);
         # the _run() cancellation handler checks this to emit the right state.
         self._pausing = set()
@@ -327,6 +336,14 @@ class Plugin:
         # is gone (two instances writing the same library.json).
         self._unloaded = False
         self._warm_task = asyncio.create_task(self._warm_library())
+
+        # A download started by a previous backend instance is still running
+        # (`legendary` outlives us). Re-attach to its log so the user does not
+        # lose sight of it after a reload — the exact failure in 7.17.
+        try:
+            self._adopt_external_installs()
+        except Exception as e:  # noqa: BLE001 - adoption must never block startup
+            decky.logger.warning("adopt external installs failed: %s", e)
 
     async def _unload(self):
         # Flip the flag first: background jobs check it before each emit / write,
@@ -841,7 +858,14 @@ class Plugin:
             return self._library_payload(cached, stale=True)
 
         try:
-            games = await self._fetch_library()
+            # A forced refresh also re-fetches the *owned* list, so a game
+            # bought after the last login finally appears (7.20). That costs a
+            # network round-trip (~20 s), so skip it when we just did one — a
+            # user tapping 刷新 twice should not wait twice.
+            deep = bool(force) and (time.time() - getattr(self, "_ent_refresh_at", 0.0) > 30.0)
+            games = await self._fetch_library(deep)
+            if deep:
+                self._ent_refresh_at = time.time()
         except LegendaryError as e:
             kind, message = classify_error(e)
             decky.logger.warning("library load failed (%s): %s", kind, e)
@@ -867,9 +891,9 @@ class Plugin:
         self._store_library(games)
         return self._library_payload(games)
 
-    async def _fetch_library(self):
+    async def _fetch_library(self, force: bool = False):
         """Hit Epic and build a fresh game list (slow path, network involved)."""
-        games = await self.legendary.list_games()
+        games = await self.legendary.list_games(force=force)
 
         # Epic exposes no "date added", so we record when each title first
         # showed up in this plugin's library. Everything seen on the first run
@@ -1045,7 +1069,10 @@ class Plugin:
         except Exception:
             have_legendary = False
         can_fetch = bool(self.config.get("auto_fetch_size", True)) and have_legendary
-        pending = sum(1 for g in out if not g.get("disk_size")) if can_fetch else 0
+        pending = (
+            sum(1 for g in out if not g.get("disk_size") and not g.get("non_installable"))
+            if can_fetch else 0
+        )
         if can_fetch:
             self._ensure_metadata_refresh(out, locale)
 
@@ -1360,6 +1387,11 @@ class Plugin:
         now = int(time.time())
         todo = []
         for g in games:
+            # Titles without a downloadable asset never return a manifest, so
+            # every attempt would be a wasted round-trip (and would keep
+            # `size_pending` permanently above zero).
+            if g.get("non_installable"):
+                continue
             cached = sizes.get(g["app_name"])
             # 用 plausible_size 判「有效」: 残缺 manifest 的 4 字节不算有效,
             # 否则这条会一直被当成 fresh 缓存,永远不重新测量。
@@ -1576,9 +1608,21 @@ class Plugin:
             try:
                 await decky.emit("install_progress", app_name, "starting", 0.0, "")
                 await self._install_streaming(app_name, target)
+                # Bytes are on disk, but the game is not launchable yet: the
+                # Steam shortcut (and its artwork) still has to be written.
+                # Report `installing` so the UI says 安装中 instead of 已完成,
+                # then `done` only once the entry really exists.
+                await decky.emit("install_progress", app_name, "installing", 100.0,
+                                 "正在添加到 Steam…")
+                try:
+                    if self.config.get("auto_add_to_steam") and await self._still_logged_in():
+                        await self._add_to_steam(app_name, await self._installed_title(app_name))
+                except Exception as e:  # noqa: BLE001
+                    # The install itself succeeded; a failed shortcut must not
+                    # turn it into an error — the user can retry from the detail
+                    # page (add_to_steam callable).
+                    decky.logger.warning("add_to_steam after install failed: %s", e)
                 await decky.emit("install_progress", app_name, "done", 100.0, "")
-                if self.config.get("auto_add_to_steam") and await self._still_logged_in():
-                    await self._add_to_steam(app_name, await self._installed_title(app_name))
             except asyncio.CancelledError:
                 if app_name in self._pausing:
                     self._pausing.discard(app_name)
@@ -1635,72 +1679,40 @@ class Plugin:
         if self.config.get("no_https"):
             cmd += ["--no-https"]
 
+        # Output goes to a FILE, not a pipe. If this backend dies mid-install
+        # (plugin reload / crash / Decky restart) legendary keeps writing instead
+        # of blocking on a pipe whose reader vanished, and the next backend can
+        # tail the same file to resume reporting progress. See 7.17.
+        log_path = self._install_log_path(app_name)
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "wb"):
+                pass  # truncate: never mix a previous run's progress into this one
+            log_fh = open(log_path, "ab", buffering=0)
+        except OSError as e:
+            raise LegendaryError("无法写入安装日志(%s): %s" % (log_path, e))
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdout=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=log_fh,
                 stderr=asyncio.subprocess.STDOUT,
                 env=self.legendary._env(),
             )
         except (OSError, PermissionError, FileNotFoundError) as e:
             raise LegendaryNotFound("无法启动 Legendary(%s): %s" % (exe, e))
-        self._install_procs[app_name] = proc
-        last_error = ""
-        downloaded_bytes = None
-        total_bytes = None
-        try:
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                decoded = line.decode("utf-8", errors="replace").strip()
-                if "error" in decoded.lower():
-                    # Keep the most specific line legendary gave us: "Not
-                    # enough free disk space" tells the user what to fix,
-                    # "退出码 1" does not.
-                    last_error = decoded
-                # Classify the activity from the log line.
-                state = self._classify_activity(decoded)
-                if state == "progress":
-                    info = self._parse_progress(decoded)
-                    # The byte figures arrive on lines of their own; keep the
-                    # latest value until it is overwritten by a newer line.
-                    if info["downloaded_bytes"] is not None:
-                        downloaded_bytes = info["downloaded_bytes"]
-                    if info["total_bytes"] is not None:
-                        total_bytes = info["total_bytes"]
-                    await decky.emit(
-                        "install_progress", app_name, "downloading",
-                        info["percent"], decoded, info["speed"], info["eta"],
-                        downloaded_bytes, total_bytes,
-                    )
-                elif state:
-                    # Non-progress activity: verification, delta patching, etc.
-                    await decky.emit(
-                        "install_progress", app_name, state, -1.0, decoded, "", "",
-                        downloaded_bytes, total_bytes,
-                    )
-                elif decoded:
-                    # A non-Progress line may still carry the byte figures
-                    # ("Downloaded: x MiB" or "Download size: y MiB").
-                    info = self._parse_progress(decoded)
-                    if info["downloaded_bytes"] is not None:
-                        downloaded_bytes = info["downloaded_bytes"]
-                    if info["total_bytes"] is not None:
-                        total_bytes = info["total_bytes"]
-                    await decky.emit(
-                        "install_progress", app_name, "downloading", -1.0, decoded, "", "",
-                        downloaded_bytes, total_bytes,
-                    )
         finally:
-            if proc.returncode is None:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=10)
-                except asyncio.TimeoutError:
-                    proc.kill()
+            # The child inherited the descriptor; our copy is no longer needed.
+            log_fh.close()
+
+        self._install_procs[app_name] = proc
+        try:
+            last_error = await self._pump_install_log(app_name, log_path, proc=proc)
             await proc.wait()
+        finally:
             self._install_procs.pop(app_name, None)
+            self._external_pids.pop(app_name, None)
 
         if proc.returncode != 0:
             detail = last_error.strip()
@@ -1708,12 +1720,193 @@ class Plugin:
                 "安装失败 (退出码 %s)%s" % (proc.returncode, ": " + detail if detail else "")
             )
 
+    async def _pump_install_log(self, app_name: str, path: str, proc=None, pid=None) -> str:
+        """Tail an install log and turn it into `install_progress` events.
+
+        Runs both for a process we started (`proc`) and for one inherited from a
+        previous backend instance (`pid`) — that is what makes a backend restart
+        non-destructive: the download keeps going and the UI picks the progress
+        back up from the same file.
+        """
+        offset = 0
+        downloaded_bytes = None
+        total_bytes = None
+        # A single legendary "tick" spans several lines: the percentage and ETA
+        # land on the `Progress:` line, the byte counts on their own line, the
+        # speed on yet another. Parsing each line independently and emitting per
+        # line meant every trailing line (it carries none of these) wiped what
+        # the previous one had set — the UI then got percent=-1, speed="" and
+        # eta="" from the last `+ Disk` line, so the bar fell back to
+        # indeterminate and speed/remaining time never showed. Accumulate them
+        # exactly like the byte counters, and emit once per batch.
+        percent = -1.0
+        speed = ""
+        eta = ""
+        message = ""
+        last_error = ""
+
+        async def push(state, percent, message, speed="", eta=""):
+            """Emit + remember the latest state.
+
+            The snapshot matters because a UI opened *after* an event was sent
+            has no way to see it: `get_active_installs()` hands it over. That is
+            how a download started before a backend restart becomes visible again.
+            """
+            self._live_progress[app_name] = {
+                "app_name": app_name,
+                "state": state,
+                "percent": percent,
+                "message": message,
+                "speed": speed,
+                "eta": eta,
+                "downloaded_bytes": downloaded_bytes,
+                "total_bytes": total_bytes,
+                "external": bool(pid),
+            }
+            await decky.emit(
+                "install_progress", app_name, state, percent, message, speed, eta,
+                downloaded_bytes, total_bytes,
+            )
+
+        async def drain() -> None:
+            nonlocal offset, downloaded_bytes, total_bytes, last_error
+            nonlocal percent, speed, eta, message
+            try:
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    chunk = f.read()
+                    offset = f.tell()
+            except OSError:
+                return
+            if not chunk:
+                return
+            batch_state = ""
+            for raw in chunk.decode("utf-8", "replace").splitlines():
+                decoded = raw.strip()
+                if not decoded:
+                    continue
+                if "error" in decoded.lower():
+                    # Keep the most specific line legendary gave us: "Not enough
+                    # free disk space" tells the user what to fix, "退出码 1" does not.
+                    last_error = decoded
+                info = self._parse_progress(decoded)
+                if info["downloaded_bytes"] is not None:
+                    downloaded_bytes = info["downloaded_bytes"]
+                if info["total_bytes"] is not None:
+                    total_bytes = info["total_bytes"]
+                if info["percent"] >= 0:
+                    percent = info["percent"]
+                if info["speed"]:
+                    speed = info["speed"]
+                if info["eta"]:
+                    eta = info["eta"]
+                state = self._classify_activity(decoded)
+                if state:
+                    batch_state = state
+                if "Progress:" in decoded:
+                    message = self._strip_log_prefix(decoded)
+            # One event per batch instead of one per line: legendary prints
+            # several lines a second and each used to fire its own event.
+            if batch_state or message:
+                await push(batch_state or "downloading", percent, message, speed, eta)
+
+        while True:
+            await drain()
+            # `os.kill(0, 0)` targets the whole process group and always
+            # "succeeds", so a missing pid must short-circuit to False or the
+            # tailer would spin forever on a download that already ended.
+            if proc is not None:
+                alive = proc.returncode is None
+            else:
+                alive = bool(pid) and self._pid_alive(pid)
+            if not alive:
+                await drain()  # 收尾:进程退出后可能还有最后几行
+                break
+            await asyncio.sleep(0.4)
+        self._live_progress.pop(app_name, None)
+        return last_error
+
+    def _scan_external_installs(self) -> dict:
+        """Find `legendary install <app>` processes we did not start.
+
+        After a backend restart the downloader is still running but this process
+        has no handle on it. Returning `{app_name: pid}` lets `_adopt_external_installs`
+        re-attach to its log file so the UI keeps showing progress instead of
+        pretending the download vanished.
+        """
+        found = {}
+        try:
+            listing = subprocess.run(
+                ["ps", "-eo", "pid,args"], capture_output=True, text=True, timeout=5
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return found
+        for line in listing.splitlines():
+            match = re.search(r"([/\w.-]*legendary)\s+install\s+(\S+)", line)
+            if not match:
+                continue
+            app = match.group(2)
+            # `app_name` is a plain token. Anything carrying quotes or escapes
+            # came from a wrapper command line (`bash -c 'exec -a "legendary
+            # install x"'`) rather than a real downloader — registering it would
+            # create a ghost download nobody can act on.
+            if app.startswith("-") or not re.fullmatch(r"[A-Za-z0-9._-]+", app):
+                continue
+            try:
+                pid = int(line.split(None, 1)[0])
+            except (ValueError, IndexError):
+                continue
+            found.setdefault(app, pid)
+        return found
+
+    def _adopt_external_installs(self):
+        """Re-attach to downloads that outlived a previous backend instance."""
+        pids = self._scan_external_installs()
+        if not pids:
+            return
+        for app_name, pid in pids.items():
+            if app_name in self._install_procs or app_name in self._install_tasks:
+                continue  # ours already
+            path = self._install_log_path(app_name)
+            if not os.path.isfile(path):
+                # Started by an older build (pipe output): no log to tail. Still
+                # mark it so the UI can show "downloading, not managed by us".
+                decky.logger.info(
+                    "adopted external install %s (pid %d), no log to tail", app_name, pid
+                )
+                self._external_pids[app_name] = pid
+                continue
+            decky.logger.info("adopted external install %s (pid %d), tailing %s",
+                              app_name, pid, path)
+            self._external_pids[app_name] = pid
+
+            async def _watch(app=app_name, p=pid, log=path):
+                try:
+                    await self._pump_install_log(app, log, pid=p)
+                finally:
+                    self._external_pids.pop(app, None)
+
+            asyncio.create_task(_watch())
+
+    @staticmethod
+    def _strip_log_prefix(line: str) -> str:
+        """Drop legendary's `[DLManager] INFO:` noise for UI display."""
+        return re.sub(
+            r"^\[[^\]]{1,24}\]\s*(?:INFO|WARNING|ERROR|DEBUG):\s*", "", line
+        ).strip()
+
     @staticmethod
     def _classify_activity(line: str):
         """Map a legendary log line to an activity state (or '' for nothing)."""
         lower = line.lower()
         if "Progress:" in line:
             return "progress"
+        # After the last chunk lands, legendary still assembles the files before
+        # the process exits. Without this the UI jumped straight from 99% to
+        # "已完成" while the game was not on disk yet.
+        if any(k in lower for k in ("waiting for installation", "all done",
+                                    "finished installation", "unpacking")):
+            return "installing"
         if any(k in lower for k in ("verifying", "verification")):
             return "verifying"
         if any(k in lower for k in ("patching", "delta patch", "applying patch")):
@@ -1885,6 +2078,14 @@ class Plugin:
         proc = self._install_procs.get(app_name)
         if proc is not None and proc.returncode is None:
             proc.terminate()
+        # Download inherited from a previous backend instance: we only hold its
+        # pid, and the user still has the right to stop it (7.17).
+        pid = self._external_pids.pop(app_name, None)
+        if pid and self._pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
         if delete:
             await self._clear_partial_download(app_name)
         return {"ok": True}
@@ -2061,9 +2262,21 @@ class Plugin:
             app_name, title=display, wine=wine,
             lsfg=self._lsfg_enabled(app_name),
         )
-        art = await self._apply_artwork(app_name, appid)
-        icon = art.get("icon") or self._steam_icon()
-        return self.steam.add_game(app_name, exe, title=display, icon=icon)
+        # Write the shortcut FIRST, artwork second. The artwork step is a set of
+        # network downloads; doing it before the vdf write meant that a backend
+        # reload in the middle left a fully installed game with *no* library
+        # entry at all (7.17c — happened twice). The game must be launchable
+        # even if every cover download fails; the default icon covers that gap.
+        written = self.steam.add_game(
+            app_name, exe, title=display, icon=self._steam_icon()
+        )
+        try:
+            art = await self._apply_artwork(app_name, appid)
+            if art.get("icon"):
+                self.steam.set_icons({written: art["icon"]})
+        except Exception as e:  # noqa: BLE001 - decoration must not break this
+            decky.logger.warning("artwork after shortcut failed: %s", e)
+        return written
 
     def _steam_icon(self) -> str:
         """Absolute path to the icon Steam should show for our shortcuts.
@@ -2231,6 +2444,26 @@ class Plugin:
         return os.path.join(
             self._runtime_dir(), "logs", "launch-%s.log" % app_name
         )
+
+    def _install_log_path(self, app_name: str) -> str:
+        """Where `legendary install` writes its output for this title.
+
+        Deliberately a **file** and not a pipe: if the backend dies (plugin
+        reload, crash, Decky restart) the downloader keeps writing to the file
+        instead of blocking on a pipe nobody reads; the next backend instance can
+        tail the same file and pick the progress back up. See 7.17.
+        """
+        return os.path.join(
+            self._runtime_dir(), "logs", "install-%s.log" % app_name
+        )
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
 
     def _write_launcher_script(self, app_name: str, exe: str = None,
                                title: str = "", wine: str = "",
@@ -2849,6 +3082,46 @@ class Plugin:
                     "total": entry.get("total") or 0,
                     "appid": entry.get("appid") or 0,
                 }
+        return out
+
+    async def get_active_installs(self):
+        """Downloads that are still running, including inherited ones.
+
+        The UI calls this on boot: `install_progress` events that fired before it
+        opened are gone, so without a snapshot a download started before a
+        backend restart would look like it never existed (7.17).
+        """
+        # getattr: callable 可能在任何任务起来之前被调用(_main 尚未执行）。
+        out = [dict(v) for v in getattr(self, "_live_progress", {}).values()]
+        # Titles ride along from the backend cache: the download list can render
+        # before the UI's own library payload arrives (e.g. right after a plugin
+        # reload), and without a title it would show the raw 32-char `app_name`.
+        titles = {}
+        for game in getattr(self, "_lib_cache", None) or []:
+            try:
+                titles[game["app_name"]] = game.get("title") or ""
+            except (KeyError, TypeError):
+                continue
+        known = {v["app_name"] for v in out}
+        for app_name in list(getattr(self, "_external_pids", {}).keys()):
+            if app_name in known:
+                continue
+            # Inherited from an older build (pipe output, no log file to tail):
+            # we know it runs but cannot read its progress. The UI still shows it
+            # so the user can cancel instead of wondering where it went.
+            out.append({
+                "app_name": app_name,
+                "state": "downloading",
+                "percent": -1.0,
+                "message": "",
+                "speed": "",
+                "eta": "",
+                "downloaded_bytes": None,
+                "total_bytes": None,
+                "external": True,
+            })
+        for row in out:
+            row["title"] = titles.get(row.get("app_name"), "")
         return out
 
     async def get_install_dir_options(self):

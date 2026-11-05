@@ -9,13 +9,14 @@
 // is fetched once, install progress is subscribed once, and navigating between
 // the two never re-runs `legendary list`.
 
-import { addEventListener } from "@decky/api";
+import { addEventListener, toaster } from "@decky/api";
 import { useSyncExternalStore } from "react";
 import {
   authStatus,
   addToSteam,
   cancelInstall,
   checkEnvironment,
+  getActiveInstalls,
   getInstallDirOptions,
   getSettings,
   installGame,
@@ -208,6 +209,10 @@ function bindEvents() {
       const progress = {
         ...state.progress,
         [appName]: {
+          // Keep what the snapshot put here (notably `title`): an event carries
+          // no title, and a bare overwrite made the download list fall back to
+          // the raw app_name.
+          ...state.progress[appName],
           state: st,
           percent,
           message,
@@ -220,6 +225,14 @@ function bindEvents() {
       setPluginState({ progress });
       // A finished install flips is_installed / sizes; one refetch covers both.
       if (st === "done") {
+        // Mirrors the "开始下载" toast so the pair reads as the two ends of one
+        // action. `state.games` may still be empty (a download inherited right
+        // after a reload), hence the fallback.
+        const finished = state.games.find((g) => g.app_name === appName);
+        toaster.toast({
+          title: t("安装完成"),
+          body: finished?.title || appName.slice(0, 12),
+        });
         setTimeout(() => {
           void reloadGames();
         }, 800);
@@ -312,6 +325,32 @@ async function boot() {
     firstRunDone: bootData.settings.first_run_done !== false,
     booted: true,
   });
+
+  // Downloads that survived a plugin reload live only in the backend (HANDOFF
+  // 7.17). Their `install_progress` events fired before this UI existed, so ask
+  // for a snapshot — otherwise the download looks like it vanished.
+  void getActiveInstalls()
+    .then((items) => {
+      if (!Array.isArray(items) || items.length === 0) return;
+      const progress: Record<string, InstallProgress> = { ...state.progress };
+      for (const item of items) {
+        if (!item || !item.app_name) continue;
+        progress[item.app_name] = {
+          state: item.state || "downloading",
+          percent: item.percent ?? -1,
+          message: item.message || "",
+          speed: item.speed || "",
+          eta: item.eta || "",
+          downloaded_bytes: item.downloaded_bytes ?? undefined,
+          total_bytes: item.total_bytes ?? undefined,
+          title: item.title || undefined,
+        } as InstallProgress;
+      }
+      setPluginState({ progress });
+    })
+    .catch(() => {
+      /* a snapshot miss must never break boot */
+    });
 
   if (!authResult.logged_in) {
     setPluginState({ games: [], loading: false, sizePending: 0, locale: "", cachedAt: 0 });

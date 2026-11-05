@@ -47,6 +47,9 @@ plugin._lib_locale = "zh-Hans"
 # `_main()` normally sets these before any callable runs; the stub skips it.
 plugin._lib_cache_at = 0.0
 plugin._install_tasks = {}
+plugin._install_procs = {}
+plugin._external_pids = {}
+plugin._live_progress = {}
 plugin._account = ""
 plugin._lib_account = ""
 plugin._settings_dir = tmp
@@ -297,6 +300,72 @@ async def run():
     resolved = main.Legendary(binary="legendary")._resolve()
     check("plugin bin/legendary wins over the runtime copy", resolved == fake_bin, str(resolved))
     decky.DECKY_PLUGIN_DIR = ROOT
+
+    # -- 进度行字段分布(7.18)--------------------------------------------
+    # Legendary spreads one tick over several lines. The pump must accumulate
+    # across them; these checks pin down where each field lives so a future
+    # "parse per line and emit" refactor cannot silently drop speed/ETA again.
+    p_line = ("[DLManager] INFO:  = Progress: 10.58% (8124/76745), "
+              "Running for 00:03:21, ETA: 00:09:42")
+    got = main.Plugin._parse_progress(p_line)
+    check("progress line carries percent", got["percent"] == 10.58, str(got))
+    check("progress line carries ETA", got["eta"] == "00:09:42", str(got))
+    check("progress line has no speed", got["speed"] == "", str(got))
+
+    s_line = ("[DLManager] INFO:  + Download\t- 42.75 MiB/s (raw) / "
+              "46.98 MiB/s (decompressed)")
+    got2 = main.Plugin._parse_progress(s_line)
+    check("speed line carries speed", got2["speed"].startswith("42.75"), str(got2))
+    check("speed line has no percent/ETA", got2["percent"] < 0 and got2["eta"] == "", str(got2))
+
+    d_line = "[DLManager] INFO:  + Disk\t- 43.03 MiB/s (write) / 0.00 MiB/s (read)"
+    got3 = main.Plugin._parse_progress(d_line)
+    check("disk line yields nothing useful (this was the wipe)",
+          got3["percent"] < 0 and got3["speed"] == "" and got3["eta"] == "", str(got3))
+    check("log prefix is stripped for display",
+          main.Plugin._strip_log_prefix("[DLManager] INFO:  = Progress: 1%") == "= Progress: 1%")
+
+    # -- 不可安装条目(7.20)----------------------------------------------
+    # legendary returns launcher-only titles (EA App / Origin) without any
+    # asset. They are listed with a badge now, so the predicate must be right:
+    # every installable title in a 139-game library had asset_infos.
+    from py_modules.legendary import non_installable as _ni
+    check("title with assets is installable", _ni({"asset_infos": {"Windows": {}}}) is False)
+    check("title without assets needs an external launcher", _ni({"asset_infos": {}}) is True)
+    check("missing asset_infos counts as non-installable", _ni({}) is True)
+
+    # -- 安装阶段识别(7.19)----------------------------------------------
+    # After the last chunk, legendary still assembles files. These lines must
+    # map to `installing` so the UI does not jump from 99% to "已完成" while the
+    # game is not usable yet.
+    for line, want in [
+        ("[DLManager] INFO: Waiting for installation to finish...", "installing"),
+        ("[DLManager] INFO: All done! Download manager quitting...", "installing"),
+        ("[cli] INFO: Finished installation process in 1860.23 seconds.", "installing"),
+        ("[DLManager] INFO:  = Progress: 100.00% (76745/76745)", "progress"),
+    ]:
+        got_state = main.Plugin._classify_activity(line)
+        check("classify %r -> %s" % (line[22:52], want), got_state == want, str(got_state))
+
+    # -- 下载认领(7.17)------------------------------------------------
+    # 后端重启后要能把还在跑的 legendary 下载接回来,否则用户会以为下载丢了。
+    check("get_active_installs is a list on a fresh plugin",
+          isinstance(await plugin.get_active_installs(), list))
+    check("dead pid is not reported alive", plugin._pid_alive(999999) is False)
+    check("current pid is alive", plugin._pid_alive(os.getpid()) is True)
+    check("external scan returns a dict",
+          isinstance(plugin._scan_external_installs(), dict))
+    plugin._external_pids["ghost"] = 999999
+    plugin._lib_cache = [{"app_name": "ghost", "title": "幽灵游戏"}]
+    active = await plugin.get_active_installs()
+    check("inherited download is reported even without a log",
+          any(r.get("app_name") == "ghost" and r.get("external") for r in active),
+          str(active)[:120])
+    check("inherited download carries its title from the library cache",
+          any(r.get("app_name") == "ghost" and r.get("title") == "幽灵游戏" for r in active),
+          str(active)[:120])
+    plugin._external_pids.pop("ghost", None)
+    plugin._lib_cache = None
 
     # -- config --------------------------------------------------------
     keys = plugin.config.get("update_check") or {}

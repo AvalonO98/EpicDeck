@@ -424,13 +424,23 @@ const LibraryTile = forwardRef<HTMLDivElement, {
         <div
           style={{
             fontSize: "0.72em",
-            color: game.is_installed ? "#7ee2a8" : "rgba(255,255,255,0.6)",
+            color: game.is_installed
+              ? "#7ee2a8"
+              : game.non_installable
+                ? "#ffd27e"
+                : "rgba(255,255,255,0.6)",
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
           }}
         >
-          {game.is_installed ? t("已安装") : game.disk_size ? fmtSize(game.disk_size) : t("未安装")}
+          {game.is_installed
+            ? t("已安装")
+            : game.non_installable
+              ? t("需外部启动器")
+              : game.disk_size
+                ? fmtSize(game.disk_size)
+                : t("未安装")}
         </div>
       </div>
     </Focusable>
@@ -462,7 +472,10 @@ function LibraryTab({
     const q = query.trim().toLowerCase();
     const filtered = games.filter((g) => {
       if (filter === "installed" && !g.is_installed) return false;
-      if (filter === "not_installed" && g.is_installed) return false;
+      // "Not installed" means "installable but not installed" — a title that
+      // needs an external launcher is neither, so it stays out of that filter
+      // instead of padding it with entries that cannot be downloaded.
+      if (filter === "not_installed" && (g.is_installed || g.non_installable)) return false;
       if (!q) return true;
       return (g.title || "").toLowerCase().includes(q) || g.app_name.toLowerCase().includes(q);
     });
@@ -1052,7 +1065,23 @@ function DetailBody({
           ) : null}
 
           <NavRow level="detail-actions" style={{ gap: "10px", flexWrap: "wrap" }}>
-            {installed ? (
+            {game.non_installable ? (
+              /* Owned but legendary cannot install it: the entitlement has no
+                 downloadable asset (EA App / Origin activation). Say so instead
+                 of offering a button that is guaranteed to fail. */
+              <div
+                className="ed-info"
+                style={{
+                  padding: "10px 14px",
+                  fontSize: "0.85em",
+                  color: "#ffd27e",
+                  lineHeight: 1.55,
+                  maxWidth: "40em",
+                }}
+              >
+                {t("这个条目需要第三方启动器（EA App / Origin 等）才能安装，EpicDeck 暂不支持直接下载。")}
+              </div>
+            ) : installed ? (
               <Focusable
                 className="ed-action"
                 data-primary="true"
@@ -1091,8 +1120,8 @@ function DetailBody({
             <Focusable
               className="ed-action"
               style={{ padding: "12px 20px", fontSize: "0.95em" }}
-              onClick={busy ? undefined : once(doToggleSteam)}
-              onActivate={busy ? undefined : once(doToggleSteam)}
+              onClick={busy || !installed ? undefined : once(doToggleSteam)}
+              onActivate={busy || !installed ? undefined : once(doToggleSteam)}
               data-disabled={!installed ? "true" : "false"}
             >
               <FaSteamSymbol /> {inSteam ? t("从 Steam 移除") : t("添加到 Steam")}
@@ -1234,8 +1263,13 @@ function DownloadsTab({ onOpenGame, onOpenSettings }: { onOpenGame: (appName: st
       });
   }, [progress]);
 
+  // `title` comes from the backend (it holds the library cache), so the list
+  // still names the game when our own payload has not landed yet — e.g. when a
+  // download is inherited right after a plugin reload.
   const titleOf = (appName: string) =>
-    games.find((g) => g.app_name === appName)?.title ?? appName.slice(0, 12);
+    progress[appName]?.title ||
+    games.find((g) => g.app_name === appName)?.title ||
+    appName.slice(0, 12);
 
   if (items.length === 0) {
     return (
