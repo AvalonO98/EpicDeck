@@ -126,6 +126,18 @@ export const loginWithCode = callable<
 >("login_with_code");
 export const getLoginUrl = callable<[], { ok: boolean; url: string }>("get_login_url");
 
+// Phone-assisted login: the backend serves a one-shot page on the Deck's LAN IP
+// that collects the authorization code on the phone (no cross-device copy).
+export const startPhoneLogin = callable<
+  [],
+  {
+    ok: boolean;
+    url?: string;
+    already_logged_in?: boolean;
+    error?: string;
+  }
+>("start_phone_login");
+
 export const listGames = callable<[force?: boolean], LibraryPayload>("list_games");
 export const getGameSize = callable<
   [app_name: string],

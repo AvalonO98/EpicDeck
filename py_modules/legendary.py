@@ -72,6 +72,34 @@ def non_installable(game: dict) -> bool:
     return not bool(game.get("asset_infos"))
 
 
+# Epic's public launcher client. These are legendary's own open-source client
+# credentials, not user secrets — third-party Epic tools share them.
+EPIC_OAUTH_TOKEN_URL = (
+    "https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/token"
+)
+EPIC_LAUNCHER_CLIENT_ID = "34a02cf8f4414e29b15921876da36f9a"
+EPIC_LAUNCHER_SECRET = "daafbccc737745039dffe53d94fc76cf"
+
+
+def oauth_error_text(payload: str) -> str:
+    """Turn Epic's OAuth error JSON into something a user can act on."""
+    try:
+        code = str(json.loads(payload).get("errorCode") or "")
+    except (ValueError, TypeError):
+        return ""
+    tail = code.rsplit(".", 1)[-1]
+    return {
+        "authorization_code_not_found": (
+            "授权码无效或已过期。授权码只能用一次且很快失效，请重新打开登录页获取。"
+        ),
+        "authorization_code_not_for_your_client": (
+            "这个授权码不是发给 EpicDeck 的，请在登录页重新确认授权。"
+        ),
+        "invalid_grant": "授权码无效，请重新获取。",
+        "invalid_client": "Epic 客户端凭据失效，请更新插件。",
+    }.get(tail, "")
+
+
 class LegendaryError(Exception):
     pass
 
@@ -253,6 +281,105 @@ class Legendary:
     async def auth_with_code(self, code: str):
         """Authenticate using an authorization code from the device flow."""
         return await self._run("auth", "--code", code, timeout=120.0)
+
+    async def auth_with_code_native(self, code: str):
+        """Trade an authorization code for tokens *without* `legendary auth`.
+
+        `legendary auth` runs `check_for_updates(force=True)` before doing
+        anything else. That request goes to api.legendary.gl, which is
+        unreachable on many networks — and the exception is not caught inside
+        `cli.auth()`, so a perfectly good authorization code dies on an
+        unrelated version check (field report 2026-11-06: login failed with a
+        ReadTimeout to api.legendary.gl *after* the code had been captured).
+        The exchange only needs Epic's public account API, so do it here and
+        write the same `user.json` legendary would have written.
+        """
+        import base64
+        import ssl
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        # The plugin runs under systemd (plugin_loader); its environment does
+        # not always resolve the system CA bundle (SSL_CERT_FILE can point at a
+        # path that no longer exists after an update). On the Deck the failure
+        # was "unable to get local issuer certificate" while the exact same
+        # request succeeded in a login shell. Pin certifi's bundle so the hand-
+        # shake never depends on the ambient environment.
+        try:
+            import certifi
+
+            _cafile = certifi.where()
+        except Exception:  # noqa: BLE001 - fall back to the OS default
+            _cafile = None
+        _ctx = None
+        if _cafile:
+            try:
+                _ctx = ssl.create_default_context(cafile=_cafile)
+            except Exception:  # noqa: BLE001
+                _ctx = None
+
+        body = urllib.parse.urlencode(
+            {"grant_type": "authorization_code", "code": code, "token_type": "eg1"}
+        ).encode()
+        basic = base64.b64encode(
+            ("%s:%s" % (EPIC_LAUNCHER_CLIENT_ID, EPIC_LAUNCHER_SECRET)).encode()
+        ).decode()
+        req = urllib.request.Request(
+            EPIC_OAUTH_TOKEN_URL,
+            data=body,
+            headers={
+                "Authorization": "basic " + basic,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+
+        loop = asyncio.get_running_loop()
+
+        def _post():
+            return urllib.request.urlopen(req, timeout=30, context=_ctx).read()
+
+        try:
+            raw = await loop.run_in_executor(None, _post)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            raise LegendaryError(
+                oauth_error_text(detail) or ("Epic 登录失败 (HTTP %s)" % e.code)
+            )
+        except Exception as e:  # noqa: BLE001 - network stack varies
+            raise LegendaryError("连接 Epic 失败: %s" % e)
+
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise LegendaryError("Epic 返回了无法解析的响应")
+
+        account_id = str(data.get("account_id") or "")
+        if not account_id or not data.get("refresh_token"):
+            raise LegendaryError("Epic 未返回有效的账号信息")
+
+        user = {
+            "account_id": account_id,
+            "displayName": data.get("displayName") or "",
+            "access_token": data.get("access_token") or "",
+            "refresh_token": data.get("refresh_token") or "",
+            "expires_at": data.get("expires_at") or "",
+            "refresh_expires_at": data.get("refresh_expires_at") or "",
+            "app": data.get("app") or "launcher",
+            "in_app_id": data.get("in_app_id") or account_id,
+        }
+        if data.get("device_id"):
+            user["device_id"] = data["device_id"]
+
+        path = os.path.join(self.config_dir(), "user.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(user, fh, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        return {"account_id": account_id, "display_name": user["displayName"]}
 
     async def auth_status(self):
         """Return dict describing auth state: logged_in, account_id, display_name.

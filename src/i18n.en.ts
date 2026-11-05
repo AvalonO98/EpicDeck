@@ -26,10 +26,32 @@ export const EN_EXTRA: Record<string, string> = {
   "授权码只能使用一次且很快过期": "The code is single-use and expires quickly",
   "在 Steam 浏览器中登录（推荐）": "Sign in with Steam's browser (recommended)",
   "手机扫码登录": "Sign in on your phone",
+  "用手机扫码登录": "Sign in on your phone",
+  "用手机扫下面的码，登录 Epic 并在那个页面里粘贴授权码，全程不用在 Deck 上输入。":
+    "Scan this code with your phone, sign in to Epic and paste the code there — nothing to type on the Deck.",
+  "手机和 Steam Deck 需要连同一个 WiFi（局域网），否则扫码会连不上。":
+    "Your phone and Steam Deck must be on the same Wi-Fi network, or the scan won't connect.",
+  "等待手机完成登录…（这个页面别关）":
+    "Waiting for you to finish on the phone… (keep this screen open)",
+  "正在准备二维码…": "Preparing the QR code…",
+  "二维码用不了？改用手动粘贴授权码": "QR not working? Paste the code manually",
+  "手动粘贴授权码": "Paste the authorization code",
+  "返回扫码": "Back to scan",
+  "无法开始手机登录": "Could not start phone sign-in",
+  "启动手机登录失败:": "Failed to start phone sign-in:",
   "用手机扫码 / 手动粘贴授权码": "Scan the code or paste the authorization code",
   "用手机或电脑打开下面的链接(也可扫码),登录你的 Epic 账号":
     "Open the link below on your phone or PC (or scan the code) and sign in to Epic",
   "登录后页面会显示一段内容,复制其中": "After signing in, the page shows a block of text — copy the",
+  "1. 用手机或电脑打开下面的链接,登录你的 Epic 账号":
+    "1. Open the link below on your phone or PC and sign in to Epic",
+  "关掉即可。": "You can close it.",
+  "登录成功后浏览器会停在 JSON 页面，按":
+    "After signing in, the browser stops on the JSON page — press",
+  "没反应？可重新打开登录页，或改用手机扫码 / 手动粘贴授权码。":
+    "Nothing happening? Reopen the sign-in page, or scan on your phone / paste the code manually.",
+  "在打开的窗口里登录 Epic，插件会自己取授权码":
+    "Sign in to Epic in the window that opened — the plugin reads the code itself",
   "粘贴到下面,点「完成登录」。": "Paste it below and press \"Finish signing in\".",
   "请先粘贴授权码": "Paste the authorization code first",
   "改用手动粘贴授权码": "Paste the code manually instead",
@@ -66,7 +88,6 @@ export const EN_EXTRA: Record<string, string> = {
   "连接状态": "Connection",
 
   // -- library ------------------------------------------------------------
-  "EpicDeck · Epic 游戏库": "EpicDeck · Epic library",
   "EpicDeck 游戏库": "EpicDeck library",
   "Epic 库中拥有": "In your Epic library",
   "游戏总数": "Games",
@@ -132,6 +153,11 @@ export const EN_EXTRA: Record<string, string> = {
     "Appended after legendary launch, e.g. -windowed; leave empty for none",
   "开始下载": "Starting download",
   "安装中": "Installing",
+  "脚本登录中": "Signing in",
+  "已读取授权码，正在登录…": "Code captured — signing in…",
+  "在打开的窗口里登录 Epic，完成后会自动继续":
+    "Sign in to Epic in the window that opened — this screen continues automatically",
+  "登录超时": "Sign-in timed out",
   "需外部启动器": "External launcher only",
   "这个条目需要第三方启动器（EA App / Origin 等）才能安装，EpicDeck 暂不支持直接下载。":
     "This title needs an external launcher (EA App / Origin) to install — EpicDeck cannot download it directly.",
@@ -262,9 +288,31 @@ export const EN_EXTRA: Record<string, string> = {
   "保存失败": "Save failed",
   "登出失败": "Sign-out failed",
   "已登出": "Signed out",
+  "登出": "Sign out",
+  "切换账号": "Switch account",
+  "切换": "Switch",
+  "已切换账号": "Account switched",
+  "切换失败": "Switch failed",
+  "下次登录会要求输入新账号": "The next sign-in will ask for a new account",
+  "下次登录会沿用当前账号": "The next sign-in will reuse the current account",
   "安装成功": "Installed",
   "安装失败": "Install failed",
   "登录成功": "Signed in",
+  "在 Steam 浏览器中登录": "Sign in with Steam's browser",
+  "会弹出 Steam 浏览器打开 Epic 登录页，登录你的账号。":
+    "Steam's browser will open Epic's sign-in page — sign in with your account.",
+  "登录成功后页面会显示一段 JSON，形如：":
+    "After signing in, the page shows a block of JSON like:",
+  "看到这段 JSON 就说明登录成功了，插件会自己把授权码取走。":
+    "That JSON means sign-in worked — the plugin reads the code from it automatically.",
+  "请稍等约 15 秒，确保授权码被完整读取。":
+    "Wait about 15 seconds so the code is fully read.",
+  "第一次登录可能因网络较慢，若长时间没出现代码，可关闭浏览器重新登录。":
+    "The first sign-in may be slow due to network — if the code doesn't appear, close the browser and try again.",
+  "然后再按 B 键关掉浏览器，回到插件即可。":
+    "Then press B to close the browser and get back to the plugin.",
+  "开始登录": "Start sign-in",
+  "取消": "Cancel",
   "登录失败": "Sign-in failed",
   "登录出错:": "Sign-in error: ",
   "启动登录失败:": "Could not start sign-in: ",

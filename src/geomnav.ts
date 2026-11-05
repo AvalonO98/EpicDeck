@@ -164,6 +164,49 @@ export function reverifyFocus(expected: HTMLElement, root: HTMLElement, frames =
   }
 }
 
+/**
+ * Bring an element into view inside Steam's scroll panel.
+ *
+ * `scrollIntoView()` does **nothing** on Steam's `ScrollPanel`: the real
+ * scrolling element is an ancestor with `overflow-y: auto` (a `Panel Focusable`
+ * in between reports `scrollHeight > clientHeight` but `overflow: visible`, so
+ * assigning its `scrollTop` is silently ignored — the exact trap HANDOFF 7.22
+ * documents). So we walk up from the target to the first *real* scroll container
+ * and nudge its `scrollTop` just enough to reveal the element, the same way the
+ * QAM's `scrollToTop` does. When no such container exists (the plain-div
+ * fallback), `scrollIntoView` is harmless and still runs.
+ */
+function scrollIntoViewport(root: HTMLElement, el: HTMLElement) {
+  const doc = root.ownerDocument;
+  const view = doc.defaultView;
+  let container: HTMLElement | null = el.parentElement;
+  while (container && container !== doc.body) {
+    const style = view?.getComputedStyle(container);
+    const scrollable = /(auto|scroll)/.test(style?.overflowY || "");
+    if (scrollable && container.scrollHeight > container.clientHeight + 4) {
+      const cTop = container.getBoundingClientRect().top;
+      const cHeight = container.clientHeight;
+      const r = el.getBoundingClientRect();
+      const relTop = r.top - cTop;
+      const relBottom = r.bottom - cTop;
+      // Scroll the minimum amount to bring the element fully inside the
+      // viewport; `block: nearest` semantics, but on the real container.
+      if (relTop < 0) {
+        container.scrollTop += relTop;
+      } else if (relBottom > cHeight) {
+        container.scrollTop += relBottom - cHeight;
+      }
+      return;
+    }
+    container = container.parentElement;
+  }
+  try {
+    el.scrollIntoView({ block: "nearest", inline: "nearest" });
+  } catch {
+    /* scrolling is cosmetic; never skip the move because of it */
+  }
+}
+
 function usable(el: HTMLElement | null | undefined, root: HTMLElement): el is HTMLElement {
   if (!el || !el.isConnected) return false;
   if (!root.contains(el)) return false;
@@ -386,11 +429,7 @@ export function moveFocus(
     best = wrapRow(active, root, button === DIR_LEFT);
   }
   if (!best) return false;
-  try {
-    best.scrollIntoView({ block: "nearest", inline: "nearest" });
-  } catch {
-    /* scrolling is cosmetic; never skip the move because of it */
-  }
+  scrollIntoViewport(root, best);
   focusOwned(best);
   // Steam 可能在同一拍里把焦点抢到隔壁。这里**不能**直接 return false 把按键
   // 交还给它 —— 那正是「按下去却横移一格」的放行口。先按回来,实在按不住
@@ -411,6 +450,165 @@ export function moveFocus(
   claimFocusRing(best, root);
   // 再盯两帧:有些路径上 Steam 不触发 focusin,只把 DOM focus 挪走。
   reverifyFocus(best, root);
+  return true;
+}
+
+/**
+ * Row/column navigation for flowing (non-grid) layouts — the settings, detail
+ * and downloads pages, plus the header/tab bar.
+ *
+ * The geometric `moveFocus` above works beautifully on the library's rigid
+ * 5×3 grid, but on a flowing form the user thinks in terms of *rows of
+ * controls*: 上/下 moves between rows, 左/右 moves between the buttons of the
+ * current row. The old "same column" test was too strict there — a ToggleField
+ * and a button in neighbouring rows are never x-aligned, so 上/下 silently
+ * stopped. Clustering controls into rows by their vertical centre and then
+ * picking the horizontally nearest one on the target row matches the intuition
+ * ("上下切换行,左右切换按钮", 2026-11-06 用户要求).
+ */
+export function moveFocusRowCol(
+  button: number,
+  scope?: HTMLElement | null
+): boolean {
+  if (button !== DIR_LEFT && button !== DIR_RIGHT && button !== DIR_UP && button !== DIR_DOWN) {
+    return false;
+  }
+  const root = scope || (document.querySelector(".ed-surface") as HTMLElement | null);
+  if (!root) return false;
+  const doc = root.ownerDocument;
+
+  const active = usable(remembered, root) ? (remembered as HTMLElement) : currentFocused(root);
+  if (!active) return false;
+
+  // Collect every visible leaf focusable within the scope — *including* the
+  // active element, so the row/column cluster knows which row/column it is in.
+  // The active element is skipped only when picking the movement target.
+  let all: HTMLElement[] = [];
+  try {
+    all = Array.from(root.querySelectorAll<HTMLElement>(CANDIDATE_SELECTOR));
+  } catch {
+    return false;
+  }
+  const candidates: HTMLElement[] = [];
+  for (const el of all) {
+    if (el === active) {
+      candidates.push(el);
+      continue;
+    }
+    if (active.contains(el) || el.contains(active)) continue;
+    if (!isLeafFocusable(el) || !isVisible(el, doc)) continue;
+    candidates.push(el);
+  }
+  if (candidates.length === 0) return false;
+
+  const r = active.getBoundingClientRect();
+  const fx = r.left + r.width / 2;
+  const fy = r.top + r.height / 2;
+
+  const rowKey = (el: HTMLElement): number => {
+    const b = el.getBoundingClientRect();
+    return b.top + b.height / 2;
+  };
+  const sorted = candidates.slice().sort((a, b) => rowKey(a) - rowKey(b));
+
+  // Cluster into rows by vertical-centre proximity. Buttons sharing a flex row
+  // sit ~0px apart; a control in the next Group sits 40px+ lower, so a band of
+  // half the shorter control's height (floor 16px) separates them cleanly.
+  const rows: { center: number; items: HTMLElement[] }[] = [];
+  for (const el of sorted) {
+    const cy = rowKey(el);
+    const last = rows[rows.length - 1];
+    const band = last
+      ? Math.max(16, Math.min(el.getBoundingClientRect().height, last.items[0].getBoundingClientRect().height) * 0.5)
+      : 0;
+    if (last && Math.abs(cy - last.center) <= band) {
+      last.items.push(el);
+      last.center = (last.center * (last.items.length - 1) + cy) / last.items.length;
+    } else {
+      rows.push({ center: cy, items: [el] });
+    }
+  }
+
+  // Locate the row the active element sits in.
+  let myRowIndex = -1;
+  let myRowGap = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < rows.length; i += 1) {
+    const gap = Math.abs(fy - rows[i].center);
+    if (gap < myRowGap) {
+      myRowGap = gap;
+      myRowIndex = i;
+    }
+  }
+  if (myRowIndex < 0) return false;
+
+  const horizontal = button === DIR_LEFT || button === DIR_RIGHT;
+
+  if (horizontal) {
+    // Within the current row, ordered left→right. Wrap around so the header's
+    // "left-most → left = right-most" behaviour survives (2026-11-05 用户要求).
+    const myRow = rows[myRowIndex].items
+      .slice()
+      .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+    const idx = myRow.indexOf(active);
+    let target: HTMLElement | null = null;
+    if (idx < 0) {
+      // active is not a leaf (edge case): pick the nearest sibling in the
+      // requested direction, or wrap.
+      for (const el of myRow) {
+        const dx = el.getBoundingClientRect().left - r.left;
+        if (button === DIR_LEFT && dx < 0) target = el;
+        else if (button === DIR_RIGHT && dx > 0) {
+          target = el;
+          break;
+        }
+      }
+      if (!target && myRow.length) target = button === DIR_LEFT ? myRow[myRow.length - 1] : myRow[0];
+    } else if (button === DIR_LEFT) {
+      target = idx > 0 ? myRow[idx - 1] : myRow[myRow.length - 1];
+    } else {
+      target = idx < myRow.length - 1 ? myRow[idx + 1] : myRow[0];
+    }
+    if (!target || target === active) return false;
+    scrollIntoViewport(root, target);
+    focusOwned(target);
+    claimFocusRing(target, root);
+    reverifyFocus(target, root);
+    return true;
+  }
+
+  // Vertical: jump to the adjacent row and pick the x-nearest control there.
+  const nextI = button === DIR_UP ? myRowIndex - 1 : myRowIndex + 1;
+  if (nextI < 0 || nextI >= rows.length) return false;
+  const row = rows[nextI].items;
+  let target: HTMLElement | null = null;
+  let bestDx = Number.POSITIVE_INFINITY;
+  for (const el of row) {
+    if (el === active) continue;
+    const b = el.getBoundingClientRect();
+    const dx = Math.abs(b.left + b.width / 2 - fx);
+    if (dx < bestDx) {
+      bestDx = dx;
+      target = el;
+    }
+  }
+  if (!target) return false;
+  scrollIntoViewport(root, target);
+  focusOwned(target);
+  if (doc.activeElement !== target) {
+    try {
+      target.focus();
+      remembered = target;
+    } catch {
+      /* fall through */
+    }
+  }
+  if (doc.activeElement !== target) {
+    remembered = null;
+    ownedTarget = null;
+    return false;
+  }
+  claimFocusRing(target, root);
+  reverifyFocus(target, root);
   return true;
 }
 

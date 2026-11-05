@@ -325,6 +325,31 @@ async def run():
     check("log prefix is stripped for display",
           main.Plugin._strip_log_prefix("[DLManager] INFO:  = Progress: 1%") == "= Progress: 1%")
 
+    # -- OAuth 错误映射(7.21)--------------------------------------------
+    # Login no longer shells out to `legendary auth` (it dies on
+    # api.legendary.gl); Epic's error payload must still produce a hint the
+    # user can act on.
+    from py_modules.legendary import oauth_error_text as _oet
+    check("expired/unknown code maps to actionable text",
+          "授权码" in _oet('{"errorCode":"errors.com.epicgames.account.oauth.authorization_code_not_found"}'))
+    check("wrong-client code maps to actionable text",
+          "EpicDeck" in _oet('{"errorCode":"errors.com.epicgames.account.oauth.authorization_code_not_for_your_client"}'))
+    check("unrelated error yields empty string",
+          _oet('{"errorCode":"something.else"}') == "")
+    check("non-JSON payload yields empty string", _oet("not json") == "")
+
+    # -- 手机扫码登录(7.22)------------------------------------------------
+    # The phone pastes whatever it got into the LAN page; extract_code must pull
+    # the authorization code out of a bare code, a JSON blob, or a URL.
+    from py_modules.localauth import extract_code as _xcode
+    check("extracts a bare code", _xcode("a" * 32) == "a" * 32)
+    check("extracts from JSON",
+          _xcode('{"authorizationCode":"deadbeefdeadbeefdeadbeef"}')
+          == "deadbeefdeadbeefdeadbeef")
+    check("extracts from URL", _xcode("https://x/?code=ABC123ABC123ABC123") == "ABC123ABC123ABC123")
+    check("rejects garbage", _xcode("hello world") == "")
+    check("rejects empty", _xcode("") == "")
+
     # -- 不可安装条目(7.20)----------------------------------------------
     # legendary returns launcher-only titles (EA App / Origin) without any
     # asset. They are listed with a badge now, so the predicate must be right:

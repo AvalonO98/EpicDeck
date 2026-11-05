@@ -6,7 +6,7 @@
 // has to do is start the attempt and poll for the outcome. The QR / manual code
 // paths stay as a fallback for when the Steam browser misbehaves.
 
-import { PanelSection, PanelSectionRow, ButtonItem, TextField } from "@decky/ui";
+import { PanelSection, PanelSectionRow, ButtonItem, TextField, ConfirmModal, showModal } from "@decky/ui";
 import { toaster } from "@decky/api";
 import { useEffect, useState, type ReactNode } from "react";
 import QRCode from "qrcode";
@@ -19,6 +19,7 @@ import {
   loginPoll,
   loginWithClipboard,
   loginWithCode,
+  startPhoneLogin,
 } from "./api";
 import { t } from "./i18n";
 
@@ -94,7 +95,10 @@ export function LoginPanel({
   variant?: "qam" | "screen";
 }) {
   const [showCode, setShowCode] = useState<boolean>(false);
+  const [showManual, setShowManual] = useState<boolean>(false);
   const [loginUrl, setLoginUrl] = useState<string>(EPIC_LOGIN_URL);
+  const [phoneUrl, setPhoneUrl] = useState<string>("");
+  const [phoneMode, setPhoneMode] = useState<boolean>(false);
   const [code, setCode] = useState<string>("");
   const [busy, setBusy] = useState<string>("");
   const [msg, setMsg] = useState<string>("");
@@ -118,6 +122,13 @@ export function LoginPanel({
     return () => {
       cancelled = true;
     };
+  }, [showCode]);
+
+  // Entering the QR screen kicks off the LAN server and shows a QR of its URL.
+  useEffect(() => {
+    if (!showCode) return;
+    void startPhone();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showCode]);
 
   const submitCode = async () => {
@@ -159,11 +170,32 @@ export function LoginPanel({
         if (r.ok) {
           stopped = true;
           setSession({ state: "ok", message: "", display_name: r.display_name });
-          toaster.toast({ title: t("登录成功"), body: r.display_name || "" });
+          // Phone login wants an explicit "signed in" toast (there is no
+          // browser to close and the user is looking at the Deck the whole
+          // time). Browser login does NOT toast here: this poll only resumes
+          // *after* the browser is already closed (the panel unmounts while
+          // it is open), so a "press B to close the browser" toast would fire
+          // late and be nonsense — the confirm dialog already told them to
+          // press B up front. Just flip to the library.
+          if (phoneMode) {
+            toaster.toast({ title: t("登录成功"), body: r.display_name || "" });
+          }
           onLoggedIn();
+        } else if (r.state === "finishing") {
+          // The code was captured and the token exchange is running; surface it
+          // so the panel does not look stuck for those few seconds.
+          setSession((prev) =>
+            prev
+              ? { ...prev, message: r.message || t("已读取授权码，正在登录…") }
+              : prev,
+          );
         } else if (r.state === "error" || r.state === "timeout") {
           stopped = true;
           setSession({ state: r.state, message: r.message, display_name: "" });
+          toaster.toast({
+            title: r.state === "timeout" ? t("登录超时") : t("登录失败"),
+            body: r.message || "",
+          });
         }
       } catch (e) {
         console.log("EpicDeck: login poll failed", e);
@@ -177,14 +209,114 @@ export function LoginPanel({
     };
   }, [session?.state]);
 
+  // Show a heads-up *before* the browser opens. Once Steam's browser is up it
+  // covers everything — including any toast — so the only reliable time to tell
+  // the user what to expect is right now. This doubles as a "second confirm".
+  const confirmBrowserLogin = () => {
+    showModal(
+      <ConfirmModal
+        strTitle={t("在 Steam 浏览器中登录")}
+        strDescription={
+          <div style={{ lineHeight: 1.6, fontSize: "0.9em" }}>
+            <div style={{ marginBottom: "10px" }}>
+              {t('会弹出 Steam 浏览器打开 Epic 登录页，登录你的账号。')}
+            </div>
+            <div style={{ marginBottom: "10px" }}>
+              {t('登录成功后页面会显示一段 JSON，形如：')}
+            </div>
+            <div
+              style={{
+                fontFamily: "monospace",
+                fontSize: "0.78em",
+                background: "rgba(0,0,0,0.35)",
+                padding: "10px",
+                borderRadius: "6px",
+                wordBreak: "break-all",
+                marginBottom: "10px",
+                opacity: 0.85,
+              }}
+            >
+              {'{"authorizationCode": "a1b2c3d4..."}'}
+            </div>
+            <div>
+              {t('看到这段 JSON 就说明登录成功了，插件会自己把授权码取走。')}
+            </div>
+            <div style={{ marginTop: "8px" }}>
+              {t('请稍等约 15 秒，确保授权码被完整读取。')}
+            </div>
+            <div style={{ marginTop: "8px" }}>
+              {t('第一次登录可能因网络较慢，若长时间没出现代码，可关闭浏览器重新登录。')}
+            </div>
+            <div style={{ marginTop: "8px", fontWeight: 600, color: "#9ecbff" }}>
+              {t('然后再按 B 键关掉浏览器，回到插件即可。')}
+            </div>
+          </div>
+        }
+        strOKButtonText={t("开始登录")}
+        strCancelButtonText={t("取消")}
+        onOK={() => {
+          void startLogin();
+        }}
+      />,
+    );
+  };
+
   const startLogin = async () => {
     setBusy("open");
     setMsg("");
     setSession(null);
+    // Persist "waiting" *before* the browser opens. `beginLogin()` hands the URL
+    // to Steam's browser on the backend, which takes over the screen and
+    // unmounts this panel — if we only set the state after `await beginLogin()`
+    // returns, the panel is already gone and the session never lands in
+    // `window.__epicdeckLoginUI`, so closing the browser re-mounts a panel that
+    // thinks nothing is running (the user has to press "sign in" again).
+    const waiting = { state: "waiting", message: "", display_name: "" };
+    setSession(waiting);
+    storeLoginSession(waiting);
     try {
       const r = await beginLogin();
       if (!r.ok) {
+        setSession(null);
+        storeLoginSession(null);
         setMsg(r.error ?? t("无法开始登录"));
+        return;
+      }
+      if (r.already_logged_in) {
+        setSession(null);
+        storeLoginSession(null);
+        toaster.toast({ title: t("已经登录"), body: t("不需要重复登录") });
+        onLoggedIn();
+        return;
+      }
+      setLoginUrl(r.url || EPIC_LOGIN_URL);
+      setSession({ state: "waiting", message: r.message ?? "", display_name: "" });
+      // Steam's browser covers this panel, so a toast is the only thing the
+      // user can still see while signing in. Tell them the plugin is working
+      // instead of leaving them staring at a browser window.
+      toaster.toast({
+        title: t("脚本登录中"),
+        body: t("在打开的窗口里登录 Epic，完成后会自动继续"),
+      });
+    } catch (e) {
+      setSession(null);
+      storeLoginSession(null);
+      setMsg(t("启动登录失败:") + String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  // Phone-assisted login: the Deck serves a page on its LAN IP, the phone opens
+  // it via QR, signs in to Epic and pastes the code there — no cross-device copy.
+  const startPhone = async () => {
+    setBusy("phone");
+    setMsg("");
+    setSession(null);
+    try {
+      const r = await startPhoneLogin();
+      if (!r.ok) {
+        setMsg(r.error ?? t("无法开始手机登录"));
         return;
       }
       if (r.already_logged_in) {
@@ -192,10 +324,11 @@ export function LoginPanel({
         onLoggedIn();
         return;
       }
-      setLoginUrl(r.url || EPIC_LOGIN_URL);
-      setSession({ state: "waiting", message: r.message ?? "", display_name: "" });
+      setPhoneUrl(r.url || "");
+      setPhoneMode(true);
+      setSession({ state: "waiting", message: "", display_name: "" });
     } catch (e) {
-      setMsg(t("启动登录失败:") + String(e));
+      setMsg(t("启动手机登录失败:") + String(e));
     } finally {
       setBusy("");
     }
@@ -203,6 +336,8 @@ export function LoginPanel({
 
   const stopLogin = async () => {
     setSession(null);
+    setPhoneMode(false);
+    setPhoneUrl("");
     try {
       await cancelLogin();
     } catch (e) {
@@ -238,11 +373,83 @@ export function LoginPanel({
       <PanelSection title={t("手机扫码登录")}>
         <PanelSectionRow>
           <div style={{ padding: "4px 0 2px", lineHeight: 1.5 }}>
-            {t('1. 用手机或电脑打开下面的链接(也可扫码),登录你的 Epic 账号')}
+            {t('用手机扫下面的码，登录 Epic 并在那个页面里粘贴授权码，全程不用在 Deck 上输入。')}
           </div>
         </PanelSectionRow>
         <PanelSectionRow>
-          <QrImage url={loginUrl} />
+          <div style={{ padding: "0 0 6px", fontSize: "0.82em", lineHeight: 1.5, opacity: 0.65 }}>
+            {t('手机和 Steam Deck 需要连同一个 WiFi（局域网），否则扫码会连不上。')}
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          {phoneUrl ? (
+            <QrImage url={phoneUrl} />
+          ) : (
+            <div style={{ padding: "16px 0", textAlign: "center", opacity: 0.7 }}>
+              {msg || t('正在准备二维码…')}
+            </div>
+          )}
+        </PanelSectionRow>
+        {phoneUrl ? (
+          <PanelSectionRow>
+            <div
+              style={{
+                fontSize: "0.78em",
+                opacity: 0.75,
+                wordBreak: "break-all",
+                textAlign: "center",
+              }}
+            >
+              {phoneUrl}
+            </div>
+          </PanelSectionRow>
+        ) : null}
+        {phoneMode && session && session.state === "waiting" ? (
+          <PanelSectionRow>
+            <div style={{ padding: "6px 0", fontSize: "0.88em", lineHeight: 1.5, color: "#9ecbff" }}>
+              {session.message || t("等待手机完成登录…（这个页面别关）")}
+            </div>
+          </PanelSectionRow>
+        ) : null}
+        {msg ? (
+          <PanelSectionRow>
+            <div style={{ padding: "6px 0", fontSize: "0.85em", opacity: 0.9 }}>{msg}</div>
+          </PanelSectionRow>
+        ) : null}
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            onClick={() => {
+              setShowCode(false);
+              setShowManual(true);
+              setMsg("");
+            }}
+            disabled={!!busy}
+          >
+            {t('二维码用不了？改用手动粘贴授权码')}
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            onClick={() => {
+              setShowCode(false);
+              setMsg("");
+            }}
+            disabled={!!busy}
+          >
+            {t('返回')}
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  } else if (showManual) {
+    body = (
+      <PanelSection title={t("手动粘贴授权码")}>
+        <PanelSectionRow>
+          <div style={{ padding: "4px 0 2px", lineHeight: 1.5 }}>
+            {t('1. 用手机或电脑打开下面的链接,登录你的 Epic 账号')}
+          </div>
         </PanelSectionRow>
         <PanelSectionRow>
           <div
@@ -289,13 +496,14 @@ export function LoginPanel({
           <ButtonItem
             layout="below"
             onClick={() => {
-              setShowCode(false);
+              setShowManual(false);
+              setShowCode(true);
               setMsg("");
               setCode("");
             }}
             disabled={!!busy}
           >
-            {t('返回')}
+            {t('返回扫码')}
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
@@ -304,33 +512,27 @@ export function LoginPanel({
     // The browser is open on top of the UI and the plugin is reading the code
     // off the result page, so this screen only has to wait.
     body = (
-      <PanelSection title={t("等待登录完成")}>
+      <PanelSection title={t("脚本登录中")}>
         <PanelSectionRow>
-          <div style={{ padding: "10px 0", lineHeight: 1.6 }}>
-            {t('在弹出的 Steam 窗口里登录 Epic 账号就行，')}<b>{t('不用复制，也不用回来粘贴')}</b>。
+          <div style={{ padding: "8px 0 4px", fontSize: "1.05em", fontWeight: 600, lineHeight: 1.5 }}>
+            {t('在打开的窗口里登录 Epic，插件会自己取授权码')}
           </div>
         </PanelSectionRow>
         <PanelSectionRow>
-          <div style={{ padding: "2px 0 4px", fontSize: "0.85em", lineHeight: 1.55, opacity: 0.75 }}>
-            {t('登录成功后浏览器会停在一个显示 JSON 的页面（')}<code>authorizationCode</code>
-            {t('），那就是成功了，插件会自己把码取走并完成登录。看到这个页面后按')} <b>B</b> {t('关掉浏览器即可。')}
-          </div>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <div style={{ padding: "2px 0", fontSize: "0.9em", opacity: 0.7 }}>
-            {t('正在等待登录…（约 20 秒后开始自动读取）')}
+          <div style={{ padding: "0 0 4px", fontSize: "0.82em", lineHeight: 1.5, opacity: 0.7 }}>
+            {t('登录成功后浏览器会停在 JSON 页面，按')} <b>B</b> {t('关掉即可。')}
           </div>
         </PanelSectionRow>
         {session.message ? (
           <PanelSectionRow>
-            <div style={{ padding: "4px 0", fontSize: "0.85em", lineHeight: 1.5, opacity: 0.85 }}>
+            <div style={{ padding: "4px 0", fontSize: "0.88em", lineHeight: 1.5, color: "#9ecbff" }}>
               {session.message}
             </div>
           </PanelSectionRow>
         ) : null}
         <PanelSectionRow>
           <div style={{ padding: "2px 0 6px", fontSize: "0.78em", lineHeight: 1.55, opacity: 0.55 }}>
-            {t('一直没反应的话，可以「重新打开登录页」；也可以改用手机扫码，或自己复制那段 JSON 后点「立即读取剪贴板」。')}
+            {t('没反应？可重新打开登录页，或改用手机扫码 / 手动粘贴授权码。')}
           </div>
         </PanelSectionRow>
         <PanelSectionRow>
@@ -348,7 +550,7 @@ export function LoginPanel({
             layout="below"
             onClick={async () => {
               await stopLogin();
-              setShowCode(true);
+              setShowManual(true);
             }}
             disabled={!!busy}
           >
@@ -374,7 +576,7 @@ export function LoginPanel({
           </div>
         </PanelSectionRow>
         <PanelSectionRow>
-          <ButtonItem layout="below" onClick={startLogin} disabled={!!busy}>
+          <ButtonItem layout="below" onClick={confirmBrowserLogin} disabled={!!busy}>
             <div
               style={{ display: "flex", alignItems: "center", gap: "6px", justifyContent: "center" }}
             >
@@ -396,7 +598,7 @@ export function LoginPanel({
         ) : null}
         <PanelSectionRow>
           <ButtonItem layout="below" onClick={() => setShowCode(true)} disabled={!!busy}>
-            {t('用手机扫码 / 手动粘贴授权码')}
+            {t('用手机扫码登录')}
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>

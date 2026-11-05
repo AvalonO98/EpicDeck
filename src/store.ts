@@ -488,9 +488,23 @@ export async function reloadDirs() {
   }
 }
 
-export async function signOut() {
-  const r = await logout();
-  if (!r.ok) return r;
+function clearBrowserData() {
+  // Clear Steam's browser data so Epic's session cookie (EPIC_SESSION_AP) is
+  // gone too. Otherwise the next "browser login" silently reuses the old
+  // account's session and never asks for a new one. `ClearAllBrowsingData`
+  // clears cookies/cache/localStorage for every site the Steam browser has
+  // visited, which is a light side effect (the storefront itself does not rely
+  // on cookies for sign-in). Best effort: if it throws or is absent, the user
+  // can still log in, just without the account chooser.
+  try {
+    const browser = (globalThis as any).SteamClient?.Browser;
+    browser?.ClearAllBrowsingData?.();
+  } catch (e) {
+    console.warn("EpicDeck: clear browser data failed", e);
+  }
+}
+
+function clearAuthState() {
   setPluginState({
     auth: null,
     games: [],
@@ -501,6 +515,25 @@ export async function signOut() {
     cachedAt: 0,
   });
   clearLibraryCache();
+}
+
+/** Sign out only: drop the stored credentials, keep the browser session so a
+ *  later login reuses the same Epic account without retyping the password. */
+export async function signOut() {
+  const r = await logout();
+  if (!r.ok) return r;
+  clearAuthState();
+  return r;
+}
+
+/** Switch account: sign out *and* clear the browser's Epic session cookie, so
+ *  the next browser login forces a fresh account/password prompt instead of
+ *  silently reusing the previous account. */
+export async function switchAccount() {
+  const r = await logout();
+  if (!r.ok) return r;
+  clearBrowserData();
+  clearAuthState();
   return r;
 }
 

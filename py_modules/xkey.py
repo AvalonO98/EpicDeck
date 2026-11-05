@@ -170,8 +170,8 @@ class ActivityWatch:
 
 
 
-def select_all_and_copy() -> bool:
-    """Send Ctrl+A then Ctrl+C to the focused window."""
+def _press_keys(keys, ctrl: bool = False) -> bool:
+    """Send a synthetic key combination to the focused window via XTest."""
     x11, dpy = _open_display()
     if not dpy:
         return False
@@ -196,22 +196,22 @@ def select_all_and_copy() -> bool:
         def keycode(name: str) -> int:
             return int(x11.XKeysymToKeycode(dpy, x11.XStringToKeysym(name.encode())))
 
-        ctrl = keycode("Control_L")
-        if not ctrl:
+        ctrl = keycode("Control_L") if ctrl else 0
+        if ctrl and not ctrl:
             return False
 
-        for name in ("a", "c"):
+        for name in keys:
             key = keycode(name)
             if not key:
                 return False
-            xtst.XTestFakeKeyEvent(dpy, ctrl, 1, 0)
+            if ctrl:
+                xtst.XTestFakeKeyEvent(dpy, ctrl, 1, 0)
             xtst.XTestFakeKeyEvent(dpy, key, 1, 0)
             x11.XFlush(dpy)
-            # Chromium handles key-down synchronously, but the selection has to
-            # exist before Ctrl+C is delivered, hence the short hold.
             time.sleep(0.08)
             xtst.XTestFakeKeyEvent(dpy, key, 0, 0)
-            xtst.XTestFakeKeyEvent(dpy, ctrl, 0, 0)
+            if ctrl:
+                xtst.XTestFakeKeyEvent(dpy, ctrl, 0, 0)
             x11.XFlush(dpy)
             time.sleep(0.4)
         return True
@@ -219,3 +219,18 @@ def select_all_and_copy() -> bool:
         return False
     finally:
         x11.XCloseDisplay(dpy)
+
+
+def select_all_and_copy() -> bool:
+    """Send Ctrl+A then Ctrl+C to the focused window."""
+    return _press_keys(("a", "c"), ctrl=True)
+
+
+def press_esc() -> bool:
+    """Press Escape — Steam's browser closes on it in Game Mode (like B).
+
+    Used after a successful login so the user is not left staring at Epic's
+    JSON redirect page: the browser dismisses itself and the plugin's UI (which
+    already flipped to "signed in") is what they see next.
+    """
+    return _press_keys(("Escape",))

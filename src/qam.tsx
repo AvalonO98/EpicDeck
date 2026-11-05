@@ -30,6 +30,7 @@ import {
   refreshLibrary,
   reloadDirs,
   signOut,
+  switchAccount,
   usePluginState,
 } from "./store";
 import { openFullScreen } from "./fullscreen";
@@ -185,7 +186,7 @@ function FirstRunView({
   );
 }
 
-function QuickPanel({ onLogout }: { onLogout: () => void }) {
+function QuickPanel({ onLogout, onSwitchAccount }: { onLogout: () => void; onSwitchAccount: () => void }) {
   const { auth, games, progress, error, refreshing, cachedAt } = usePluginState();
   const [booting, setBooting] = useState<boolean>(false);
   const topRef = useRef<HTMLDivElement>(null);
@@ -276,9 +277,14 @@ function QuickPanel({ onLogout }: { onLogout: () => void }) {
                 {cachedAt ? tf(" · {0}更新", fmtAgo(cachedAt)) : ""}
               </div>
             </div>
-            <DialogButton onClick={onLogout} style={{ padding: "4px 12px", fontSize: "0.8em", minWidth: 0 }}>
-              {t('登出')}
-            </DialogButton>
+            <div style={{ display: "flex", gap: "6px", flexShrink: 0 }}>
+              <DialogButton onClick={onSwitchAccount} style={{ padding: "4px 10px", fontSize: "0.8em", minWidth: 0 }}>
+                {t('切换')}
+              </DialogButton>
+              <DialogButton onClick={onLogout} style={{ padding: "4px 10px", fontSize: "0.8em", minWidth: 0 }}>
+                {t('登出')}
+              </DialogButton>
+            </div>
           </div>
         </PanelSectionRow>
         <PanelSectionRow>
@@ -377,6 +383,11 @@ export function QamPanel() {
     if (!r.ok) toaster.toast({ title: t("登出失败"), body: r.error ?? "" });
   };
 
+  const switchAccountAction = async () => {
+    const r = await switchAccount();
+    if (!r.ok) toaster.toast({ title: t("切换失败"), body: r.error ?? "" });
+  };
+
   if (booting && !booted && games.length === 0) {
     return (
       <PanelSection>
@@ -407,5 +418,5 @@ export function QamPanel() {
     return <LoginPanel onLoggedIn={() => void onSignedIn()} />;
   }
 
-  return <QuickPanel onLogout={logout} />;
+  return <QuickPanel onLogout={logout} onSwitchAccount={switchAccountAction} />;
 }

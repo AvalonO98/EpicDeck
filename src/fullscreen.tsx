@@ -97,6 +97,7 @@ import {
   DIR_RIGHT,
   focusOwned,
   moveFocus,
+  moveFocusRowCol,
   rememberFocus,
   settleFocus,
 } from "./geomnav";
@@ -110,6 +111,7 @@ import {
   reloadDirs,
   refreshLibrary,
   signOut,
+  switchAccount,
   usePluginState,
 } from "./store";
 import { STEAM_BOTTOM_INSET, STEAM_TOP_INSET, useViewport, type Viewport } from "./viewport";
@@ -1550,6 +1552,11 @@ function DataLocations() {
 
 function SettingsTab() {
   const { auth, games, progress } = usePluginState();
+  // The plugin JS runs in Decky's 1×1 SharedJSContext, so the module-level
+  // `document` belongs to that hidden window and never contains `.ed-surface`.
+  // Everything below must read the real Big Picture document off a rendered
+  // node's `ownerDocument` (HANDOFF 5.10 / 886).
+  const rootRef = useRef<HTMLDivElement>(null);
   const [settings, setSettings] = useState<Record<string, any>>({});
   const [dirs, setDirs] = useState<{ path: string; label: string; free: number }[]>([]);
   const [protons, setProtons] = useState<{ data: string; label: string }[]>([]);
@@ -1567,13 +1574,69 @@ function SettingsTab() {
   // FsUI and consumed (cleared) here so a later manual visit starts at the top.
   useEffect(() => {
     const target = readFsUI().settingsSection;
-    if (!target) return;
-    writeFsUI({ settingsSection: "" });
-    const timer = window.setTimeout(() => {
-      const el = document.querySelector(`[data-ed-section="${target}"]`) as HTMLElement | null;
-      el?.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 120);
-    return () => window.clearTimeout(timer);
+    if (target) {
+      writeFsUI({ settingsSection: "" });
+      const timer = window.setTimeout(() => {
+        const root = rootRef.current;
+        if (!root || !root.isConnected) return;
+        const el = root.ownerDocument.querySelector(`[data-ed-section="${target}"]`) as HTMLElement | null;
+        if (!el) return;
+        // scrollIntoView does nothing on Steam's ScrollPanel; walk up to the real
+        // overflow-y container and nudge its scrollTop to reveal the section.
+        const doc = root.ownerDocument;
+        const view = doc.defaultView;
+        let container: HTMLElement | null = el.parentElement;
+        while (container && container !== doc.body) {
+          const style = view?.getComputedStyle(container);
+          if (/(auto|scroll)/.test(style?.overflowY || "") && container.scrollHeight > container.clientHeight + 4) {
+            const cTop = container.getBoundingClientRect().top;
+            container.scrollTop += el.getBoundingClientRect().top - cTop;
+            break;
+          }
+          container = container.parentElement;
+        }
+      }, 120);
+      return () => window.clearTimeout(timer);
+    }
+    // Normal open: force the scroll back to the top AND focus the first account
+    // action. Steam's ScrollPanel keeps its scrollTop across tab switches, so
+    // re-opening Settings can land mid-page — the account row (切换账号/登出)
+    // sits at negative y, Steam focuses the first *visible* control
+    // ("补齐封面与图标") and keeps it in view, which defeats any scrollTop=0
+    // reset done alone (focus re-scrolls back to it). So scroll to top *and*
+    // focus the top control together, so "keep focused visible" agrees with
+    // "at the top". scrollIntoView does nothing on Steam's panel; scrollTop=0
+    // is the one that works — and it must be set on the *real* scroll container
+    // (an ancestor with overflow-y:auto), found by walking up from the account
+    // row exactly like qam.tsx does. Searching the .ed-fade subtree for the
+    // first "overflow:auto" node is unreliable: the true scroller sits *outside*
+    // the ScrollPanelGroup, and a Panel Focusable in between reports
+    // scrollHeight>clientHeight with overflow:visible whose scrollTop is ignored.
+    const settle = () => {
+      const root = rootRef.current;
+      if (!root || !root.isConnected) return;
+      const doc = root.ownerDocument;
+      const surface = (root.closest(".ed-surface") as HTMLElement | null) || root;
+      const first = surface.querySelector<HTMLElement>(".ed-group .ed-action, .ed-action");
+      if (!first) return;
+      const view = doc.defaultView;
+      // Find the real vertical scroller by walking up from the account row.
+      let container: HTMLElement | null = first.parentElement;
+      while (container && container !== doc.body) {
+        const style = view?.getComputedStyle(container);
+        const scrollable = /(auto|scroll)/.test(style?.overflowY || "");
+        if (scrollable && container.scrollHeight > container.clientHeight + 4) {
+          container.scrollTop = 0;
+          break;
+        }
+        container = container.parentElement;
+      }
+      focusOwned(first);
+      claimFocusRing(first, surface);
+    };
+    const timers: number[] = [];
+    [40, 220, 420, 900].forEach((ms) => timers.push(window.setTimeout(settle, ms)));
+    return () => timers.forEach((t) => window.clearTimeout(t));
   }, []);
 
   // Version check rides along with the settings load: cached for a day on the
@@ -1672,6 +1735,7 @@ function SettingsTab() {
   }, [games, progress]);
 
   return (
+    <div ref={rootRef} style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
     <Scroller className="ed-fade" contentStyle={{ paddingRight: "6px", paddingBottom: "1.6em" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: "18px", maxWidth: "1040px", paddingBottom: "1.8em" }}>
         {/* account */}
@@ -1707,8 +1771,18 @@ function SettingsTab() {
               <ActionButton
                 style={{ padding: "10px 18px", fontSize: "0.9em" }}
                 onClick={async () => {
+                  const r = await switchAccount();
+                  if (r.ok) done(t("已切换账号"), t("下次登录会要求输入新账号"));
+                  else done(t("切换失败"), r.error ?? "");
+                }}
+              >
+                {t('切换账号')}
+              </ActionButton>
+              <ActionButton
+                style={{ padding: "10px 18px", fontSize: "0.9em" }}
+                onClick={async () => {
                   const r = await signOut();
-                  if (r.ok) done(t("已登出"), t("可以重新登录其他账号"));
+                  if (r.ok) done(t("已登出"), t("下次登录会沿用当前账号"));
                   else done(t("登出失败"), r.error ?? "");
                 }}
               >
@@ -1747,12 +1821,14 @@ function SettingsTab() {
                 checked={settings.auto_cover !== false}
                 onChange={(v) => update("auto_cover", v)}
               />
+              {/* 功能尚未做完（HANDOFF 7.13 侧边栏菜单入口），先隐藏。
               <ToggleField
                 label={t("在 Steam 菜单显示 EpicDeck")}
                 description={t("按 STEAM 键后，「库」下方多一个 EpicDeck 游戏库入口；下次打开菜单生效")}
                 checked={settings.show_menu_entry !== false}
                 onChange={(v) => update("show_menu_entry", v)}
               />
+              */}
             </div>
             <NavRow level="steam-actions" style={{ gap: "10px", marginTop: "12px", flexWrap: "wrap" }}>
               <ActionButton
@@ -2111,6 +2187,7 @@ function SettingsTab() {
         </div>
       </div>
     </Scroller>
+    </div>
   );
 }
 
@@ -2417,6 +2494,8 @@ export function FullScreenPage() {
     const horizontal = button === DIR_LEFT || button === DIR_RIGHT;
     let moved = false;
     if (grid && horizontal) {
+      // Grid horizontal movement keeps the rigid geometric model + page flips
+      // on the edges.
       moved = moveFocus(button, surfaceRef.current, grid);
       if (!moved) {
         const bumper = gridBumperRef.current;
@@ -2438,8 +2517,15 @@ export function FullScreenPage() {
           }, 0), 0);
         }
       }
-    } else {
+    } else if (grid) {
+      // Grid vertical movement stays geometric but is allowed to cross levels
+      // (up → toolbar), the way it always did.
       moved = moveFocus(button, surfaceRef.current);
+    } else {
+      // Flowing layouts (settings / detail / downloads / header / tabs) use the
+      // row/column model: 上/下 switches rows, 左/右 moves between the buttons
+      // of the current row (2026-11-06 用户要求).
+      moved = moveFocusRowCol(button, surfaceRef.current);
     }
     // Diagnostics: a press that never reaches this handler, and a press whose
     // moveFocus fails, look identical from the outside (Steam moves the cursor

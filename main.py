@@ -48,6 +48,7 @@ from py_modules.steam import (
     restart_steam,
 )
 from py_modules import artwork, proton
+from py_modules import localauth
 from py_modules.legendary_installer import (
     InstallerError,
     default_install_dir,
@@ -417,27 +418,49 @@ class Plugin:
                 "error": "没有识别到授权码。请粘贴 authorizationCode 的值,或直接粘贴整段 JSON/网址。",
             }
 
+        # Native exchange first. `legendary auth` checks api.legendary.gl for
+        # updates before it even looks at the code, and that host is
+        # unreachable on many networks — the resulting ReadTimeout aborts the
+        # whole login with an error that has nothing to do with the code
+        # (field report 2026-11-06). Only fall back to the CLI when the native
+        # path failed for a reason that is *not* Epic rejecting the code.
         try:
             await asyncio.wait_for(
-                self.legendary.auth_with_code(code), timeout=120.0
+                self.legendary.auth_with_code_native(code), timeout=60.0
             )
         except asyncio.TimeoutError:
             return {"ok": False, "error": "登录超时,请检查网络后重试"}
         except LegendaryError as e:
-            msg = str(e)
-            low = msg.lower()
-            if "not_found" in low:
-                return {
-                    "ok": False,
-                    "error": "授权码已失效。它有效期很短且只能用一次,请重新打开登录页并立即粘贴。",
-                }
-            if "not_for_your_client" in low:
-                return {
-                    "ok": False,
-                    "error": "授权码不属于 EpicDeck 的客户端。请用插件里给出的那个链接登录。",
-                }
-            decky.logger.error("login_with_code: %s", msg)
-            return {"ok": False, "error": msg}
+            native_error = str(e)
+            if "授权码" in native_error or "客户端凭据" in native_error:
+                # Epic looked at the code and said no; retrying via the CLI
+                # would only produce a slower, less specific failure.
+                decky.logger.warning("native exchange rejected the code: %s", native_error)
+                return {"ok": False, "error": native_error}
+            decky.logger.warning(
+                "native login failed (%s), falling back to legendary auth", native_error
+            )
+            try:
+                await asyncio.wait_for(
+                    self.legendary.auth_with_code(code), timeout=120.0
+                )
+            except asyncio.TimeoutError:
+                return {"ok": False, "error": "登录超时,请检查网络后重试"}
+            except LegendaryError as e2:
+                msg = str(e2)
+                low = msg.lower()
+                if "not_found" in low:
+                    return {
+                        "ok": False,
+                        "error": "授权码已失效。它有效期很短且只能用一次,请重新打开登录页并立即粘贴。",
+                    }
+                if "not_for_your_client" in low:
+                    return {
+                        "ok": False,
+                        "error": "授权码不属于 EpicDeck 的客户端。请用插件里给出的那个链接登录。",
+                    }
+                decky.logger.error("login_with_code: %s / native: %s", msg, native_error)
+                return {"ok": False, "error": native_error or msg}
 
         status = await self.legendary.auth_status()
         if not status.get("logged_in"):
@@ -455,6 +478,102 @@ class Plugin:
             "display_name": status.get("display_name", ""),
             "account_id": _hash_id(str(status.get("account_id") or "")),
         }
+
+    # -- phone-assisted login (LAN callback server) ------------------------
+    async def start_phone_login(self):
+        """Serve a page on the Deck's LAN IP that collects the code on the phone.
+
+        Epic rejects a custom `redirectUrl`, so a phone cannot hand the code
+        back automatically. What it *can* do is keep the whole flow inside one
+        browser: the phone opens this LAN page (via QR), signs in to Epic there,
+        pastes the code into the same page, and the server posts it straight
+        back here — the 32-character code never has to travel from phone to Deck.
+        """
+        if self.legendary._resolve() is None:
+            return {"ok": False, "error": "Legendary 未安装,请先点「一键安装 Legendary」"}
+
+        try:
+            status = await asyncio.wait_for(self.legendary.auth_status(), timeout=20.0)
+        except Exception:
+            status = {}
+        if status.get("logged_in"):
+            self._login_state = {
+                "state": "ok",
+                "message": "",
+                "display_name": status.get("display_name", ""),
+                "auto_copied": False,
+            }
+            return {"ok": True, "already_logged_in": True, "url": ""}
+
+        await self._stop_login_session()
+        self._stop_phone_server()
+
+        server = localauth.LocalAuthServer(self._login_page_url())
+        try:
+            url = await asyncio.get_running_loop().run_in_executor(
+                None, server.start
+            )
+        except Exception as e:
+            decky.logger.error("start_phone_login: %s", e)
+            return {"ok": False, "error": str(e)}
+
+        self._phone_server = server
+        self._login_state = {
+            "state": "waiting",
+            "message": "",
+            "display_name": "",
+            "auto_copied": False,
+        }
+        self._login_task = asyncio.create_task(self._run_phone_login_session())
+        decky.logger.info("phone login server started: %s", url)
+        return {"ok": True, "url": url}
+
+    def _stop_phone_server(self):
+        server = getattr(self, "_phone_server", None)
+        self._phone_server = None
+        if server is not None:
+            server.stop()
+
+    async def _run_phone_login_session(self):
+        """Await the code the phone submits, then redeem it exactly like the
+        browser path does."""
+        server = getattr(self, "_phone_server", None)
+        if server is None:
+            return
+        try:
+            code = await localauth.wait_for_code(server, timeout=600.0)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._stop_phone_server()
+        if not code:
+            if self._login_state.get("state") not in ("ok", "error"):
+                self._login_state = {
+                    "state": "timeout",
+                    "message": "等待手机登录超时，请重试。",
+                    "display_name": "",
+                    "auto_copied": False,
+                }
+            return
+
+        self._login_state["state"] = "finishing"
+        self._login_state["message"] = "已收到授权码，正在登录…"
+        decky.logger.info("phone login code received")
+        result = await self.login_with_code(code)
+        if result.get("ok"):
+            self._login_state = {
+                "state": "ok",
+                "message": "",
+                "display_name": result.get("display_name", ""),
+                "auto_copied": False,
+            }
+        else:
+            self._login_state = {
+                "state": "error",
+                "message": result.get("error", "登录失败"),
+                "display_name": "",
+                "auto_copied": False,
+            }
 
     async def logout(self):
         try:
@@ -593,6 +712,7 @@ class Plugin:
             return ""
 
     async def _stop_login_session(self):
+        self._stop_phone_server()
         task = getattr(self, "_login_task", None)
         self._login_task = None
         if task is not None and not task.done():
@@ -744,6 +864,9 @@ class Plugin:
                     continue
 
                 self._login_state["state"] = "finishing"
+                # Visible in the panel: the exchange can take a few seconds and
+                # a silent "waiting" state looks like a hang.
+                self._login_state["message"] = "已读取授权码，正在登录…"
                 decky.logger.info("authorization code captured")
                 result = await self.login_with_code(code)
                 self._login_baseline = ""
@@ -754,6 +877,13 @@ class Plugin:
                         "display_name": result.get("display_name", ""),
                         "auto_copied": self._login_state.get("auto_copied", False),
                     }
+                    decky.logger.info("browser login succeeded")
+                    # NOTE: we deliberately do NOT auto-close the browser here.
+                    # The user presses B (or the panel offers it) to dismiss
+                    # Epic's JSON redirect page. Sending an Escape key via XTest
+                    # was tried (0.9.2-beta.5) and — on at least one Deck —
+                    # left Steam's gamepad navigation dead afterwards, so the
+                    # synthetic key is not worth the risk. See HANDOFF 7.22b.
                 else:
                     self._login_state = {
                         "state": "error",
@@ -761,6 +891,7 @@ class Plugin:
                         "display_name": "",
                         "auto_copied": self._login_state.get("auto_copied", False),
                     }
+                    decky.logger.warning("browser login failed: %s", result.get("error", ""))
                 return
 
             self._login_state = {

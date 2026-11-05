@@ -12,13 +12,12 @@
 import { definePlugin, routerHook } from "@decky/api";
 import { ScrollPanel, ScrollPanelGroup, staticClasses } from "@decky/ui";
 import { FaGamepad } from "react-icons/fa";
-import { getSettings } from "./api";
 import { FocusStyles } from "./components";
 import { FullScreenPage, openFullScreen } from "./fullscreen";
 import { QamPanel } from "./qam";
 import { LIBRARY_ROUTE } from "./routes";
 import { moveFocus } from "./geomnav";
-import { installSteamMenuEntry, setSteamMenuEntryEnabled } from "./steammenu";
+// import { installSteamMenuEntry, setSteamMenuEntryEnabled } from "./steammenu";
 import { t, useLangVersion } from "./i18n";
 import { bootstrapLang } from "./langboot";
 
@@ -26,7 +25,7 @@ import { bootstrapLang } from "./langboot";
 // read asynchronously after the plugin loads.
 function QamTitle() {
   useLangVersion();
-  return <div className={staticClasses.Title}>{t("EpicDeck · Epic 游戏库")}</div>;
+  return <div className={staticClasses.Title}>{t("EpicDeck")}</div>;
 }
 
 export default definePlugin(() => {
@@ -47,13 +46,15 @@ export default definePlugin(() => {
 
   // "EpicDeck 游戏库" in the STEAM button menu. Patched lazily: the menu only
   // mounts when it is opened, so the installer keeps re-applying itself.
-  const uninstallMenuEntry = installSteamMenuEntry();
-
-  // Honour the user's choice without blocking startup — the menu reads the flag
-  // on every render, so a late answer simply applies to the next menu open.
-  void getSettings()
-    .then((settings) => setSteamMenuEntryEnabled(settings?.show_menu_entry !== false))
-    .catch(() => {});
+  // DISABLED: the sidebar menu entry is not finished yet (patch installs but the
+  // item never shows — HANDOFF 7.13), so do not inject it at all for now.
+  // const uninstallMenuEntry = installSteamMenuEntry();
+  //
+  // // Honour the user's choice without blocking startup — the menu reads the flag
+  // // on every render, so a late answer simply applies to the next menu open.
+  // void getSettings()
+  //   .then((settings) => setSteamMenuEntryEnabled(settings?.show_menu_entry !== false))
+  //   .catch(() => {});
 
   // Reachable from the Steam devtools console and from CDP: lets a developer
   // jump to the page without hunting for the QAM entry. The two Steam scroll
@@ -79,7 +80,7 @@ export default definePlugin(() => {
     icon: <FaGamepad />,
     onDismount() {
       routerHook.removeRoute(LIBRARY_ROUTE);
-      uninstallMenuEntry();
+      // uninstallMenuEntry();
     },
   };
 });
