@@ -20,10 +20,10 @@
 // L1/R1 (page flip vs tab switch) easy to reason about.
 
 /** Steam's GamepadButton values for the four directions. */
-const DIR_LEFT = 11;
-const DIR_UP = 9;
-const DIR_RIGHT = 12;
-const DIR_DOWN = 10;
+export const DIR_LEFT = 11;
+export const DIR_UP = 9;
+export const DIR_RIGHT = 12;
+export const DIR_DOWN = 10;
 
 const CANDIDATE_SELECTOR =
   '[tabindex]:not([tabindex="-1"]),button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),a[href]';
@@ -62,8 +62,106 @@ const GPFOCUS_RE = /(^|\s)gpfocus(\s|$)/;
  */
 let remembered: HTMLElement | null = null;
 
+/**
+ * 防「Steam 抢焦点」的锚。
+ *
+ * Steam 自己的导航层也会处理**同一次方向键**(它不是在 DOM 上注册的监听,
+ * `preventDefault`/`stopPropagation` 拦不住),它按 DOM 顺序把焦点挪一格:
+ * 下一个兄弟节点 = 右边(所以「下」看起来成了「右下」),上一个兄弟 = 左边
+ * (所以「上」成了「左上」)。随后那次 `focusin` 会把我们的锚点改成隔壁元素,
+ * 下一次按键就从隔壁开始算 —— 每按一次斜一格,上下对称、全界面一致。
+ *
+ * **不要用时间窗口判断**(旧实现是 300ms):用户按键间隔常有 400~600ms,
+ * Steam 的插队一旦落在窗口外就被当成"真实焦点变化"接受了,于是偏移照旧
+ * (2026-11-05 22:1x 用户复现,日志里「按『下』→ 焦点落在『已安装』」即同一行右邻)。
+ *
+ * 改成**元素标记 + 一次消费**:我们自己移动后记下 `ownedTarget`;接下来第一个
+ * 不是它的 `focusin` 判定为 Steam 插队,拉回并消费掉标记;再往后的焦点变化是
+ * 真实的(程序性聚焦、切标签),正常接受。
+ */
+let ownedTarget: HTMLElement | null = null;
+/** 本次移动是否已经吸收过一次 Steam 插队(每次移动只吸收一次)。 */
+let ownedSettled = false;
+
 export function rememberFocus(el: HTMLElement | null | undefined) {
   remembered = el ?? null;
+  ownedTarget = null;
+  ownedSettled = false;
+}
+
+/**
+ * Move focus as an action of ours: anchor first, then focus, so the `focusin`
+ * it triggers is recognised as ours instead of being treated as a stray move.
+ */
+export function focusOwned(el: HTMLElement) {
+  remembered = el;
+  ownedTarget = el;
+  ownedSettled = false;
+  try {
+    el.focus();
+  } catch {
+    /* best effort — the caller re-checks the anchor */
+  }
+}
+
+/**
+ * Decide what focus should be, given a `focusin` that just happened.
+ *
+ * Returns the element focus should really be on. When Steam moved focus behind
+ * our back right after our own move, the anchor is kept and DOM focus is put
+ * back on it.
+ */
+export function settleFocus(target: HTMLElement, root: HTMLElement): HTMLElement {
+  // 1) 正是我们自己移到的元素 → 确认。
+  if (ownedTarget && target === ownedTarget) {
+    remembered = target;
+    return target;
+  }
+  // 2) 我们刚移过、还没吸收过插队 → 这是 Steam 对同一次按键的响应,拉回。
+  if (ownedTarget && !ownedSettled && root.contains(ownedTarget)) {
+    ownedSettled = true;
+    try {
+      ownedTarget.focus();
+      remembered = ownedTarget;
+      return ownedTarget;
+    } catch {
+      /* 拉不回去就接受,绝不把用户卡在原点 */
+      ownedTarget = null;
+      remembered = target;
+      return target;
+    }
+  }
+  // 3) 真实的外来焦点(程序性聚焦、切标签、点击)→ 接受并解除锚。
+  ownedTarget = null;
+  remembered = target;
+  return target;
+}
+
+/**
+ * 移动后的定时复检。
+ *
+ * 有些路径上 Steam 只把 DOM focus 挪走、并不触发 `focusin`(或触发得比我们的
+ * 处理还早),`settleFocus` 就没有机会介入。移动后连续几帧核对一次,发现被
+ * 挪走就按回来 —— 这是我们唯一能兜住那条路径的地方。
+ */
+export function reverifyFocus(expected: HTMLElement, root: HTMLElement, frames = 2) {
+  if (!root.contains(expected)) return;
+  const doc = root.ownerDocument;
+  if (doc.activeElement !== expected) {
+    try {
+      expected.focus();
+      remembered = expected;
+    } catch {
+      /* 聚焦不了就算了,下一次按键会重新求锚 */
+    }
+  }
+  if (frames > 0) {
+    try {
+      doc.defaultView?.requestAnimationFrame(() => reverifyFocus(expected, root, frames - 1));
+    } catch {
+      /* no rAF: the single sync check above is all we get */
+    }
+  }
 }
 
 function usable(el: HTMLElement | null | undefined, root: HTMLElement): el is HTMLElement {
@@ -119,10 +217,80 @@ export function currentFocused(root: HTMLElement): HTMLElement | null {
 }
 
 /**
+ * The horizontally-flowing container an element belongs to, if any.
+ *
+ * Used for edge wrapping: pressing LEFT on the left-most chip should land on the
+ * right-most one *of that row* — not on some element in another row. A grid is
+ * deliberately excluded (`null`): wrapping columns there would fight the row
+ * model and make vertical movement unpredictable.
+ */
+function rowContainer(el: HTMLElement): HTMLElement | null {
+  const view = el.ownerDocument?.defaultView;
+  let node = el.parentElement;
+  let depth = 0;
+  while (node && node !== el.ownerDocument.body && depth < 8) {
+    const style = view?.getComputedStyle(node);
+    const display = style?.display || "";
+    if (display === "grid" || display === "inline-grid") return null;
+    if (display === "flex" || display === "inline-flex") {
+      const dir = style?.flexDirection || "row";
+      if (dir.startsWith("row")) return node;
+      // A column flex is not a "row"; keep walking — its parent may still be one.
+    }
+    node = node.parentElement;
+    depth += 1;
+  }
+  return null;
+}
+
+/**
+ * Wrap to the other end of the current row.
+ *
+ * `toLeft` means "the user pressed LEFT, so jump to the right-most sibling".
+ * Elements sharing a row are picked by vertical-centre proximity, which keeps
+ * this correct for `flex-wrap: wrap` rows (the detail page's action bar) where a
+ * container holds several visual rows.
+ */
+function wrapRow(from: HTMLElement, root: HTMLElement, toLeft: boolean): HTMLElement | null {
+  const row = rowContainer(from);
+  if (!row || !root.contains(row)) return null;
+  const doc = root.ownerDocument;
+  const fr = from.getBoundingClientRect();
+  const fy = fr.top + fr.height / 2;
+
+  let items: HTMLElement[] = [];
+  try {
+    items = Array.from(row.querySelectorAll<HTMLElement>(CANDIDATE_SELECTOR));
+  } catch {
+    return null;
+  }
+  const sameRow = items.filter((el) => {
+    if (el === from || el.contains(from) || from.contains(el)) return false;
+    if (!isLeafFocusable(el) || !isVisible(el, doc)) return false;
+    const r = el.getBoundingClientRect();
+    const cy = r.top + r.height / 2;
+    return Math.abs(cy - fy) <= Math.max(10, Math.min(fr.height, r.height) * 0.6);
+  });
+  if (sameRow.length === 0) return null;
+  sameRow.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+  return toLeft ? sameRow[sameRow.length - 1] : sameRow[0];
+}
+
+/**
  * Move focus one step in `button`'s direction inside `scope`.
  * Returns true when focus actually moved (caller should swallow the event).
+ *
+ * `limitTo` restricts the *candidates* to one subtree (focus/cleanup still use
+ * `scope`). Callers pass the game grid when the user is inside it: without it,
+ * pressing LEFT on the first column fell through to the relaxed round and landed
+ * on a toolbar chip diagonally above-left (2026-11-05 22:4x 用户反馈「网格里移动
+ * 会跑到导航栏」). The grid then handles its own horizontal edges by flipping pages.
  */
-export function moveFocus(button: number, scope?: HTMLElement | null): boolean {
+export function moveFocus(
+  button: number,
+  scope?: HTMLElement | null,
+  limitTo?: HTMLElement | null
+): boolean {
   if (button !== DIR_LEFT && button !== DIR_RIGHT && button !== DIR_UP && button !== DIR_DOWN) {
     return false;
   }
@@ -148,8 +316,11 @@ export function moveFocus(button: number, scope?: HTMLElement | null): boolean {
   const horizontal = button === DIR_LEFT || button === DIR_RIGHT;
 
   let all: HTMLElement[] = [];
+  // Candidates come from `area` (the grid when the caller restricts it), but
+  // visibility/anchoring still resolve against `root`.
+  const area = limitTo && root.contains(limitTo) ? limitTo : root;
   try {
-    all = Array.from(root.querySelectorAll<HTMLElement>(CANDIDATE_SELECTOR));
+    all = Array.from(area.querySelectorAll<HTMLElement>(CANDIDATE_SELECTOR));
   } catch {
     return false;
   }
@@ -208,15 +379,38 @@ export function moveFocus(button: number, scope?: HTMLElement | null): boolean {
   };
 
   best = collect(true) || collect(false);
+  // 横向走到行首/行尾时循环到同一行的另一端(用户 2026-11-05 要求:
+  // 顶栏最左再左滑 → 落到最右的「刷新」,反之亦然)。只对「行」生效,
+  // 网格被 rowContainer 主动排除,免得打乱行列关系。
+  if (!best && horizontal) {
+    best = wrapRow(active, root, button === DIR_LEFT);
+  }
   if (!best) return false;
   try {
     best.scrollIntoView({ block: "nearest", inline: "nearest" });
-    best.focus();
   } catch {
+    /* scrolling is cosmetic; never skip the move because of it */
+  }
+  focusOwned(best);
+  // Steam 可能在同一拍里把焦点抢到隔壁。这里**不能**直接 return false 把按键
+  // 交还给它 —— 那正是「按下去却横移一格」的放行口。先按回来,实在按不住
+  // (元素正在卸载)才放行,避免把用户卡死。
+  if (doc.activeElement !== best) {
+    try {
+      best.focus();
+      remembered = best;
+    } catch {
+      /* fall through to the give-up branch below */
+    }
+  }
+  if (doc.activeElement !== best) {
+    remembered = null;
+    ownedTarget = null;
     return false;
   }
   claimFocusRing(best, root);
-  remembered = best;
+  // 再盯两帧:有些路径上 Steam 不触发 focusin,只把 DOM focus 挪走。
+  reverifyFocus(best, root);
   return true;
 }
 

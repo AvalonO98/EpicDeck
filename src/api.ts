@@ -6,6 +6,7 @@
 // a wrong signature used to be a silent `undefined` on one surface only.
 
 import { callable } from "@decky/api";
+import { t, tf } from "./i18n";
 
 export interface AuthStatus {
   logged_in: boolean;
@@ -47,11 +48,17 @@ export interface InstallProgress {
     | "prereq"
     | "done"
     | "error"
-    | "cancelled";
+    | "cancelled"
+    | "paused";
   percent: number;
   message: string;
   speed: string;
   eta: string;
+  // Bytes already pulled / total to pull. Present only once Legendary has
+  // reported them (it prints "Downloaded: x MiB" and "Download size: y MiB"
+  // on their own lines), so both may be undefined early in a download.
+  downloaded_bytes?: number;
+  total_bytes?: number;
 }
 
 export interface EnvironmentInfo {
@@ -128,7 +135,26 @@ export const installGame = callable<
   [app_name: string, install_dir: string],
   { ok: boolean; error?: string }
 >("install");
-export const cancelInstall = callable<[app_name: string], { ok: boolean }>("cancel_install");
+export const cancelInstall = callable<[app_name: string, del?: boolean], { ok: boolean }>("cancel_install");
+export const pauseInstall = callable<[app_name: string], { ok: boolean }>("pause_install");
+export const resumeInstall = callable<[app_name: string, install_dir?: string], { ok: boolean; error?: string }>("resume_install");
+export const clearDownloadCache = callable<[], { ok: boolean; removed?: number; error?: string }>(
+  "clear_download_cache"
+);
+
+export interface LsfgState {
+  ok: boolean;
+  available: boolean;
+  default: boolean;
+  enabled: boolean;
+  own: boolean;
+}
+
+export const getLsfg = callable<[app_name?: string], LsfgState>("get_lsfg");
+export const setLsfg = callable<
+  [app_name: string, enabled: boolean],
+  { ok: boolean; enabled?: boolean; warning?: string }
+>("set_lsfg");
 export const launchGame = callable<
   [app_name: string, direct?: boolean],
   {
@@ -157,7 +183,11 @@ export const syncInstalledToSteam = callable<
 export const refreshSteam = callable<[], { ok: boolean; note?: string; error?: string }>("refresh_steam");
 
 export const getSettings = callable<[], Record<string, any>>("get_settings");
-export const setSetting = callable<[key: string, value: any], { ok: boolean }>("set_setting");
+// Which language the UI should use: Steam's own setting unless overridden.
+export const getUILanguage = callable<
+  [],
+  { ok: boolean; lang: "zh" | "en"; steam?: string; source?: string }
+>("get_ui_language");export const setSetting = callable<[key: string, value: any], { ok: boolean }>("set_setting");
 export const getInstallDirOptions = callable<
   [],
   { options: InstallDirOption[]; current: string }
@@ -192,6 +222,65 @@ export const exportLogs = callable<[], { ok: boolean; logs?: string; path?: stri
   "export_logs"
 );
 
+// -- update check + ProtonDB (HANDOFF 7.13.5 / 7.13.2) -------------------
+
+export interface UpdateState {
+  ok: boolean;
+  current: string;
+  latest?: string;
+  has_update?: boolean;
+  url?: string;
+  zip_url?: string;
+  cached?: boolean;
+  checked_at?: number;
+  reason?: string;
+}
+
+// Silent by design: `ok: false` means "could not check", which the settings row
+// renders as nothing rather than an error.
+export const checkUpdate = callable<[force?: boolean], UpdateState>("check_update");
+
+export interface ProtonDbTier {
+  ok: boolean;
+  tier?: string;
+  label?: string;
+  total?: number;
+  appid?: number;
+  matched?: string;
+  confidence?: number;
+  report_confidence?: string;
+  cached?: boolean;
+  title?: string;
+  reason?: string;
+}
+
+export const getProtonDb = callable<[app_name: string, force?: boolean], ProtonDbTier>(
+  "get_protondb"
+);
+export const getProtonDbCached = callable<
+  [app_names?: string[]],
+  Record<string, { tier: string; label: string; total: number; appid: number }>
+>("get_protondb_cached");
+
+// Game Mode has no browser window we can call; the backend hands the URL to
+// Steam's built-in one.
+export const openUrl = callable<[url: string], { ok: boolean; error?: string }>("open_url");
+
+export interface CloudSaveInfo {
+  ok: boolean;
+  supported?: boolean;
+  folder?: string;
+  save_path?: string;
+  error?: string;
+}
+
+// Manual only: auto-syncing on launch can overwrite newer local saves.
+export const getCloudSaves = callable<[app_name: string], CloudSaveInfo>("get_cloud_saves");
+export const syncCloudSaves = callable<
+  [app_name: string, mode?: "sync" | "upload" | "download"],
+  { ok: boolean; output?: string; error?: string }
+>("sync_cloud_saves");
+
 export interface DataLocation {
   key: string;
   label: string;
@@ -213,33 +302,35 @@ export function fmtSize(bytes: number): string {
   const gb = bytes / 1024 / 1024 / 1024;
   if (gb >= 1) return gb.toFixed(1) + " GB";
   const mb = bytes / 1024 / 1024;
-  return mb.toFixed(0) + " MB";
+  if (mb >= 1) return mb.toFixed(0) + " MB";
+  const kb = bytes / 1024;
+  return kb.toFixed(0) + " KB";
 }
 
 export function fmtPlaytime(seconds: number): string {
   if (!seconds || seconds <= 0) return "";
   const hours = seconds / 3600;
-  if (hours >= 10) return Math.round(hours) + " 小时";
-  if (hours >= 1) return hours.toFixed(1) + " 小时";
-  return Math.max(1, Math.round(seconds / 60)) + " 分钟";
+  if (hours >= 10) return tf("{0} 小时", Math.round(hours));
+  if (hours >= 1) return tf("{0} 小时", hours.toFixed(1));
+  return tf("{0} 分钟", Math.max(1, Math.round(seconds / 60)));
 }
 
 export function fmtMinutes(totalMinutes: number): string {
   if (!totalMinutes || totalMinutes <= 0) return "—";
   const hours = Math.floor(totalMinutes / 60);
   const minutes = Math.round(totalMinutes % 60);
-  if (hours <= 0) return minutes + " 分钟";
-  return minutes > 0 ? `${hours} 小时 ${minutes} 分` : `${hours} 小时`;
+  if (hours <= 0) return tf("{0} 分钟", minutes);
+  return minutes > 0 ? tf("{0} 小时 {1} 分", hours, minutes) : tf("{0} 小时", hours);
 }
 
 /** "刚刚" / "12 分钟前" / "3 天前" — used for cache age. */
 export function fmtAgo(ts: number): string {
   if (!ts) return "";
   const diff = Math.max(0, Math.floor(Date.now() / 1000 - ts));
-  if (diff < 60) return "刚刚";
-  if (diff < 3600) return Math.floor(diff / 60) + " 分钟前";
-  if (diff < 86400) return Math.floor(diff / 3600) + " 小时前";
-  return Math.floor(diff / 86400) + " 天前";
+  if (diff < 60) return t("刚刚");
+  if (diff < 3600) return tf("{0} 分钟前", Math.floor(diff / 60));
+  if (diff < 86400) return tf("{0} 小时前", Math.floor(diff / 3600));
+  return tf("{0} 天前", Math.floor(diff / 86400));
 }
 
 /**
@@ -283,6 +374,7 @@ export const STATE_LABEL: Record<string, string> = {
   prereq: "安装组件中",
   done: "已完成",
   cancelled: "已取消",
+  paused: "已暂停",
   error: "出错",
 };
 

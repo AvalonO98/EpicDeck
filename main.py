@@ -29,7 +29,7 @@ from py_modules.epic_api import (
     fetch_playtime,
     steam_posix_locale,
 )
-from py_modules.legendary import Legendary, LegendaryError, LegendaryNotFound
+from py_modules.legendary import Legendary, LegendaryError, LegendaryNotFound, plausible_size
 from py_modules.paths import (
     default_games_dir,
     ensure_dir,
@@ -73,6 +73,11 @@ _RAW_CODE_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 # page opens before pressing Ctrl+A, so it cannot interrupt a password being
 # typed.
 _LOGIN_FIRST_CAPTURE_DELAY = 20.0
+
+# 诊断日志导出目录最多保留多少份。每次「导出诊断日志」都会在
+# ~/epicdeck_logs/ 落一个带时间戳的 .log，若不设上限会无限累积吃满 home
+# 分区；10 份（每次约几十 KB）足以回溯历史，也几乎不占空间。
+EXPORT_LOG_KEEP = 10
 
 
 def extract_authorization_code(raw: str) -> str:
@@ -252,6 +257,15 @@ def classify_error(exc) -> tuple:
     return "unknown", text[:300] or "未知错误"
 
 
+def _parse_size(value: str, unit: str):
+    """Parse "123.45" + "MiB" into an integer byte count. Never raises."""
+    mult = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}
+    try:
+        return int(float(value) * mult.get(unit, 1))
+    except (TypeError, ValueError):
+        return None
+
+
 class Plugin:
     async def _main(self):
         decky.logger.info("EpicDeck loaded")
@@ -270,6 +284,12 @@ class Plugin:
 
         # app_name -> asyncio.Task for active installs.
         self._install_tasks = {}
+        # app_name -> subprocess.Process for the running legendary install, so
+        # pause/cancel can stop the actual downloader (not just the task).
+        self._install_procs = {}
+        # app_name set of installs being soft-paused (vs cancelled outright);
+        # the _run() cancellation handler checks this to emit the right state.
+        self._pausing = set()
         # Background waiters for games started from the plugin, so a finished
         # game does not stay a zombie while the callable returns immediately.
         self._launch_reapers = set()
@@ -285,6 +305,11 @@ class Plugin:
         self._lib_cache = None
         self._lib_cache_at = 0.0
         self._lib_locale = ""
+        # Which Epic account the caches belong to. `app_name` is global, but the
+        # library, playtime and installed state are per account, so switching
+        # accounts must not serve the previous one's snapshot.
+        self._account = ""
+        self._lib_account = ""
         self._lib_task = None
         self._playtime_task = None
         self._load_library_cache()
@@ -325,7 +350,9 @@ class Plugin:
     # -- auth -------------------------------------------------------------
     async def auth_status(self):
         try:
-            return _public_auth(await self.legendary.auth_status())
+            status = await self.legendary.auth_status()
+            self._set_account(status.get("account_id"))
+            return _public_auth(status)
         except Exception as e:
             decky.logger.error("auth_status: %s", e)
             return {"logged_in": False, "account_id": "", "display_name": ""}
@@ -340,6 +367,10 @@ class Plugin:
             if self.legendary._resolve() is None:
                 return {"ok": False, "error": "Legendary 未安装,请先在设置中点击「一键安装 Legendary」"}
             await asyncio.wait_for(self.legendary.auth_login(), timeout=60.0)
+            self._account = ""
+            self._clear_library_cache()
+            self.config.set("playtime_cache", {})
+            self._meta_done = False
             return {"ok": True}
         except asyncio.TimeoutError:
             return {"ok": False, "error": "浏览器登录超时。游戏模式下请改用「手机/电脑授权码登录」"}
@@ -394,6 +425,14 @@ class Plugin:
         status = await self.legendary.auth_status()
         if not status.get("logged_in"):
             return {"ok": False, "error": "登录命令已执行但未确认成功,请导出日志排查。"}
+        # Signing in replaces Legendary's stored credentials, so whatever we
+        # cached may belong to the previous account. Drop it unconditionally:
+        # a wrong library is worse than one extra fetch.
+        self._account = ""
+        self._clear_library_cache()
+        self.config.set("playtime_cache", {})
+        self._meta_done = False
+        self._set_account(status.get("account_id"))
         return {
             "ok": True,
             "display_name": status.get("display_name", ""),
@@ -404,7 +443,10 @@ class Plugin:
         try:
             await self.legendary.auth_logout()
             # The snapshot belongs to the account that just signed out.
+            self._account = ""
             self._clear_library_cache()
+            self.config.set("playtime_cache", {})
+            self._meta_done = False
             return {"ok": True}
         except LegendaryError as e:
             return {"ok": False, "error": str(e)}
@@ -760,6 +802,12 @@ class Plugin:
         immediately now, and a background refresh patches the rows in.
         """
         cached = getattr(self, "_lib_cache", None)
+        # A snapshot written by another Epic account must never be served, even
+        # if the panel opens before auth_status has run.
+        if cached and self._lib_account and self._account and self._lib_account != self._account:
+            decky.logger.info("library snapshot belongs to another account, dropping it")
+            self._clear_library_cache()
+            cached = None
         age = time.time() - getattr(self, "_lib_cache_at", 0.0)
         # A clock that jumped backwards (VM restore, manual edit) makes `age`
         # negative, and `age < TTL` would then hold forever: the snapshot would
@@ -768,6 +816,15 @@ class Plugin:
             age = LIBRARY_TTL + 1.0
 
         if cached and not force and age < LIBRARY_TTL:
+            if self._lib_locale and self._lib_locale != self._effective_title_locale():
+                # The snapshot was built for another language (the user just
+                # switched the UI): titles are re-picked from the cache right
+                # away, and a rebuild fixes anything not cached for this locale.
+                self._ensure_library_refresh()
+                try:
+                    return self._library_payload(cached, stale=True)
+                except Exception:
+                    pass
             try:
                 return self._library_payload(cached)
             except Exception as e:  # noqa: BLE001 - a bad snapshot must not kill the panel
@@ -853,7 +910,7 @@ class Plugin:
         # one catalog call, sizes need a per-game manifest download (seconds
         # each), so both are cached and filled in by a background task that
         # patches the list through events.
-        locale = detect_locale(self.config.get("title_locale", "auto"))
+        locale = self._effective_title_locale()
         self._lib_locale = locale
         self._apply_cached_metadata(games, locale)
 
@@ -882,6 +939,7 @@ class Plugin:
             self._lib_cache = [g for g in games if _valid_game_row(g)]
             self._lib_cache_at = float(data.get("ts") or 0)
             self._lib_locale = str(data.get("locale") or "")
+            self._lib_account = str(data.get("account") or "")
             decky.logger.info("library cache: %d games", len(self._lib_cache))
         except FileNotFoundError:
             pass
@@ -899,6 +957,7 @@ class Plugin:
                         "version": 1,
                         "ts": int(self._lib_cache_at),
                         "locale": self._lib_locale,
+                        "account": self._account,
                         "games": games,
                     },
                     f,
@@ -913,6 +972,7 @@ class Plugin:
         self._lib_cache = None
         self._lib_cache_at = 0.0
         self._lib_locale = ""
+        self._lib_account = ""
         try:
             os.remove(self._library_cache_path())
         except FileNotFoundError:
@@ -920,23 +980,62 @@ class Plugin:
         except OSError as e:
             decky.logger.warning("library cache clear failed: %s", e)
 
+    def _set_account(self, account_id) -> None:
+        """Remember which Epic account is signed in; drop caches on a switch.
+
+        Called anywhere the account is learnt (auth_status, login, logout). A
+        different account means a different library, playtime and ownership, so
+        the snapshot must go — otherwise the new account briefly sees the old
+        account's games, which is both confusing and a privacy leak between
+        users of the same Deck.
+        """
+        raw = str(account_id or "")
+        account = _hash_id(raw) if raw else ""
+        previous = getattr(self, "_account", "")
+        self._account = account
+        snapshot_account = getattr(self, "_lib_account", "")
+
+        switched = bool(account) and (
+            (bool(previous) and previous != account)
+            or (bool(snapshot_account) and snapshot_account != account)
+        )
+        if not switched:
+            return
+        decky.logger.info("epic account changed, dropping account-scoped caches")
+        self._clear_library_cache()
+        # Playtime is per account; titles and sizes are keyed by Epic's global
+        # app_name and stay useful across accounts.
+        self.config.set("playtime_cache", {})
+        self._meta_done = False
+        self._image_cache = None
+
     def _playtime_map(self):
         data = self.config.get("playtime_cache") or {}
         return data if isinstance(data, dict) else {}
 
     def _library_payload(self, games, stale: bool = False):
         playtime = self._playtime_map()
-        locale = self._lib_locale or detect_locale(
-            self.config.get("title_locale", "auto")
-        )
+        locale = self._effective_title_locale()
+        # Pick the title for the *current* language on every render. The snapshot
+        # stores `source_title` (Epic's own, English) separately from `title`, so
+        # switching language is instant and never shows a stale translation.
+        titles = (self.config.get("title_cache") or {}).get(locale) or {}
+        if not isinstance(titles, dict):
+            titles = {}
+
         out = []
         for g in games:
             if not _valid_game_row(g):
                 continue
             item = dict(g)
-            item["playtime_seconds"] = int(playtime.get(g["app_name"]) or 0)
-            if not item.get("title"):
-                item["title"] = self._title_for(g["app_name"]) or g["app_name"]
+            name = g["app_name"]
+            item["playtime_seconds"] = int(playtime.get(name) or 0)
+            localized = titles.get(name)
+            if isinstance(localized, str) and localized.strip():
+                item["title"] = localized.strip()
+            else:
+                fallback = str(g.get("source_title") or item.get("title") or "").strip()
+                item["title"] = fallback or name
             out.append(item)
         # A refresh may have landed new titles/sizes since the snapshot.
         self._apply_cached_metadata(out, locale)
@@ -1043,11 +1142,28 @@ class Plugin:
             decky.logger.warning("playtime patch failed: %s", e)
 
     # -- library enrichment ----------------------------------------------
+    def _effective_title_locale(self) -> str:
+        """Language game titles should use.
+
+        `title_locale=auto` follows the *interface* language, not raw Steam:
+        a user who switched the UI to English expects English titles, and the
+        library used to stay Chinese because Steam itself was still Chinese.
+        An explicit `title_locale` always wins, so "English UI + Chinese titles"
+        is still possible.
+        """
+        setting = str(self.config.get("title_locale", "auto") or "auto")
+        if setting != "auto":
+            return setting
+        ui = str(self.config.get("ui_language", "auto") or "auto")
+        if ui == "en":
+            return "en-US"
+        if ui == "zh":
+            return "zh-Hans"
+        return detect_locale("auto")
+
     def _title_for(self, app_name: str) -> str:
         """Best known display title for an app_name, without a network call."""
-        locale = self._lib_locale or detect_locale(
-            self.config.get("title_locale", "auto")
-        )
+        locale = self._effective_title_locale()
         cache = self.config.get("title_cache") or {}
         if isinstance(cache, dict):
             titles = cache.get(locale) or {}
@@ -1080,8 +1196,10 @@ class Plugin:
 
             cached = sizes.get(g["app_name"])
             if isinstance(cached, dict):
-                disk = int(cached.get("disk") or 0)
-                download = int(cached.get("download") or 0)
+                # plausible_size: 残缺 manifest 写进来的 4 字节要当成没有,
+                # 否则列表里会显示成 "4 B" 且永远不会被重新测量。
+                disk = plausible_size(cached.get("disk"))
+                download = plausible_size(cached.get("download"))
                 if disk or download:
                     g["download_size"] = download
                     g["disk_size"] = disk
@@ -1099,6 +1217,102 @@ class Plugin:
             return
         self._meta_task = asyncio.create_task(self._refresh_metadata(games, locale))
 
+    #: How long a "no Chinese title anywhere" answer is trusted before retrying.
+    TITLE_MISS_TTL = 30 * 24 * 3600
+
+    def _save_titles(self, locale: str, added: dict, misses: dict) -> None:
+        """Merge new titles into the cache, recording where each came from."""
+        cache = self.config.get("title_cache") or {}
+        if not isinstance(cache, dict):
+            cache = {}
+        bucket = cache.get(locale)
+        if not isinstance(bucket, dict):
+            bucket = {}
+        bucket.update(added)
+        cache[locale] = bucket
+        self.config.set("title_cache", cache)
+        self.config.set("title_misses", misses)
+
+    async def _fill_missing_titles(self, games, locale, cached):
+        """Third-party Chinese titles for the games Epic leaves in English.
+
+        Epic's catalog only translates a fraction of a library (9 of 138 in
+        testing). The Steam store knows the official Chinese name for many more;
+        lookups run in the background, throttled, and patches are emitted as
+        results arrive so the grid fills in without a reload.
+
+        Misses are remembered for 30 days: without that, every library refresh
+        would re-ask the store about the same 80 untranslated games.
+        """
+        from py_modules import title_sources
+
+        if not str(locale).lower().startswith("zh"):
+            return
+        if not self.config.get("third_party_titles", True):
+            return
+
+        misses = self.config.get("title_misses") or {}
+        if not isinstance(misses, dict):
+            misses = {}
+        now = int(time.time())
+        todo = []
+        for g in games:
+            name = str(g.get("app_name") or "")
+            if not name or name in cached or name in misses and now - int(misses[name]) < self.TITLE_MISS_TTL:
+                continue
+            title = str(g.get("source_title") or g.get("title") or "").strip()
+            # A 32-char app_name is a hash, not something worth searching for.
+            if len(title) < 3 or title == name:
+                continue
+            todo.append((name, title))
+        if not todo:
+            return
+
+        loop = asyncio.get_running_loop()
+        added = {}
+        transport_failures = 0
+        processed = 0
+        for app_name, title in todo:
+            if getattr(self, "_unloaded", False):
+                return
+            try:
+                result = await loop.run_in_executor(None, title_sources.lookup, title, 6.0)
+            except Exception as e:  # noqa: BLE001 - decorations must not break a refresh
+                decky.logger.warning("title lookup failed: %s", e)
+                result = {"transport": True}
+            processed += 1
+            if result.get("title"):
+                transport_failures = 0
+                added[app_name] = result["title"]
+                decky.logger.info(
+                    "title from %s: %s -> %s", result.get("source"), title, result["title"]
+                )
+            elif result.get("transport"):
+                # Unreachable, not untranslated: do NOT cache this as a miss, or
+                # the game keeps its English title for a month after a hiccup.
+                transport_failures += 1
+                if transport_failures >= 3:
+                    decky.logger.info("title lookup: store unreachable, will retry later")
+                    break
+            else:
+                transport_failures = 0
+                misses[app_name] = now
+            # The store is a shared service and this loop can run over a hundred
+            # titles; a small gap keeps it from looking like a scraper.
+            await asyncio.sleep(0.3)
+            # Flush on progress, not only on hits: a library with few translated
+            # titles would otherwise sit silent for minutes.
+            if processed % 25 == 0:
+                self._save_titles(locale, dict(added), misses)
+                if added:
+                    await decky.emit("library_patch", dict(added), 0)
+                    added.clear()
+        if added:
+            self._save_titles(locale, added, misses)
+            await decky.emit("library_patch", dict(added), 0)
+        else:
+            self.config.set("title_misses", misses)
+
     async def _refresh_metadata(self, games, locale):
         """Fill in localised titles, then sizes, emitting patches as it goes."""
         loop = asyncio.get_running_loop()
@@ -1111,11 +1325,17 @@ class Plugin:
             if not isinstance(cache, dict):
                 cache = {}
             cached = cache.get(locale) or {}
-            items = [
-                (g["app_name"], g.get("namespace", ""), g.get("catalog_item_id", ""))
-                for g in games
-                if g["app_name"] not in cached
-            ]
+            # English titles already come from `app_title`; asking the catalog
+            # for 138 of them would be pure waste.
+            items = (
+                []
+                if locale.lower().startswith("en")
+                else [
+                    (g["app_name"], g.get("namespace", ""), g.get("catalog_item_id", ""))
+                    for g in games
+                    if g["app_name"] not in cached
+                ]
+            )
             if items:
                 got = await loop.run_in_executor(None, fetch_localized_titles, items, locale)
                 if got:
@@ -1129,6 +1349,10 @@ class Plugin:
         except Exception as e:
             decky.logger.warning("localized titles failed: %s", e)
 
+        # 1b) Chinese titles Epic does not translate (Steam store / Wikidata).
+        titles = (self.config.get("title_cache") or {}).get(locale) or {}
+        await self._fill_missing_titles(games, locale, titles if isinstance(titles, dict) else {})
+
         # 2) Install sizes: one manifest fetch per game, throttled and cached.
         sizes = self.config.get("size_cache") or {}
         if not isinstance(sizes, dict):
@@ -1137,8 +1361,15 @@ class Plugin:
         todo = []
         for g in games:
             cached = sizes.get(g["app_name"])
-            fresh = isinstance(cached, dict) and int(cached.get("disk") or 0) > 0
+            # 用 plausible_size 判「有效」: 残缺 manifest 的 4 字节不算有效,
+            # 否则这条会一直被当成 fresh 缓存,永远不重新测量。
+            fresh = isinstance(cached, dict) and plausible_size(cached.get("disk")) > 0
             if fresh and now - int(cached.get("ts") or 0) < 30 * 86400:
+                continue
+            # A recent failure is not retried on every panel open: each attempt
+            # costs a manifest download (and some apps never return one).
+            failed_at = int(cached.get("failed") or 0) if isinstance(cached, dict) else 0
+            if not fresh and failed_at and now - failed_at < self.SIZE_FAIL_TTL:
                 continue
             todo.append(g["app_name"])
         if not todo:
@@ -1166,13 +1397,28 @@ class Plugin:
                     decky.logger.warning("size %s failed: %s", app_name, e)
                     result = None
                 remaining[0] -= 1
+                if not result:
+                    # No manifest: an installed game still has a real size on
+                    # disk, and that is what the user is looking at.
+                    disk = await self._measure_install(app_name)
+                    if disk:
+                        result = {"download": 0, "disk": disk, "measured": True}
+                        decky.logger.info(
+                            "size %s: no manifest, measured %d bytes on disk", app_name, disk
+                        )
                 if result:
                     sizes[app_name] = {
                         "download": result["download"],
                         "disk": result["disk"],
                         "ts": now,
                     }
-                    patch[app_name] = result
+                    patch[app_name] = {
+                        "download": result["download"],
+                        "disk": result["disk"],
+                    }
+                    dirty[0] = True
+                else:
+                    sizes[app_name] = {"failed": now}
                     dirty[0] = True
 
                 # Flush in batches: per-game IPC would mean 138 events.
@@ -1214,14 +1460,53 @@ class Plugin:
             decky.logger.warning("library_patch emit failed: %s", e)
         decky.logger.info("size fetch complete (%d games)", len(todo))
 
+    #: A failed size lookup is retried after this long. Short enough to recover
+    #: from a network blip, long enough not to re-fetch a 90 s manifest every
+    #: time the panel opens.
+    SIZE_FAIL_TTL = 6 * 3600
+
+    async def _measure_install(self, app_name: str) -> int:
+        """Bytes actually used by an installed game, via `du`.
+
+        Manifest data is the preferred source, but some apps return no manifest
+        at all (GOTY/bundle entries). For those, the folder on disk is the
+        honest answer — and it is what "已占用" means anyway.
+        """
+        try:
+            path = await self.legendary.get_install_dir(app_name)
+        except Exception:
+            return 0
+        if not path or not os.path.isdir(path):
+            return 0
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "du", "-sb", path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=45.0)
+        except (OSError, asyncio.TimeoutError):
+            return 0
+        try:
+            return int(out.split()[0])
+        except (IndexError, ValueError):
+            return 0
+
     async def get_game_size(self, app_name: str):
         """On-demand size for one title, for the detail page."""
         sizes = self.config.get("size_cache") or {}
         if not isinstance(sizes, dict):
             sizes = {}
         cached = sizes.get(app_name)
-        if isinstance(cached, dict) and int(cached.get("disk") or 0) > 0:
+        # 脏缓存自愈: 之前版本把残缺 manifest 的 4 字节写了进来,这里必须
+        # 用 plausible_size 判定,否则一进详情页就直接返回那个假体积。
+        if isinstance(cached, dict) and plausible_size(cached.get("disk")) > 0:
             return {"ok": True, "download": cached.get("download", 0), "disk": cached.get("disk", 0)}
+        # Respect the failure window here too: without this, every open of the
+        # detail page would block on two manifest timeouts (up to ~4 minutes).
+        failed_at = int(cached.get("failed") or 0) if isinstance(cached, dict) else 0
+        if failed_at and time.time() - failed_at < self.SIZE_FAIL_TTL:
+            return {"ok": False, "unknown": True, "error": "没有可用的体积数据"}
 
         try:
             result = await self.legendary.game_size(app_name)
@@ -1230,7 +1515,20 @@ class Plugin:
         except Exception as e:
             return {"ok": False, "error": str(e)}
         if not result:
-            return {"ok": False, "error": "无法读取安装体积"}
+            # No manifest (GOTY/bundle entries): fall back to what is on disk.
+            disk = await self._measure_install(app_name)
+            if disk:
+                result = {"download": 0, "disk": disk, "measured": True}
+                decky.logger.info("size %s: no manifest, measured %d bytes on disk", app_name, disk)
+            else:
+                # Remember the miss so the UI can say "未知" instead of showing
+                # "读取中…" forever (see SIZE_FAIL_TTL).
+                sizes[app_name] = {"failed": int(time.time())}
+                try:
+                    self.config.set("size_cache", sizes)
+                except OSError:
+                    pass
+                return {"ok": False, "unknown": True, "error": "没有可用的体积数据"}
 
         sizes[app_name] = {
             "download": result["download"],
@@ -1282,7 +1580,11 @@ class Plugin:
                 if self.config.get("auto_add_to_steam") and await self._still_logged_in():
                     await self._add_to_steam(app_name, await self._installed_title(app_name))
             except asyncio.CancelledError:
-                await decky.emit("install_progress", app_name, "cancelled", 0.0, "")
+                if app_name in self._pausing:
+                    self._pausing.discard(app_name)
+                    await decky.emit("install_progress", app_name, "paused", 0.0, "已暂停，可稍后继续")
+                else:
+                    await decky.emit("install_progress", app_name, "cancelled", 0.0, "")
                 raise
             except Exception as e:
                 decky.logger.error("install %s: %s", app_name, e)
@@ -1317,6 +1619,21 @@ class Plugin:
         cmd = [exe, "install", app_name, "-y"]
         if install_dir:
             cmd += ["--base-path", install_dir]
+        # Optional download concurrency. 0 = Legendary's default. This is also
+        # the plugin's coarse "speed limit": Legendary has no rate-limit flag,
+        # so fewer workers is the only way to slow a download down.
+        try:
+            workers = int(self.config.get("max_workers") or 0)
+        except (TypeError, ValueError):
+            workers = 0
+        if workers > 0:
+            cmd += ["--max-workers", str(workers)]
+        # Optional CDN override and plaintext toggle.
+        cdn = (self.config.get("preferred_cdn") or "").strip()
+        if cdn:
+            cmd += ["--preferred-cdn", cdn]
+        if self.config.get("no_https"):
+            cmd += ["--no-https"]
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1327,7 +1644,10 @@ class Plugin:
             )
         except (OSError, PermissionError, FileNotFoundError) as e:
             raise LegendaryNotFound("无法启动 Legendary(%s): %s" % (exe, e))
+        self._install_procs[app_name] = proc
         last_error = ""
+        downloaded_bytes = None
+        total_bytes = None
         try:
             while True:
                 line = await proc.stdout.readline()
@@ -1343,18 +1663,34 @@ class Plugin:
                 state = self._classify_activity(decoded)
                 if state == "progress":
                     info = self._parse_progress(decoded)
+                    # The byte figures arrive on lines of their own; keep the
+                    # latest value until it is overwritten by a newer line.
+                    if info["downloaded_bytes"] is not None:
+                        downloaded_bytes = info["downloaded_bytes"]
+                    if info["total_bytes"] is not None:
+                        total_bytes = info["total_bytes"]
                     await decky.emit(
                         "install_progress", app_name, "downloading",
                         info["percent"], decoded, info["speed"], info["eta"],
+                        downloaded_bytes, total_bytes,
                     )
                 elif state:
                     # Non-progress activity: verification, delta patching, etc.
                     await decky.emit(
-                        "install_progress", app_name, state, -1.0, decoded, "", ""
+                        "install_progress", app_name, state, -1.0, decoded, "", "",
+                        downloaded_bytes, total_bytes,
                     )
                 elif decoded:
+                    # A non-Progress line may still carry the byte figures
+                    # ("Downloaded: x MiB" or "Download size: y MiB").
+                    info = self._parse_progress(decoded)
+                    if info["downloaded_bytes"] is not None:
+                        downloaded_bytes = info["downloaded_bytes"]
+                    if info["total_bytes"] is not None:
+                        total_bytes = info["total_bytes"]
                     await decky.emit(
-                        "install_progress", app_name, "downloading", -1.0, decoded, "", ""
+                        "install_progress", app_name, "downloading", -1.0, decoded, "", "",
+                        downloaded_bytes, total_bytes,
                     )
         finally:
             if proc.returncode is None:
@@ -1364,6 +1700,7 @@ class Plugin:
                 except asyncio.TimeoutError:
                     proc.kill()
             await proc.wait()
+            self._install_procs.pop(app_name, None)
 
         if proc.returncode != 0:
             detail = last_error.strip()
@@ -1387,18 +1724,54 @@ class Plugin:
 
     @staticmethod
     def _parse_progress(line: str):
-        """Parse `Progress: xx% (a/b MiB), s MiB/s, ETA: h:mm:ss` into a dict."""
+        """Parse a Legendary `Progress:` line into a dict.
+
+        Legendary prints two kinds of progress line:
+
+          = Progress: 42.00% (123/456), Running for 00:00:12, ETA: 00:00:30
+            - Downloaded: 123.45 MiB, Written: 120.00 MiB
+            + Download - 12.34 MiB/s (raw) / 12.00 MiB/s (decompressed)
+
+        The byte figures ("Downloaded"/"Written") land on a *separate* line
+        from the percentage, so the caller accumulates them across lines. This
+        parser returns the fields it can see on a single line; the caller keeps
+        `downloaded_bytes` / `total_bytes` running until the next line updates
+        them.
+        """
         import re
-        info = {"percent": -1.0, "speed": "", "eta": ""}
+        info = {"percent": -1.0, "speed": "", "eta": "",
+                "downloaded_bytes": None, "total_bytes": None}
         m = re.search(r"Progress:\s*([\d.]+)%", line)
         if m:
             try:
                 info["percent"] = float(m.group(1))
             except ValueError:
                 info["percent"] = -1.0
-        s = re.search(r",\s*([\d.]+\s*\w+/s)\s*,", line)
+        # "Progress: 42.00% (123/456)" — the (a/b) pair is chunk counts, not
+        # bytes, so it is only useful when nothing better is available.
+        m = re.search(r"\(\s*([\d.]+)\s*MiB\s*/\s*([\d.]+)\s*MiB\s*\)", line)
+        if m:
+            try:
+                info["downloaded_bytes"] = float(m.group(1)) * 1024 * 1024
+                info["total_bytes"] = float(m.group(2)) * 1024 * 1024
+            except ValueError:
+                pass
+        m = re.search(r"Downloaded:\s*([\d.]+)\s*(MiB|GiB|KiB|B)", line)
+        if m:
+            info["downloaded_bytes"] = _parse_size(m.group(1), m.group(2))
+        m = re.search(r"Download size:\s*([\d.]+)\s*(MiB|GiB|KiB|B)", line)
+        if m:
+            info["total_bytes"] = _parse_size(m.group(1), m.group(2))
+        # Speed: newer Legendary prints "+ Download - 26.45 MiB/s (raw) / ..."
+        # on its own line; older builds embedded it as ", 26.45 MiB/s," on the
+        # Progress line. Match both.
+        s = re.search(r"Download\s*-\s*([\d.]+\s*\w+/s)\s*\(raw\)", line)
         if s:
             info["speed"] = s.group(1)
+        if not info["speed"]:
+            s = re.search(r",\s*([\d.]+\s*\w+/s)\s*,", line)
+            if s:
+                info["speed"] = s.group(1)
         e = re.search(r"ETA:\s*([\d:]+)", line)
         if e:
             info["eta"] = e.group(1)
@@ -1498,11 +1871,92 @@ class Plugin:
         except LegendaryError as e:
             return {"ok": False, "error": str(e)}
 
-    async def cancel_install(self, app_name: str):
+    async def cancel_install(self, app_name: str, delete: bool = False):
+        """Stop an install task.
+
+        ``delete=False`` (pause) keeps the downloaded chunks and Legendary's
+        ``.resume`` state, so a later ``install`` picks up where it left off —
+        this is the "soft pause". ``delete=True`` additionally removes the
+        partial download so a retry starts from scratch.
+        """
         task = self._install_tasks.get(app_name)
         if task and not task.done():
             task.cancel()
+        proc = self._install_procs.get(app_name)
+        if proc is not None and proc.returncode is None:
+            proc.terminate()
+        if delete:
+            await self._clear_partial_download(app_name)
         return {"ok": True}
+
+    async def pause_install(self, app_name: str):
+        """Soft-pause: stop the downloader but keep the partial state."""
+        self._pausing.add(app_name)
+        return await self.cancel_install(app_name, delete=False)
+
+    async def resume_install(self, app_name: str, install_dir: str = ""):
+        """Resume a paused download. Legendary reuses the on-disk chunks."""
+        # Drop the paused marker so install() will accept a new task.
+        self._install_tasks.pop(app_name, None)
+        return await self.install(app_name, install_dir)
+
+    async def _clear_partial_download(self, app_name: str):
+        """Remove Legendary's partial-download state for a title.
+
+        The game chunks live inside the install directory (not a central tmp
+        dir), so clearing them means removing the half-written game folder.
+        Legendary's own ``.resume`` file under ``<config>/tmp`` is what tracks
+        which chunks are already there; delete both so a retry is a clean
+        download rather than a resume.
+        """
+        try:
+            record = self.legendary.installed_records().get(app_name) or {}
+            install_path = (record.get("install_path") or "").strip()
+            # Only delete the half-finished folder if Legendary knows about it;
+            # otherwise the title never started downloading and there is
+            # nothing to clear.
+            if install_path and os.path.isdir(install_path):
+                # A completed game also has an install_path. Never delete a
+                # directory that looks like a finished install.
+                done = record.get("version") and os.path.exists(
+                    os.path.join(install_path, ".egstore")
+                )
+                if not done:
+                    import shutil
+                    shutil.rmtree(install_path, ignore_errors=True)
+            # Remove the .resume file(s) that reference this app's chunks.
+            tmp_dir = os.path.join(self.legendary.config_dir(), "tmp")
+            if os.path.isdir(tmp_dir):
+                for name in os.listdir(tmp_dir):
+                    if name.endswith(".resume") and app_name[:12].lower() in name.lower():
+                        try:
+                            os.unlink(os.path.join(tmp_dir, name))
+                        except OSError:
+                            pass
+        except Exception as e:
+            decky.logger.warning("clear_partial_download %s: %s", app_name, e)
+
+    async def clear_download_cache(self):
+        """Remove Legendary's leftover tmp/.resume files (all titles).
+
+        Safe to run when nothing is downloading: it only touches the ``tmp``
+        dir where Legendary keeps resume state and partial manifests, never a
+        game's actual files.
+        """
+        removed = 0
+        try:
+            tmp_dir = os.path.join(self.legendary.config_dir(), "tmp")
+            if os.path.isdir(tmp_dir):
+                for name in os.listdir(tmp_dir):
+                    try:
+                        os.unlink(os.path.join(tmp_dir, name))
+                        removed += 1
+                    except OSError:
+                        pass
+        except Exception as e:
+            decky.logger.warning("clear_download_cache: %s", e)
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "removed": removed}
 
     # -- steam integration ------------------------------------------------
     def _proton_dir(self) -> str:
@@ -1603,7 +2057,10 @@ class Plugin:
         # The wrapper has to exist before the shortcut does: Steam starts the
         # launcher script, and the script is what carries `--wine`.
         wine = self._wine_wrapper(app_name, appid)
-        exe = self._write_launcher_script(app_name, title=display, wine=wine)
+        exe = self._write_launcher_script(
+            app_name, title=display, wine=wine,
+            lsfg=self._lsfg_enabled(app_name),
+        )
         art = await self._apply_artwork(app_name, appid)
         icon = art.get("icon") or self._steam_icon()
         return self.steam.add_game(app_name, exe, title=display, icon=icon)
@@ -1776,7 +2233,8 @@ class Plugin:
         )
 
     def _write_launcher_script(self, app_name: str, exe: str = None,
-                               title: str = "", wine: str = "") -> str:
+                               title: str = "", wine: str = "",
+                               lsfg: bool = False) -> str:
         """(Re)write the wrapper Steam points at for this game.
 
         Four things go in here:
@@ -1788,7 +2246,15 @@ class Plugin:
           * `--wine <proton wrapper>` for Windows titles, because SteamOS has
             no wine (see py_modules/proton.py);
           * `"$@"`, so whatever the user types into Steam's "launch options"
-            box is appended to the game command line.
+            box is appended to the game command line;
+          * when `lsfg` is set, the final launch is wrapped in `~/lsfg` so the
+            Decky LSFG-VK frame-gen layer kicks in. This must be the
+            *outermost* layer (`~/lsfg` -> shim -> legendary -> proton -> game)
+            because `LSFG_PROCESS` is an env var that has to be inherited all
+            the way down. We call the user's `~/lsfg` script rather than
+            hardcoding its env vars: the plugin regenerates that script when
+            the user changes their profile, so calling it is the only way to
+            stay in sync.
         """
         if exe is None:
             exe = self.legendary._resolve()
@@ -1818,6 +2284,41 @@ class Plugin:
             helper_shell += " --wine %s" % shlex.quote(_posix_path(wine))
         helper_shell += " --log %s" % shlex.quote(_posix_path(self._launch_log_path(app_name)))
 
+        # The shim command and the plain-launch fallback both get wrapped in
+        # `~/lsfg` when frame-gen is on. We write the wrapper as a *function*
+        # `launch()` so an empty `LSFG` (plugin installed after the toggle was
+        # set, or removed later) degrades to a direct launch instead of bash
+        # trying to run `""` as a command. The function is only defined when
+        # lsfg is requested; otherwise the script stays byte-for-byte plain.
+        # When it does wrap, it appends one line to the same log file the shim
+        # writes, so "is LSFG active?" is answerable from the launch log
+        # instead of only by inspecting the script.
+        lsfg_prologue = ""
+        lsfg_prefix = ""
+        if lsfg:
+            lsfg_log = shlex.quote(_posix_path(self._launch_log_path(app_name)))
+            lsfg_prologue = (
+                '# Decky LSFG-VK frame-gen wrapper: `~/lsfg` sets the env and\n'
+                '# execs its argument. It is the OUTERMOST layer so LSFG_PROCESS\n'
+                '# is inherited all the way into the game. Guarded against the\n'
+                '# plugin being absent: then LSFG is empty and launch() runs the\n'
+                '# command directly.\n'
+                'if [ -x "$HOME/lsfg" ]; then\n'
+                '  LSFG="$HOME/lsfg"\n'
+                'else\n'
+                '  LSFG=""\n'
+                'fi\n'
+                'launch() {\n'
+                '  if [ -n "$LSFG" ]; then\n'
+                f'    echo "$(date \'+%F %T\') [lsfg] wrapping launch via $LSFG" >> {lsfg_log}\n'
+                '    "$LSFG" "$@"\n'
+                '  else\n'
+                '    "$@"\n'
+                '  fi\n'
+                '}\n'
+            )
+            lsfg_prefix = 'launch '
+
         script_dir = self._launcher_dir()
         os.makedirs(script_dir, exist_ok=True)
         script = os.path.join(script_dir, f"{app_name}.sh")
@@ -1829,9 +2330,10 @@ class Plugin:
             # Quoted, not just wrapped in double quotes: a path containing `$`
             # or a backtick would otherwise be expanded by bash at run time.
             f'EPICDECK_SHIM={shlex.quote(helper)}\n'
+            + lsfg_prologue +
             'for EPICDECK_PY in /usr/bin/python3 /usr/bin/python3.11 /usr/bin/python; do\n'
             '  if [ -x "$EPICDECK_PY" ] && [ -f "$EPICDECK_SHIM" ]; then\n'
-            f'    "$EPICDECK_PY" "$EPICDECK_SHIM" {helper_shell} --{extra_shell} "$@"\n'
+            f'    {lsfg_prefix}"$EPICDECK_PY" "$EPICDECK_SHIM" {helper_shell} --{extra_shell} "$@"\n'
             '    EPICDECK_RC=$?\n'
             '    # 90 means the shim never started a game; fall through to the plain\n'
             '    # launch below instead of leaving the user with a dead entry.\n'
@@ -1839,7 +2341,7 @@ class Plugin:
             '    break\n'
             '  fi\n'
             'done\n'
-            f'exec {shlex.quote(exe)} launch{wine_shell} {shlex.quote(app_name)}'
+            f'{lsfg_prefix}exec {shlex.quote(exe)} launch{wine_shell} {shlex.quote(app_name)}'
             f'{extra_shell} "$@"\n'
         )
         with open(script, "w", encoding="utf-8") as f:
@@ -1853,7 +2355,8 @@ class Plugin:
         # pick up an unrelated system-wide legendary.
         appid = self.steam_appid(app_name, title)
         return self._write_launcher_script(
-            app_name, title=title, wine=self._wine_wrapper(app_name, appid)
+            app_name, title=title, wine=self._wine_wrapper(app_name, appid),
+            lsfg=self._lsfg_enabled(app_name),
         )
 
     def _sync_launcher_scripts(self):
@@ -1876,7 +2379,8 @@ class Plugin:
                 app_name = os.path.splitext(os.path.basename(entry.exe))[0]
                 wine = self._wine_wrapper(app_name, entry.appid)
                 self._write_launcher_script(
-                    app_name, title=entry.app_name, wine=wine
+                    app_name, title=entry.app_name, wine=wine,
+                    lsfg=self._lsfg_enabled(app_name),
                 )
                 decky.logger.info(
                     "launcher refreshed for %s (proton=%s)", app_name, bool(wine)
@@ -1920,6 +2424,20 @@ class Plugin:
                 return value.strip()
         return ""
 
+    def _lsfg_enabled(self, app_name: str) -> bool:
+        """Whether this game should be wrapped in `~/lsfg` (Decky LSFG-VK).
+
+        Per-game override wins over the global default; an absent key means
+        "follow the default", so the user can turn it on for one game without
+        a tri-state toggle. `~/lsfg` only exists when that plugin is installed,
+        so the generated script guards with `[ -x "$HOME/lsfg" ]` and the
+        wrapper is a no-op otherwise.
+        """
+        per_game = self.config.get("lsfg") or {}
+        if isinstance(per_game, dict) and app_name in per_game:
+            return bool(per_game.get(app_name))
+        return bool(self.config.get("lsfg_default", False))
+
     def _effective_launch_args(self, app_name: str) -> str:
         """What to show in the UI: our own value, else Legendary's config.ini.
 
@@ -1959,6 +2477,44 @@ class Plugin:
             decky.logger.warning("launcher rewrite failed for %s: %s", app_name, e)
             return {"ok": True, "args": stored[app_name], "warning": str(e)}
         return {"ok": True, "args": stored[app_name]}
+
+    async def get_lsfg(self, app_name: str = ""):
+        """LSFG-VK frame-gen state: global default + per-game override."""
+        per_game = self.config.get("lsfg") or {}
+        has_own = isinstance(per_game, dict) and app_name in per_game
+        # Whether `~/lsfg` exists on this machine at all (the Decky LSFG-VK
+        # plugin creates it); the frontend hides the toggle when it is absent.
+        lsfg_available = os.path.isfile(os.path.expanduser("~/lsfg"))
+        return {
+            "ok": True,
+            "available": lsfg_available,
+            "default": bool(self.config.get("lsfg_default", False)),
+            "enabled": self._lsfg_enabled(app_name) if app_name else False,
+            "own": has_own,
+        }
+
+    async def set_lsfg(self, app_name: str, enabled: bool):
+        """Set the per-game LSFG override (empty app_name = the global default)."""
+        if not app_name:
+            self.config.set("lsfg_default", bool(enabled))
+        else:
+            per_game = self.config.get("lsfg") or {}
+            if not isinstance(per_game, dict):
+                per_game = {}
+            per_game[app_name] = bool(enabled)
+            self.config.set("lsfg", per_game)
+
+        # Rewrite the launcher script(s) so the change takes effect on the
+        # next launch. Empty app_name = flip every game's script.
+        try:
+            if app_name:
+                await self._ensure_launcher_script(app_name)
+            else:
+                self._sync_launcher_scripts()
+        except Exception as e:
+            decky.logger.warning("launcher rewrite failed for lsfg: %s", e)
+            return {"ok": True, "warning": str(e)}
+        return {"ok": True, "enabled": bool(enabled)}
 
     async def add_to_steam(self, app_name: str):
         try:
@@ -2090,6 +2646,210 @@ class Plugin:
     async def set_setting(self, key: str, value):
         self.config.set(key, value)
         return {"ok": True}
+
+    # -- interface language (HANDOFF 7.13.0a) ------------------------------
+    async def get_ui_language(self):
+        """Which language the UI should use.
+
+        Game Mode has no `LANG`, so Steam's own setting (`registry.vdf`) is the
+        only signal; the user can override it explicitly in Settings. Returning
+        both lets the settings row show what "follow Steam" resolved to.
+        """
+        try:
+            from py_modules.epic_api import _steam_language
+        except Exception:
+            _steam_language = lambda: ""  # noqa: E731
+
+        steam = ""
+        try:
+            steam = str(_steam_language() or "")
+        except Exception:
+            steam = ""
+
+        setting = str(self.config.get("ui_language", "auto") or "auto")
+        if setting in ("zh", "en"):
+            return {"ok": True, "lang": setting, "steam": steam, "source": "setting"}
+
+        lang = "zh" if steam.startswith(("schinese", "tchinese", "zh")) else ("en" if steam else "zh")
+        return {"ok": True, "lang": lang, "steam": steam, "source": "steam"}
+
+    # -- update check (HANDOFF 7.13.5) -------------------------------------
+    async def check_update(self, force: bool = False):
+        """Compare the running version with the newest GitHub release.
+
+        Never raises and never blocks the UI: on a bad connection the answer is
+        simply `ok: False` with the previous known version, and the settings row
+        shows nothing new. One lookup a day unless `force`.
+        """
+        from py_modules import update_check
+
+        plugin_dir = getattr(
+            decky, "DECKY_PLUGIN_DIR", os.path.dirname(os.path.abspath(__file__))
+        )
+        current = update_check.current_version(plugin_dir)
+        cache = self.config.get("update_check") or {}
+        if not isinstance(cache, dict):
+            cache = {}
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                None, lambda: update_check.check(current, cache, force)
+            )
+        except Exception as exc:  # noqa: BLE001 - a version check must never break the panel
+            decky.logger.warning("update check failed: %s", exc)
+            return {"ok": False, "reason": str(exc)[:160], "current": current}
+        if cache.get("ts"):
+            self.config.set("update_check", cache)
+        return result
+
+    async def open_url(self, url: str):
+        """Open a release/changelog link in Steam's browser.
+
+        Game Mode has no other browser, and `window.open` inside the plugin's
+        hidden window does nothing. Restricted to http(s) so a bad value cannot
+        turn into `file://` or a shell-looking scheme.
+        """
+        target = str(url or "").strip()
+        if not target.lower().startswith(("http://", "https://")):
+            return {"ok": False, "error": "只支持 http(s) 链接"}
+        opened = await self._open_in_steam(target)
+        return {"ok": opened, "error": "" if opened else "无法打开浏览器"}
+
+    # -- ProtonDB tier (HANDOFF 7.13.2) ------------------------------------
+    def _protondb_title(self, app_name: str) -> str:
+        """Title to search Steam with: English first, since the store's own
+        search matches localised names anyway and English survives them best."""
+        cache = self.config.get("title_cache") or {}
+        if isinstance(cache, dict):
+            for locale in ("en-US", "en", "en-GB"):
+                titles = cache.get(locale)
+                if isinstance(titles, dict):
+                    title = titles.get(app_name)
+                    if isinstance(title, str) and title.strip():
+                        return title.strip()
+        title = self._title_for(app_name)
+        if title:
+            return title
+        # The title cache only holds locales that were fetched; a game added by a
+        # background refresh can be missing from it. The library snapshot always
+        # has the title that is on screen.
+        for row in getattr(self, "_lib_cache", None) or []:
+            if isinstance(row, dict) and row.get("app_name") == app_name:
+                fallback = str(row.get("title") or "").strip()
+                if fallback:
+                    return fallback
+        return app_name
+
+    # -- cloud saves (HANDOFF 7.13.3) --------------------------------------
+    async def get_cloud_saves(self, app_name: str):
+        """Does this title use Epic cloud saves, and where do they live?"""
+        try:
+            info = await self.legendary.cloud_save_info(app_name)
+        except Exception as exc:  # noqa: BLE001 - reading a flag must never break the page
+            return {"ok": False, "error": str(exc)[:160]}
+        return {"ok": True, **info}
+
+    async def sync_cloud_saves(self, app_name: str, mode: str = "sync"):
+        """Manual cloud-save sync. Deliberately *not* hooked into launch.
+
+        Auto-syncing on every launch would add minutes on a bad connection and
+        can overwrite newer local saves; the user asks for it explicitly here.
+        """
+        if mode not in ("sync", "upload", "download"):
+            return {"ok": False, "error": "无效的同步方向"}
+        try:
+            output = await self.legendary.sync_saves(app_name, mode)
+        except LegendaryError as exc:
+            return {"ok": False, "error": str(exc)[:400]}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)[:400]}
+        return {"ok": True, "output": output[-2000:]}
+
+    #: How long a *failed* ProtonDB lookup suppresses retries. The Steam store
+    #: endpoint takes ~12 s to time out on a blocked network, and retrying it on
+    #: every detail-page open would keep a pointless request in flight forever.
+    PROTONDB_FAIL_TTL = 3600
+
+    async def get_protondb(self, app_name: str, force: bool = False):
+        """ProtonDB tier for one game (detail page). Cached 7 days."""
+        from py_modules import protondb
+
+        cache = self.config.get("protondb") or {}
+        if not isinstance(cache, dict):
+            cache = {}
+        entry = cache.get(app_name) if isinstance(cache.get(app_name), dict) else None
+
+        # Recent failure and no tier yet: stay quiet instead of hammering the API.
+        if (
+            not force
+            and isinstance(entry, dict)
+            and not entry.get("tier")
+            and time.time() - float(entry.get("failed_ts") or 0) < self.PROTONDB_FAIL_TTL
+        ):
+            return {"ok": False, "reason": "recent failure", "title": self._protondb_title(app_name)}
+        overrides = self.config.get("protondb_appid") or {}
+        try:
+            override = int(overrides.get(app_name) or 0) if isinstance(overrides, dict) else 0
+        except (TypeError, ValueError):
+            override = 0
+
+        title = self._protondb_title(app_name)
+        # A 32-character app_name is not a searchable title: skip the network
+        # entirely instead of asking Steam about a hash.
+        if title == app_name and len(app_name) >= 24:
+            return {"ok": False, "reason": "no display title", "title": title}
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                None, lambda: protondb.lookup(title, entry, override, force)
+            )
+        except Exception as exc:  # noqa: BLE001
+            decky.logger.warning("protondb lookup failed for %s: %s", app_name, exc)
+            return {"ok": False, "reason": str(exc)[:160], "title": title}
+
+        if not result.get("ok"):
+            # Keep the reason in the log: "no tier" alone is undiagnosable.
+            decky.logger.info(
+                "protondb %s: %s%s (title=%r)",
+                app_name,
+                result.get("reason"),
+                (" (" + str(result.get("detail")) + ")") if result.get("detail") else "",
+                title,
+            )
+        if result.get("ok") and not result.get("cached"):
+            cache[app_name] = {
+                key: result.get(key)
+                for key in ("appid", "tier", "label", "total", "ts", "matched",
+                            "score", "best_tier", "report_confidence")
+            }
+            self.config.set("protondb", cache)
+        elif not result.get("ok"):
+            # Remember the miss for an hour (see PROTONDB_FAIL_TTL). Never
+            # overwrite a known-good entry with a failure.
+            if not isinstance(cache.get(app_name), dict) or not cache[app_name].get("tier"):
+                cache[app_name] = {"failed_ts": int(time.time())}
+                self.config.set("protondb", cache)
+        result["title"] = title
+        return result
+
+    async def get_protondb_cached(self, app_names=None):
+        """Cached tiers only — no network. Used for library badges, where 138
+        lookups would be absurd; the detail page fills the cache lazily."""
+        cache = self.config.get("protondb") or {}
+        if not isinstance(cache, dict):
+            cache = {}
+        wanted = app_names if isinstance(app_names, (list, tuple)) else list(cache.keys())
+        out = {}
+        for name in wanted:
+            entry = cache.get(name)
+            if isinstance(entry, dict) and entry.get("tier"):
+                out[name] = {
+                    "tier": entry.get("tier"),
+                    "label": entry.get("label") or "",
+                    "total": entry.get("total") or 0,
+                    "appid": entry.get("appid") or 0,
+                }
+        return out
 
     async def get_install_dir_options(self):
         """Install roots the user can pick from, annotated with free space.
@@ -2335,6 +3095,21 @@ class Plugin:
             export_path = os.path.join(export_dir, f"epicdeck_{stamp}.log")
             with open(export_path, "w", encoding="utf-8") as f:
                 f.write(content)
+            # 导出目录会随每次诊断无限累积，只保留最近 EXPORT_LOG_KEEP 份，
+            # 超出删除最旧的，避免把用户 home 分区慢慢吃满。
+            try:
+                exports = sorted(
+                    (p for p in os.listdir(export_dir) if p.startswith("epicdeck_") and p.endswith(".log")),
+                    key=lambda n: os.path.getmtime(os.path.join(export_dir, n)),
+                    reverse=True,
+                )
+                for stale in exports[EXPORT_LOG_KEEP:]:
+                    try:
+                        os.unlink(os.path.join(export_dir, stale))
+                    except OSError:
+                        pass
+            except OSError:
+                pass
         except OSError as e:
             decky.logger.error("export_logs write: %s", e)
             export_path = ""

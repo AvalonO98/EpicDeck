@@ -22,8 +22,10 @@ import {
   launchGame,
   listGames,
   logout,
+  pauseInstall,
   refreshSteam,
   removeFromSteam,
+  resumeInstall,
   uninstallGame,
   type AuthStatus,
   type EnvironmentInfo,
@@ -33,6 +35,7 @@ import {
   type LibraryFailure,
   type LibraryPayload,
 } from "./api";
+import { t } from "./i18n";
 
 export interface PluginState {
   auth: AuthStatus | null;
@@ -182,7 +185,7 @@ function applyPayload(r: LibraryPayload) {
     locale: r.locale ?? "",
     cachedAt: r.stale ? r.cached_at ?? state.cachedAt : Math.floor(Date.now() / 1000),
     error: r.error_kind
-      ? { message: r.warning || r.error || "读取游戏库失败", kind: r.error_kind }
+      ? { message: r.warning || r.error || t("读取游戏库失败"), kind: r.error_kind }
       : r.warning
       ? { message: r.warning, kind: "unknown" }
       : null,
@@ -199,12 +202,20 @@ function bindEvents() {
   if (eventsBound) return;
   eventsBound = true;
 
-  addEventListener<[string, string, number, string, string, string]>(
+  addEventListener<[string, string, number, string, string, string, number?, number?]>(
     "install_progress",
-    (appName, st, percent, message, speed, eta) => {
+    (appName, st, percent, message, speed, eta, downloadedBytes, totalBytes) => {
       const progress = {
         ...state.progress,
-        [appName]: { state: st, percent, message, speed, eta } as InstallProgress,
+        [appName]: {
+          state: st,
+          percent,
+          message,
+          speed,
+          eta,
+          downloaded_bytes: downloadedBytes,
+          total_bytes: totalBytes,
+        } as InstallProgress,
       } as Record<string, InstallProgress>;
       setPluginState({ progress });
       // A finished install flips is_installed / sizes; one refetch covers both.
@@ -254,7 +265,7 @@ function bindEvents() {
   addEventListener<[string, string]>("library_error", (message, kind) => {
     setPluginState({
       error: {
-        message: message || "读取游戏库失败",
+        message: message || t("读取游戏库失败"),
         kind: (kind as LibraryFailure["kind"]) || "unknown",
       },
       loading: false,
@@ -326,7 +337,7 @@ async function boot() {
       games: [],
       size_pending: 0,
       locale: "",
-      error: "读取游戏库超时：Epic 服务器没有响应",
+      error: t("读取游戏库超时：Epic 服务器没有响应"),
       error_kind: "network",
     });
   } catch (e) {
@@ -336,7 +347,7 @@ async function boot() {
       games: [],
       size_pending: 0,
       locale: "",
-      error: "读取游戏库失败：" + String(e),
+      error: t("读取游戏库失败：") + String(e),
       error_kind: "unknown",
     };
   }
@@ -350,7 +361,7 @@ async function boot() {
       cachedAt: mine.ts,
       loading: false,
       error: {
-        message: r.error ?? "读取游戏库失败",
+        message: r.error ?? t("读取游戏库失败"),
         kind: (r.error_kind as LibraryFailure["kind"]) || "unknown",
       },
     });
@@ -359,7 +370,7 @@ async function boot() {
       games: [],
       loading: false,
       error: {
-        message: r.error ?? "未知错误",
+        message: r.error ?? t("未知错误"),
         kind: (r.error_kind as LibraryFailure["kind"]) || "unknown",
       },
     });
@@ -420,7 +431,7 @@ export async function refreshLibrary(force = false) {
       // Keep the cached list visible with a banner instead of wiping it.
       games: mine?.games ?? [],
       error: {
-        message: r.error ?? "读取游戏库失败",
+        message: r.error ?? t("读取游戏库失败"),
         kind: (r.error_kind as LibraryFailure["kind"]) || "unknown",
       },
       loading: false,
@@ -474,7 +485,7 @@ export const actions = {
       setProgress(appName, {
         state: "starting",
         percent: -1,
-        message: "正在准备…",
+        message: t("正在准备…"),
         speed: "",
         eta: "",
       });
@@ -482,12 +493,39 @@ export const actions = {
     return r;
   },
   async cancel(appName: string) {
-    const r = await cancelInstall(appName);
+    // delete=true: clear the partial download so a retry starts over.
+    const r = await cancelInstall(appName, true);
     if (r.ok) {
       setProgress(appName, {
         state: "cancelled",
         percent: 0,
-        message: "已取消",
+        message: t("已取消"),
+        speed: "",
+        eta: "",
+      });
+    }
+    return r;
+  },
+  async pause(appName: string) {
+    const r = await pauseInstall(appName);
+    if (r.ok) {
+      setProgress(appName, {
+        state: "paused",
+        percent: 0,
+        message: t("已暂停"),
+        speed: "",
+        eta: "",
+      });
+    }
+    return r;
+  },
+  async resume(appName: string, dir = "") {
+    const r = await resumeInstall(appName, dir);
+    if (r.ok) {
+      setProgress(appName, {
+        state: "starting",
+        percent: -1,
+        message: t("正在继续…"),
         speed: "",
         eta: "",
       });

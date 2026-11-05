@@ -30,6 +30,11 @@ import sys
 import time
 
 PLAN_TIMEOUT = 120.0  # seconds; the plan call also does a version check
+# Per-game launch log cap. A single launch rarely writes more than a few KB,
+# so 256 KB is generous headroom; once exceeded, the current file is rotated
+# to `<name>.log.1` (keeping only the previous generation) and a fresh file
+# starts. Worst case on disk is 2 * LOG_LIMIT = 512 KB per game. This keeps
+# every game's log bounded regardless of how many times it is launched.
 LOG_LIMIT = 256 * 1024
 
 # Legendary appends Epic's EGL arguments to the game command line, and they

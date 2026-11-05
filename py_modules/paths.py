@@ -92,6 +92,23 @@ def ensure_dir(path: str):
     return os.path.realpath(target), ""
 
 
+def plugin_dir() -> str:
+    """The installed plugin directory (``~/homebrew/plugins/<Name>``).
+
+    Decky puts binaries declared in `package.json`'s `remote_binary` here, under
+    `bin/`; that copy is what store installs should use, because it is the one
+    the loader verified against the declared SHA-256.
+    """
+    try:
+        import decky
+
+        return getattr(decky, "DECKY_PLUGIN_DIR", "") or os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))
+        )
+    except Exception:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def runtime_dir() -> str:
     """Writable per-plugin data dir (``~/homebrew/data/<Name>``).
 

@@ -18,10 +18,13 @@
 import { findInReactTree, getReactRoot } from "@decky/ui";
 import { FaGamepad } from "react-icons/fa";
 import { LIBRARY_ROUTE } from "./routes";
+import { t } from "./i18n";
 
 const PATCH_MARK = "__EPICDECK_STEAM_MENU_PATCHED";
 const PATCH_ORIG = "__EPICDECK_STEAM_MENU_ORIG";
-const ENTRY_LABEL = "EpicDeck 游戏库";
+// A function, not a constant: the label is read while the menu renders, and a
+// module-level t() would freeze whichever language was active at import time.
+const entryLabel = () => t("EpicDeck 游戏库");
 
 type AnyFn = (...args: any[]) => any;
 
@@ -145,7 +148,7 @@ function createMenuPatch(): (() => void) | null {
               <MenuEntry
                 key="epicdeck-library"
                 route={LIBRARY_ROUTE}
-                label={ENTRY_LABEL}
+                label={entryLabel()}
                 onGamepadFocus={sample.props.onGamepadFocus}
                 onFocus={sample.props.onFocus}
                 MenuItemComponent={sample.type}

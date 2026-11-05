@@ -7,7 +7,8 @@
 import { Focusable, ProgressBar, ScrollPanel, ScrollPanelGroup } from "@decky/ui";
 import { useState, useRef, type CSSProperties, type ReactNode } from "react";
 import { FaExclamationTriangle, FaGamepad, FaRedo } from "react-icons/fa";
-import { STATE_LABEL, isActive, type InstallProgress, type LibraryFailure } from "./api";
+import { STATE_LABEL, fmtSize, isActive, type InstallProgress, type LibraryFailure } from "./api";
+import { t } from "./i18n";
 
 // Steam's Focusable swaps in its own class when gamepad focus lands on an
 // element, so every highlight has to live in CSS — inline styles cannot react
@@ -377,10 +378,19 @@ export function ProgressInline({
         }}
       >
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {STATE_LABEL[progress.state] ?? "处理中"}
+          {t(STATE_LABEL[progress.state] ?? "") || t("处理中")}
           {progress.message ? " · " + progress.message : ""}
         </span>
-        {progress.percent >= 0 && <span>{progress.percent.toFixed(1)}%</span>}
+        <span style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
+          {progress.downloaded_bytes != null && progress.total_bytes ? (
+            <>
+              {fmtSize(progress.downloaded_bytes)} / {fmtSize(progress.total_bytes)}
+              {progress.percent >= 0 ? ` · ${progress.percent.toFixed(1)}%` : ""}
+            </>
+          ) : progress.percent >= 0 ? (
+            `${progress.percent.toFixed(1)}%`
+          ) : null}
+        </span>
       </div>
       <ProgressBar
         nProgress={progress.percent >= 0 ? progress.percent : 0}
@@ -390,7 +400,7 @@ export function ProgressInline({
         <div style={{ fontSize: compact ? "0.72em" : "0.8em", opacity: 0.6, marginTop: "4px" }}>
           {progress.speed}
           {progress.speed && progress.eta ? " · " : ""}
-          {progress.eta ? "剩余 " + progress.eta : ""}
+          {progress.eta ? t("剩余 ") + progress.eta : ""}
         </div>
       )}
     </div>
@@ -422,7 +432,7 @@ export function WarningBanner({ text, onRetry }: { text: string; onRetry?: () =>
           className="ed-chip"
           style={{ padding: "4px 10px", fontSize: "0.95em", whiteSpace: "nowrap" }}
         >
-          重试
+          {t('重试')}
         </Focusable>
       )}
     </div>
@@ -436,16 +446,16 @@ export function WarningBanner({ text, onRetry }: { text: string; onRetry?: () =>
 export function errorCopy(error: LibraryFailure) {
   const title =
     error.kind === "network"
-      ? "连不上 Epic 服务器"
+      ? t("连不上 Epic 服务器")
       : error.kind === "auth"
-      ? "登录状态已失效"
-      : "读取游戏库失败";
+      ? t("登录状态已失效")
+      : t("读取游戏库失败");
   const hint =
     error.kind === "network"
-      ? "请确认掌机已联网、代理（如有）可用；Epic 服务器偶发不稳定，稍后重试通常就好。"
+      ? t("请确认掌机已联网、代理（如有）可用；Epic 服务器偶发不稳定，稍后重试通常就好。")
       : error.kind === "auth"
-      ? "凭证可能已过期或被吊销，请到「设置 → 账号」重新登录。"
-      : "可以重试一次；若反复失败，请到「设置 → 维护」导出诊断日志。";
+      ? t("凭证可能已过期或被吊销，请到「设置 → 账号」重新登录。")
+      : t("可以重试一次；若反复失败，请到「设置 → 维护」导出诊断日志。");
   return { title, hint };
 }
 
@@ -511,7 +521,7 @@ export function ErrorBlock({
         data-disabled={retrying ? "true" : "false"}
         style={{ marginTop: "14px", padding: "10px 18px", width: "fit-content", fontSize: "0.95em" }}
       >
-        <FaRedo /> {retrying ? "正在重试…" : "重试"}
+        <FaRedo /> {retrying ? t("正在重试…") : t("重试")}
       </Focusable>
     </div>
   );
@@ -553,7 +563,7 @@ export function activeLabel(progress?: InstallProgress): { text: string; color: 
   if (!progress || !isActive(progress)) return null;
   return {
     text:
-      (STATE_LABEL[progress.state] ?? "下载中") +
+      (t(STATE_LABEL[progress.state] ?? "") || t("下载中")) +
       (progress.percent >= 0 ? " " + progress.percent.toFixed(0) + "%" : ""),
     color: "#4aa3ff",
   };

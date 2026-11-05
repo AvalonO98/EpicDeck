@@ -19,9 +19,21 @@ import { QamPanel } from "./qam";
 import { LIBRARY_ROUTE } from "./routes";
 import { moveFocus } from "./geomnav";
 import { installSteamMenuEntry, setSteamMenuEntryEnabled } from "./steammenu";
+import { t, useLangVersion } from "./i18n";
+import { bootstrapLang } from "./langboot";
+
+// Re-renders on language change so the QAM header follows the setting, which is
+// read asynchronously after the plugin loads.
+function QamTitle() {
+  useLangVersion();
+  return <div className={staticClasses.Title}>{t("EpicDeck · Epic 游戏库")}</div>;
+}
 
 export default definePlugin(() => {
   console.log("EpicDeck frontend initializing");
+
+  // Pick the UI language once; a late answer simply re-renders the roots.
+  void bootstrapLang();
 
   // A route (not a modal) is what makes the page take over the whole screen:
   // Steam renders it in the same router as its own pages, so the B button,
@@ -57,7 +69,7 @@ export default definePlugin(() => {
 
   return {
     name: "EpicDeck",
-    titleView: <div className={staticClasses.Title}>EpicDeck · Epic 游戏库</div>,
+    titleView: <QamTitle />,
     content: (
       <>
         <FocusStyles />

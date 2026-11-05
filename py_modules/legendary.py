@@ -21,6 +21,45 @@ import shlex
 import shutil
 import time
 
+# 体积数据的合理性下限。真实游戏不可能只有几字节,但 Epic 对部分 GOTY/合集条目
+# 返回的是**残缺 manifest**:`disk_size`/`download_size` 有值、却小得荒谬
+# (实测《龙腾世纪:审判》年度版 `verdi` 是 disk_size=4、download_size=1109、
+# num_files=1、tag_disk_size=[])。旧代码只判「非 0 就算有效」,于是这个 4 字节
+# 被当成真实体积写进缓存,详情页显示 4 B,兜底逻辑(du 实测 / 体积未知)永远不触发。
+# 1 MiB 是安全门槛:最小的独立游戏也有几十 MB。
+MIN_PLAUSIBLE_SIZE = 1024 * 1024
+
+
+def plausible_size(value) -> int:
+    """体积字段转 int,低于 MIN_PLAUSIBLE_SIZE 的一律当 0(无效)。
+
+    调用方据此判断「这份 manifest 能不能用」,不要拿 4 字节当真实体积。
+    """
+    try:
+        size = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return size if size >= MIN_PLAUSIBLE_SIZE else 0
+
+
+
+def _legendary_home() -> str:
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+
+
+def _installed_path(app_name: str) -> str:
+    """`install_path` for an installed title, straight from installed.json."""
+    path = os.path.join(_legendary_home(), "legendary", "installed.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    entry = data.get(app_name) if isinstance(data, dict) else None
+    if isinstance(entry, dict):
+        return str(entry.get("install_path") or "")
+    return ""
+
 
 class LegendaryError(Exception):
     pass
@@ -88,11 +127,34 @@ class Legendary:
         self.env_prefix = env_prefix
 
     def _resolve(self):
-        """Locate the legendary binary: absolute path, then PATH, then bundled dir."""
+        """Locate the legendary binary.
+
+        Order matters for store installs: Decky downloads the binary declared in
+        `package.json`'s `remote_binary` into `<plugin>/bin/`, and that copy is
+        the one the loader hash-checked. The runtime copy (written by our own
+        installer) is the fallback for sideloaded/scp deployments, where Decky
+        never runs the remote_binary step.
+        """
         # 1. Explicit absolute path.
         if self.binary and os.path.isabs(self.binary) and os.path.isfile(self.binary):
             return self.binary
-        # 2. Bundled user dir (where the installer puts it).
+        # 2. Decky's remote_binary download.
+        try:
+            from py_modules.paths import plugin_dir
+
+            declared = os.path.join(plugin_dir(), "bin", "legendary")
+            if os.path.isfile(declared):
+                # Decky normally chmods what it downloads; be forgiving if a
+                # manual copy lost the execute bit.
+                if not os.access(declared, os.X_OK):
+                    try:
+                        os.chmod(declared, 0o755)
+                    except OSError:
+                        pass
+                return declared
+        except Exception:
+            pass
+        # 3. Bundled user dir (where our installer puts it).
         try:
             from py_modules.legendary_installer import default_install_dir
             bundled = os.path.join(default_install_dir(), "legendary")
@@ -100,7 +162,7 @@ class Legendary:
                 return bundled
         except Exception:
             pass
-        # 3. On PATH.
+        # 4. On PATH.
         exe = shutil.which(self.binary)
         if exe:
             return exe
@@ -303,7 +365,13 @@ class Legendary:
             result.append(
                 {
                     "app_name": app_name,
+                    # `title` is what the UI shows and gets overlaid with a
+                    # localised name; `source_title` keeps Epic's own (English)
+                    # title so switching language never needs a refetch.
                     "title": g.get("app_title")
+                    or metadata.get("title")
+                    or app_name,
+                    "source_title": g.get("app_title")
                     or metadata.get("title")
                     or app_name,
                     "version": ins.get("version", "") or g.get("version", ""),
@@ -373,13 +441,39 @@ class Legendary:
         `legendary list` never reports sizes: the only source is the build
         manifest, which `legendary info --json` fetches (a couple of MB each).
         That is why callers cache the result instead of asking per render.
+
+        GOTY/bundle entries sometimes expose no manifest for the platform
+        Legendary picks by default (`verdi` = Dragon Age: Inquisition GOTY is
+        one), and the answer is then `{"manifest": null}` rather than an error.
+        A second attempt names Windows explicitly before giving up, because
+        every current Epic build is Windows-only.
         """
-        data = await self._run_json("info", app_name, timeout=90.0)
+        sizes = await self._info_sizes(app_name, timeout=75.0)
+        if sizes:
+            return sizes
+        # Shorter second attempt: the page waits on this call.
+        sizes = await self._info_sizes(app_name, platform="Windows", timeout=45.0)
+        if sizes:
+            return sizes
+        return None
+
+    async def _info_sizes(self, app_name: str, platform: str = "", timeout: float = 120.0):
+        args = ["info", app_name]
+        if platform:
+            args += ["--platform", platform]
+        try:
+            data = await self._run_json(*args, timeout=timeout)
+        except LegendaryError:
+            return None
         if not isinstance(data, dict):
             return None
         manifest = data.get("manifest") or {}
-        disk = int(manifest.get("disk_size") or 0)
-        download = int(manifest.get("download_size") or 0)
+        if not isinstance(manifest, dict):
+            return None
+        # 4 字节、1109 字节这种「有值但荒谬」的残缺 manifest 必须当成没有,
+        # 否则调用方会把它缓存起来并显示成 4 B,兜底路径永远不会走。
+        disk = plausible_size(manifest.get("disk_size"))
+        download = plausible_size(manifest.get("download_size"))
         if not disk and not download:
             return None
         return {"download": download, "disk": disk}
@@ -415,8 +509,53 @@ class Legendary:
         return await self._run("uninstall", app_name, "-y", timeout=120.0)
 
     async def get_install_dir(self, app_name: str):
+        """Install path from Legendary's own bookkeeping.
+
+        Reading `installed.json` is instant and works offline, unlike
+        `legendary info` (which also fetches a manifest).
+        """
+        path = _installed_path(app_name)
+        if path:
+            return path
         try:
-            out = await self._run_json("info", app_name, timeout=30.0)
+            out = await self._run_json("info", app_name, timeout=60.0)
         except LegendaryError:
             return ""
         return out.get("install_path", "") if isinstance(out, dict) else ""
+
+    # -- cloud saves (HANDOFF 7.13.3) -------------------------------------
+    async def cloud_save_info(self, app_name: str):
+        """Whether a title supports Epic cloud saves, and where its saves live.
+
+        `legendary info --json` answers this directly (`cloud_saves_supported`,
+        `cloud_save_folder`), which is more reliable than guessing from the
+        manifest — GameBridge's `supports_cloud_saves` heuristic is unnecessary.
+        """
+        try:
+            info = await self._run_json("info", app_name, timeout=40.0)
+        except LegendaryError:
+            info = {}
+        game = info.get("game") if isinstance(info, dict) else None
+        game = game if isinstance(game, dict) else {}
+        record = self.installed_records().get(app_name) or {}
+        return {
+            "supported": bool(game.get("cloud_saves_supported")),
+            "mac_supported": bool(game.get("cloud_saves_supported_mac")),
+            "folder": str(game.get("cloud_save_folder") or ""),
+            "save_path": str(record.get("save_path") or ""),
+        }
+
+    async def sync_saves(self, app_name: str, mode: str = "sync", timeout: float = 240.0):
+        """Sync cloud saves. `mode` is one of sync / upload / download.
+
+        `-y` is a *global* flag and must precede the subcommand; `--accept-path`
+        is what stops Legendary from skipping a game whose save path has never
+        been set (with `-y` alone it logs "skipping due to --yes" and exits 0,
+        which would look like a successful sync that did nothing).
+        """
+        args = ["-y", "sync-saves", app_name, "--accept-path"]
+        if mode == "download":
+            args.append("--skip-upload")
+        elif mode == "upload":
+            args.append("--skip-download")
+        return await self._run(*args, timeout=timeout)
