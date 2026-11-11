@@ -106,7 +106,6 @@ const EN_BASE: Record<string, string> = {
   "数据位置": "Data locations",
   "诊断": "Diagnostics",
   "导出诊断日志": "Export diagnostic logs",
-  "重新安装Legendary": "Reinstall Legendary",
   "检查环境": "Check environment",
   "一键安装Legendary": "Install Legendary",
   "保存": "Save",

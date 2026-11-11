@@ -10,7 +10,7 @@
 // the two never re-runs `legendary list`.
 
 import { addEventListener, toaster } from "@decky/api";
-import { useSyncExternalStore } from "react";
+import { useCallback, useRef, useSyncExternalStore } from "react";
 import {
   authStatus,
   addToSteam,
@@ -56,6 +56,8 @@ export interface PluginState {
   env: EnvironmentInfo;
   firstRunDone: boolean | null;
   booted: boolean;
+  /** true when the backend never answered `auth_status` (we cannot tell). */
+  authUnknown: boolean;
 }
 
 // ---- library snapshot cache -------------------------------------------
@@ -142,6 +144,7 @@ let state: PluginState = {
   env: { legendary_installed: true, legendary_path: "" },
   firstRunDone: null,
   booted: false,
+  authUnknown: false,
 };
 
 const listeners = new Set<() => void>();
@@ -175,6 +178,60 @@ function subscribe(listener: () => void) {
 /** Subscribe a component to the whole state object (stable between writes). */
 export function usePluginState(): PluginState {
   return useSyncExternalStore(subscribe, getPluginState, getPluginState);
+}
+
+/** Shallow equality for the small objects selectors return. */
+export function shallowEqual<T extends Record<string, unknown>>(a: T, b: T): boolean {
+  if (Object.is(a, b)) return true;
+  if (!a || !b) return false;
+  const ak = Object.keys(a);
+  if (ak.length !== Object.keys(b).length) return false;
+  for (const key of ak) {
+    if (!Object.is(a[key], b[key])) return false;
+  }
+  return true;
+}
+
+/**
+ * Subscribe to a *slice* of the store.
+ *
+ * `usePluginState()` re-renders on every write, and install progress is written
+ * 1–2 times per second. That made the shell, the library page and all 15 covers
+ * re-render during a download even though none of them displayed the numbers
+ * (audit 3.5). A selector whose result is cached per state snapshot — and
+ * compared with `isEqual` — keeps those components still while `progress`
+ * churns.
+ *
+ * The selector itself may be an inline closure: it is read through a ref, so a
+ * new identity each render does not invalidate the cache.
+ */
+export function usePluginSelector<T>(
+  selector: (s: PluginState) => T,
+  isEqual: (a: T, b: T) => boolean = Object.is
+): T {
+  const selectorRef = useRef(selector);
+  selectorRef.current = selector;
+  const equalRef = useRef(isEqual);
+  equalRef.current = isEqual;
+  const cacheRef = useRef<{ state: PluginState; value: T } | null>(null);
+
+  // Stable across renders: `useSyncExternalStore` is allowed to call this at any
+  // time and must get the same answer until the store actually changes.
+  const getSelection = useCallback(() => {
+    const current = getPluginState();
+    const cached = cacheRef.current;
+    if (cached && cached.state === current) return cached.value;
+    const next = selectorRef.current(current);
+    if (cached && equalRef.current(cached.value, next)) {
+      // Same value: hand back the *old* reference so React bails out.
+      cacheRef.current = { state: current, value: cached.value };
+      return cached.value;
+    }
+    cacheRef.current = { state: current, value: next };
+    return next;
+  }, []);
+
+  return useSyncExternalStore(subscribe, getSelection, getSelection);
 }
 
 const accountId = () => state.auth?.account_id || "";
@@ -240,6 +297,29 @@ function bindEvents() {
     }
   );
 
+  // 缓存落盘防抖：冷启动补标题/体积时后端可能连发几百个 patch，每次都
+  // `JSON.stringify(148 款)` + 同步 `localStorage.setItem`，会卡 Big Picture 的 UI 线程
+  // （第三轮审计 3.4）。1s trailing，页面隐藏时立即落盘。
+  let cacheTimer = 0;
+  const flushCache = () => {
+    cacheTimer = 0;
+    writeLibraryCache(accountId(), { games: state.games, locale: state.locale });
+  };
+  const scheduleCache = () => {
+    if (cacheTimer) return;
+    cacheTimer = window.setTimeout(flushCache, 1000);
+  };
+  try {
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden && cacheTimer) {
+        window.clearTimeout(cacheTimer);
+        flushCache();
+      }
+    });
+  } catch {
+    /* no document (tests) */
+  }
+
   // The backend patches titles/sizes in as it discovers them (localised title
   // first, then one manifest per game), so the list never blocks on 138
   // network round-trips. Playtime arrives through the same channel.
@@ -259,7 +339,7 @@ function bindEvents() {
         };
       });
       setPluginState({ games });
-      writeLibraryCache(accountId(), { games, locale: state.locale });
+      scheduleCache();
     }
     // A negative count means "this patch is not about sizes" (playtime).
     if (typeof remaining === "number" && remaining >= 0) {
@@ -286,7 +366,8 @@ function bindEvents() {
   });
 
   window.addEventListener("epicdeck:library-changed", () => {
-    void reloadGames();
+    // A settings change never invalidates ownership, so skip the network.
+    void reloadGames(false);
   });
 }
 
@@ -296,8 +377,17 @@ let bootPromise: Promise<void> | null = null;
 
 async function boot() {
   bindEvents();
+  // The fallback carries `__timeout` so callers can tell "the backend said no"
+  // from "the backend did not answer in time". Conflating them was destructive:
+  // a slow boot (SD card, Deck just woken) deleted the cached library and showed
+  // "请登录" until the user hit refresh (audit 2.1).
   const withTimeout = <T,>(p: Promise<T>, ms: number, fallback: T): Promise<T> =>
-    Promise.race([p, new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms))]);
+    Promise.race([
+      p,
+      new Promise<T>((resolve) =>
+        setTimeout(() => resolve({ ...(fallback as any), __timeout: true } as T), ms)
+      ),
+    ]);
 
   const [envResult, authResult, bootData] = await Promise.all([
     withTimeout(checkEnvironment(), 8000, {
@@ -315,9 +405,12 @@ async function boot() {
     ),
   ]);
 
+  const authUnknown = !!(authResult as any).__timeout;
   setPluginState({
     env: envResult,
-    auth: authResult,
+    // 超时说明"没问到"，不是"没登录"：保留上一次已知的登录态，别把用户丢回登录页。
+    auth: authUnknown ? state.auth : authResult,
+    authUnknown,
     dirs: bootData.dirs,
     defaultDir: bootData.settings.install_dir || bootData.current || "",
     // A backend that timed out reports {} — do not trap the user in the
@@ -353,6 +446,19 @@ async function boot() {
     });
 
   if (!authResult.logged_in) {
+    if ((authResult as any).__timeout) {
+      // We never got an answer — keep whatever is cached and say so, instead of
+      // wiping the library and pretending the account is signed out.
+      setPluginState({
+        loading: false,
+        error: {
+          kind: "unknown",
+          message: t("账号状态读取超时，请稍后点「刷新」重试"),
+        },
+      });
+      bootPromise = null; // allow a later ensureBoot() to retry
+      return;
+    }
     setPluginState({ games: [], loading: false, sizePending: 0, locale: "", cachedAt: 0 });
     clearLibraryCache();
     return;
@@ -435,14 +541,26 @@ export async function recheckEnv() {
 
 /** Idempotent: every surface calls this on mount, the work happens once. */
 export function ensureBoot(): Promise<void> {
-  if (!bootPromise) bootPromise = boot().catch((e) => console.log("EpicDeck: boot failed", e));
+  if (!bootPromise) {
+    bootPromise = boot().catch((e) => {
+      console.log("EpicDeck: boot failed", e);
+      // Without this the page stayed on its loading skeleton forever whenever
+      // one callable rejected outside the per-call timeouts.
+      setPluginState({
+        loading: false,
+        booted: true,
+        error: { message: String(e).slice(0, 160), kind: "unknown" },
+      });
+    });
+  }
   return bootPromise;
 }
 
-export async function reloadGames() {
-  // After an install the cached snapshot still says "not installed" (and with
-  // stale:false, so the UI cannot even warn). Ask for a fresh list.
-  const r = await listGames(true);
+export async function reloadGames(force = true) {
+  // `force` re-downloads the entitlement list (~20 s); pass false when only
+  // the rendering changed (language, filter, Proton) and the cached snapshot
+  // is still valid — the backend re-picks titles for the new locale itself.
+  const r = await listGames(force);
   if (r.ok) applyPayload(r);
 }
 
@@ -454,29 +572,39 @@ export async function refreshLibrary(force = false) {
   // Only block the UI when there is nothing cached to show.
   if (readLibraryCache() === null) setPluginState({ loading: true });
   setPluginState({ refreshing: true });
-  const a = await authStatus();
-  setPluginState({ auth: a });
-  if (!a.logged_in) {
-    setPluginState({ games: [], error: null, loading: false, refreshing: false });
-    clearLibraryCache();
-    return;
-  }
-  const r = await listGames(force);
-  if (r.ok) {
-    applyPayload(r);
-  } else {
-    const mine = readLibraryCache(a.account_id);
+  try {
+    const a = await authStatus();
+    setPluginState({ auth: a });
+    if (!a.logged_in) {
+      setPluginState({ games: [], error: null, loading: false });
+      clearLibraryCache();
+      return;
+    }
+    const r = await listGames(force);
+    if (r.ok) {
+      applyPayload(r);
+    } else {
+      const mine = readLibraryCache(a.account_id);
+      setPluginState({
+        // Keep the cached list visible with a banner instead of wiping it.
+        games: mine?.games ?? [],
+        error: {
+          message: r.error ?? t("读取游戏库失败"),
+          kind: (r.error_kind as LibraryFailure["kind"]) || "unknown",
+        },
+        loading: false,
+      });
+    }
+  } catch (e) {
+    // A rejected callable used to leave `refreshing` true forever, disabling
+    // the refresh button with no way back.
     setPluginState({
-      // Keep the cached list visible with a banner instead of wiping it.
-      games: mine?.games ?? [],
-      error: {
-        message: r.error ?? t("读取游戏库失败"),
-        kind: (r.error_kind as LibraryFailure["kind"]) || "unknown",
-      },
+      error: { message: String(e).slice(0, 160), kind: "unknown" },
       loading: false,
     });
+  } finally {
+    setPluginState({ refreshing: false });
   }
-  setPluginState({ refreshing: false });
 }
 
 export async function reloadDirs() {
@@ -579,11 +707,14 @@ export const actions = {
     return r;
   },
   async pause(appName: string) {
+    // Keep how far it got: "已暂停 60%" is useful, "已暂停 0%" looks like the
+    // download was thrown away (audit 2.5).
+    const before = state.progress[appName]?.percent ?? 0;
     const r = await pauseInstall(appName);
     if (r.ok) {
       setProgress(appName, {
         state: "paused",
-        percent: 0,
+        percent: before > 0 ? before : 0,
         message: t("已暂停"),
         speed: "",
         eta: "",
@@ -632,17 +763,3 @@ export const actions = {
   },
   refreshSteam,
 };
-
-/** Games currently downloading / verifying, newest first by name. */
-export function activeDownloads(progress: Record<string, InstallProgress>): string[] {
-  return Object.keys(progress).filter((k) => {
-    const p = progress[k];
-    return (
-      p.state === "starting" ||
-      p.state === "downloading" ||
-      p.state === "verifying" ||
-      p.state === "patching" ||
-      p.state === "prereq"
-    );
-  });
-}

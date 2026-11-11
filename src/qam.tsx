@@ -58,7 +58,7 @@ function MissingDependency({ onInstalled }: { onInstalled: () => void }) {
         <div style={{ padding: "12px 0" }}>
           <p>{t('未检测到 Legendary(SteamOS 无 pip,无法用 pip 安装)。')}</p>
           <p style={{ opacity: 0.7, fontSize: "0.85em" }}>
-            {t('点击下方按钮,将自动从 GitHub Releases 下载官方独立二进制(约 3 MB,无需 Python)。')}
+            {t('点击下方按钮,将自动从 GitHub Releases 下载官方独立二进制(约 14 MB,无需 Python)。')}
           </p>
         </div>
       </PanelSectionRow>
@@ -272,7 +272,7 @@ function QuickPanel({ onLogout, onSwitchAccount }: { onLogout: () => void; onSwi
               <div style={{ fontWeight: 700, fontSize: "0.98em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {auth?.display_name || t("Epic 账号")}
               </div>
-              <div style={{ fontSize: "0.76em", opacity: 0.55, marginTop: "1px" }}>
+              <div style={{ fontSize: "0.84em", opacity: 0.55, marginTop: "1px" }}>
                 {tf("共 {0} 个 · 已安装 {1}", games.length, installed)}
                 {cachedAt ? tf(" · {0}更新", fmtAgo(cachedAt)) : ""}
               </div>
@@ -354,7 +354,7 @@ function QuickPanel({ onLogout, onSwitchAccount }: { onLogout: () => void; onSwi
 
       <PanelSection>
         <PanelSectionRow>
-          <div style={{ fontSize: "0.74em", opacity: 0.45, lineHeight: 1.5, display: "flex", alignItems: "center", gap: "6px" }}>
+          <div style={{ fontSize: "0.82em", opacity: 0.45, lineHeight: 1.5, display: "flex", alignItems: "center", gap: "6px" }}>
             <FaSteamSymbol /> {t('添加进 Steam 的游戏会带封面，重启 Steam 后出现在「非 Steam 游戏」里')}
           </div>
         </PanelSectionRow>
@@ -365,7 +365,7 @@ function QuickPanel({ onLogout, onSwitchAccount }: { onLogout: () => void; onSwi
 
 export function QamPanel() {
   useLangVersion();
-  const { auth, env, firstRunDone, booted, games, dirs } = usePluginState();
+  const { auth, authUnknown, env, firstRunDone, booted, games, dirs } = usePluginState();
   const [booting, setBooting] = useState(!booted);
 
   useEffect(() => {
@@ -414,8 +414,41 @@ export function QamPanel() {
     return <FirstRunView dirs={dirs} onDone={(path) => markFirstRunDone(path)} />;
   }
 
+  if (authUnknown && !auth?.logged_in) {
+    // 后端没回答 ≠ 未登录：别把用户推到登录页（复审 2.1 收尾）。
+    return (
+      <PanelSection>
+        <PanelSectionRow>
+          <ButtonItem layout="below" label={t("无法确认登录状态")}
+            description={t("账号状态读取超时，请稍后点「刷新」重试")}
+            onClick={() => void onSignedIn()}>
+            {t("重试")}
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
   if (!auth?.logged_in) {
-    return <LoginPanel onLoggedIn={() => void onSignedIn()} />;
+    // Signing in is when the network or Legendary install is usually broken,
+    // so the panel must not be a dead end: settings stay one press away.
+    return (
+      <>
+        <LoginPanel onLoggedIn={() => void onSignedIn()} />
+        <PanelSection>
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              label={t("设置与诊断")}
+              description={t("网络、语言、安装目录、导出日志")}
+              onClick={() => openFullScreen("settings")}
+            >
+              <FaCog />
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      </>
+    );
   }
 
   return <QuickPanel onLogout={logout} onSwitchAccount={switchAccountAction} />;

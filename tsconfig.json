@@ -6,6 +6,15 @@
     "jsx": "react-jsx",
     "declaration": false,
     "moduleResolution": "node",
+    // @decky/api's own types import "react-router", which is not a dependency
+    // here (webpack supplies it at runtime). Without skipLibCheck that single
+    // reference fails the whole typecheck (审计 5.2).
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      // The installed react-icons has no .d.ts; see src/types/react-icons-fa.d.ts.
+      "react-icons/fa": ["src/types/react-icons-fa.d.ts"]
+    },
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "esModuleInterop": true,

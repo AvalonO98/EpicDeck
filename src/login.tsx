@@ -22,6 +22,7 @@ import {
   startPhoneLogin,
 } from "./api";
 import { t } from "./i18n";
+import { COLOR } from "./tokens";
 
 function QrImage({ url }: { url: string }) {
   const [dataUrl, setDataUrl] = useState<string>("");
@@ -227,7 +228,7 @@ export function LoginPanel({
             <div
               style={{
                 fontFamily: "monospace",
-                fontSize: "0.78em",
+                fontSize: "0.84em",
                 background: "rgba(0,0,0,0.35)",
                 padding: "10px",
                 borderRadius: "6px",
@@ -242,12 +243,12 @@ export function LoginPanel({
               {t('看到这段 JSON 就说明登录成功了，插件会自己把授权码取走。')}
             </div>
             <div style={{ marginTop: "8px" }}>
-              {t('请稍等约 15 秒，确保授权码被完整读取。')}
+              {t('请稍等约 20~30 秒，确保授权码被完整读取。')}
             </div>
             <div style={{ marginTop: "8px" }}>
               {t('第一次登录可能因网络较慢，若长时间没出现代码，可关闭浏览器重新登录。')}
             </div>
-            <div style={{ marginTop: "8px", fontWeight: 600, color: "#9ecbff" }}>
+            <div style={{ marginTop: "8px", fontWeight: 600, color: COLOR.accentSoft }}>
               {t('然后再按 B 键关掉浏览器，回到插件即可。')}
             </div>
           </div>
@@ -345,6 +346,20 @@ export function LoginPanel({
     }
   };
 
+  // The QR screen starts a LAN listener that accepts an authorization code.
+  // Leaving the screen used to leave it running for its full 10-minute timeout,
+  // so anyone on the same network could still sign this Deck in.
+  useEffect(() => {
+    if (showCode) return;
+    if (!phoneMode) return;
+    setPhoneMode(false);
+    setPhoneUrl("");
+    void cancelLogin().catch(() => {
+      /* the server may already be gone */
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showCode, phoneMode]);
+
   // The code is sitting in the clipboard after step 3; the backend reads X11
   // CLIPBOARD itself, so the user never has to paste it anywhere.
   const loginFromClipboard = async () => {
@@ -394,7 +409,7 @@ export function LoginPanel({
           <PanelSectionRow>
             <div
               style={{
-                fontSize: "0.78em",
+                fontSize: "0.84em",
                 opacity: 0.75,
                 wordBreak: "break-all",
                 textAlign: "center",
@@ -406,7 +421,7 @@ export function LoginPanel({
         ) : null}
         {phoneMode && session && session.state === "waiting" ? (
           <PanelSectionRow>
-            <div style={{ padding: "6px 0", fontSize: "0.88em", lineHeight: 1.5, color: "#9ecbff" }}>
+            <div style={{ padding: "6px 0", fontSize: "0.88em", lineHeight: 1.5, color: COLOR.accentSoft }}>
               {session.message || t("等待手机完成登录…（这个页面别关）")}
             </div>
           </PanelSectionRow>
@@ -454,7 +469,7 @@ export function LoginPanel({
         <PanelSectionRow>
           <div
             style={{
-              fontSize: "0.78em",
+              fontSize: "0.84em",
               opacity: 0.75,
               wordBreak: "break-all",
               textAlign: "center",
@@ -525,13 +540,13 @@ export function LoginPanel({
         </PanelSectionRow>
         {session.message ? (
           <PanelSectionRow>
-            <div style={{ padding: "4px 0", fontSize: "0.88em", lineHeight: 1.5, color: "#9ecbff" }}>
+            <div style={{ padding: "4px 0", fontSize: "0.88em", lineHeight: 1.5, color: COLOR.accentSoft }}>
               {session.message}
             </div>
           </PanelSectionRow>
         ) : null}
         <PanelSectionRow>
-          <div style={{ padding: "2px 0 6px", fontSize: "0.78em", lineHeight: 1.55, opacity: 0.55 }}>
+          <div style={{ padding: "2px 0 6px", fontSize: "0.84em", lineHeight: 1.55, opacity: 0.55 }}>
             {t('没反应？可重新打开登录页，或改用手机扫码 / 手动粘贴授权码。')}
           </div>
         </PanelSectionRow>

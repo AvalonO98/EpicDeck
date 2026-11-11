@@ -231,6 +231,24 @@ def _posix_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
+_APP_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _safe_app_id(app_name: str) -> str:
+    """Validate an Epic `app_name` before it becomes a path component.
+
+    The value comes from Epic's API, but it is concatenated into
+    `launchers/<app_name>.sh`, `proton/<app_name>.sh` and log filenames. A
+    compromised or malformed response containing `../` would write outside the
+    plugin's directories, so only the character set Epic actually uses is
+    accepted.
+    """
+    name = str(app_name or "").strip()
+    if not name or len(name) > 200 or not _APP_ID_RE.match(name):
+        raise ValueError("非法的游戏标识: %r" % (name[:60],))
+    return name
+
+
 def _valid_game_row(row) -> bool:
     """A library row we can render without blowing up.
 
@@ -271,6 +289,7 @@ def _parse_size(value: str, unit: str):
 
 class Plugin:
     async def _main(self):
+        started = time.monotonic()
         decky.logger.info("EpicDeck loaded")
 
         settings_dir = getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", None) or getattr(decky, "DECKY_SETTINGS_DIR", None) or os.path.join(decky.HOME, ".epicdeck")
@@ -297,9 +316,20 @@ class Plugin:
         # app_name -> latest progress snapshot. Events alone are not enough: a UI
         # opened after they were emitted would show nothing (7.17).
         self._live_progress = {}
+        # app_name -> last non-negative percent. The snapshot is popped as soon
+        # as the tailer stops, but a paused download should still show how far
+        # it got instead of "0% / 已暂停" (audit 2.5).
+        self._last_percent = {}
         # app_name set of installs being soft-paused (vs cancelled outright);
         # the _run() cancellation handler checks this to emit the right state.
         self._pausing = set()
+        # app_name -> the folder legendary actually chose for this install
+        # ("Install path: ..." in its log). Needed by "cancel and delete":
+        # legendary names the folder after the *title* (DREDGEmKMzx), so
+        # guessing `<base>/<app_name>` misses it, and `installed.json` only gets
+        # an entry once legendary gets that far. Loaded lazily from config so a
+        # backend restart mid-download can still clean up.
+        self._install_paths = None
         # Background waiters for games started from the plugin, so a finished
         # game does not stay a zombie while the callable returns immediately.
         self._launch_reapers = set()
@@ -322,6 +352,17 @@ class Plugin:
         self._lib_account = ""
         self._lib_task = None
         self._playtime_task = None
+        # Upgraded configs predate `first_run_done`, so the first-run wizard
+        # popped up again for users who had been using the plugin for weeks.
+        # An install directory (or an existing config) is proof enough.
+        try:
+            if "first_run_done" not in self.config._data:
+                if self.config.get("install_dir"):
+                    self.config.set("first_run_done", True)
+                    decky.logger.info("first_run_done migrated from install_dir")
+        except Exception as e:  # noqa: BLE001 - never block startup
+            decky.logger.debug("first_run_done migration skipped: %s", e)
+
         self._load_library_cache()
 
         # Shortcuts created by older versions lack the locale export and the
@@ -346,10 +387,13 @@ class Plugin:
         except Exception as e:  # noqa: BLE001 - adoption must never block startup
             decky.logger.warning("adopt external installs failed: %s", e)
 
+        decky.logger.info("EpicDeck ready in %.2fs", time.monotonic() - started)
+
     async def _unload(self):
         # Flip the flag first: background jobs check it before each emit / write,
         # so nothing from this instance touches the cache once we are gone.
         self._unloaded = True
+        self._unload_started = time.monotonic()
         for task in getattr(self, "_install_tasks", {}).values():
             if not task.done():
                 task.cancel()
@@ -357,8 +401,16 @@ class Plugin:
             task = getattr(self, name, None)
             if task is not None and not task.done():
                 task.cancel()
-        await self._stop_login_session()
-        decky.logger.info("EpicDeck unloaded")
+        # A stuck login session (local HTTP server / browser login polling) must
+        # not block the unload: Decky kills the service after ~5s and the next
+        # start then races a half-stopped process (review #11).
+        try:
+            await asyncio.wait_for(self._stop_login_session(), timeout=3.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            decky.logger.warning("stop_login_session timed out on unload")
+        except Exception as e:  # noqa: BLE001
+            decky.logger.warning("stop_login_session failed on unload: %s", e)
+        decky.logger.info("EpicDeck unloaded in %.2fs", time.monotonic() - self._unload_started)
         # Decky treats a falsy return as "keep the plugin running".
         return True
 
@@ -559,7 +611,20 @@ class Plugin:
         self._login_state["state"] = "finishing"
         self._login_state["message"] = "已收到授权码，正在登录…"
         decky.logger.info("phone login code received")
-        result = await self.login_with_code(code)
+        try:
+            result = await self.login_with_code(code)
+        except Exception as e:  # noqa: BLE001
+            # Writing user.json can fail (disk full / read-only / concurrent
+            # write). Without this the task died and left the state on
+            # "finishing", so the phone page span forever (audit 3.10).
+            decky.logger.error("phone login failed: %s", e)
+            self._login_state = {
+                "state": "error",
+                "message": "登录失败: %s" % str(e)[:120],
+                "display_name": "",
+                "auto_copied": False,
+            }
+            return
         if result.get("ok"):
             self._login_state = {
                 "state": "ok",
@@ -639,10 +704,11 @@ class Plugin:
 
         code = extract_authorization_code(raw)
         if not code:
-            preview = raw.strip()[:80].replace("\n", " ")
+            # Never echo the clipboard: it may hold a password or a private
+            # message, and this string is rendered in the QAM panel.
             return {
                 "ok": False,
-                "error": "剪贴板内容里没有授权码（读到：%s…）。请复制登录后显示的那整段内容。" % preview,
+                "error": "剪贴板内容里没有授权码。请复制登录后显示的那整段内容。",
             }
 
         result = await self.login_with_code(code)
@@ -851,7 +917,16 @@ class Plugin:
                     if watch.idle_seconds() >= 6.0 and await self._auto_copy_async():
                         await asyncio.sleep(0.6)
                         text = await self._read_clipboard_async()
-                        if text and extract_authorization_code(text):
+                        # A code that was already on the clipboard when the
+                        # session started belongs to the previous attempt;
+                        # redeeming it fails with "code not found" and looks
+                        # like the plugin is broken. Only a *new* value counts.
+                        if (
+                            text
+                            and text != baseline
+                            and text != last_clip
+                            and extract_authorization_code(text)
+                        ):
                             raw = text
                             last_clip = text
                             self._login_state["auto_copied"] = True
@@ -1025,6 +1100,23 @@ class Plugin:
     async def _fetch_library(self, force: bool = False):
         """Hit Epic and build a fresh game list (slow path, network involved)."""
         games = await self.legendary.list_games(force=force)
+
+        # A game bought while the plugin is running was never seen by the
+        # one-shot metadata pass or the artwork cache, so it kept showing
+        # "size unknown" and got no cover. Reset both when the set grows.
+        previous_names = {
+            g.get("app_name")
+            for g in (getattr(self, "_lib_cache", None) or [])
+            if isinstance(g, dict)
+        }
+        current_names = {g.get("app_name") for g in games if isinstance(g, dict)}
+        if previous_names and current_names - previous_names:
+            decky.logger.info(
+                "library gained %d new app(s), refreshing metadata",
+                len(current_names - previous_names),
+            )
+            self._meta_done = False
+            self._image_cache = None
 
         # Epic exposes no "date added", so we record when each title first
         # showed up in this plugin's library. Everything seen on the first run
@@ -1463,11 +1555,17 @@ class Plugin:
             if processed % 25 == 0:
                 self._save_titles(locale, dict(added), misses)
                 if added:
-                    await decky.emit("library_patch", dict(added), 0)
+                    # The UI patches `patch[app].title`; sending a bare string
+                    # meant every patch was silently ignored (audit 3.7).
+                    await decky.emit(
+                        "library_patch", {k: {"title": v} for k, v in added.items()}, 0
+                    )
                     added.clear()
         if added:
             self._save_titles(locale, added, misses)
-            await decky.emit("library_patch", dict(added), 0)
+            await decky.emit(
+                "library_patch", {k: {"title": v} for k, v in added.items()}, 0
+            )
         else:
             self.config.set("title_misses", misses)
 
@@ -1500,7 +1598,9 @@ class Plugin:
                     cached.update(got)
                     cache[locale] = cached
                     self.config.set("title_cache", cache)
-                    await decky.emit("library_patch", got, 0)
+                    await decky.emit(
+                        "library_patch", {k: {"title": v} for k, v in got.items()}, 0
+                    )
                     decky.logger.info("localized titles: %d added for %s", len(got), locale)
         except asyncio.CancelledError:
             raise
@@ -1627,6 +1727,8 @@ class Plugin:
     #: from a network blip, long enough not to re-fetch a 90 s manifest every
     #: time the panel opens.
     SIZE_FAIL_TTL = 6 * 3600
+    #: Retry window after the artwork metadata call failed (audit 3.9).
+    IMAGE_CACHE_RETRY = 10 * 60
 
     async def _measure_install(self, app_name: str) -> int:
         """Bytes actually used by an installed game, via `du`.
@@ -1709,6 +1811,16 @@ class Plugin:
     async def install(self, app_name: str, install_dir: str = ""):
         if app_name in self._install_tasks and not self._install_tasks[app_name].done():
             return {"ok": False, "error": "该游戏正在下载中"}
+        # A download inherited from a previous backend (only a pid, no task) is
+        # still writing into the same folder; starting another legendary there
+        # corrupts the .resume and truncates the log the old tailer reads.
+        if app_name in (getattr(self, "_external_pids", {}) or {}) or \
+                app_name in (getattr(self, "_install_procs", {}) or {}):
+            return {"ok": False, "error": "该游戏正在下载中"}
+        # A stale paused marker used to survive a cancel-then-resume cycle and
+        # made the *next* cancel read as a pause (audit 3.8).
+        self._pausing.discard(app_name)
+        self._forget_terminal(app_name)
         # Fail before the UI shows "开始下载": otherwise the row flips from
         # starting to error ~0.1s later and the user cannot tell what happened.
         if self.legendary._resolve() is None:
@@ -1735,6 +1847,19 @@ class Plugin:
                 return {"ok": False, "error": err}
             decky.logger.info("install %s: no dir configured, using %s", app_name, target)
 
+        # Remember where this title is being installed. `resume_install` and
+        # `cancel_install` otherwise fall back to the global default (or to
+        # Legendary's installed.json, which does not exist yet early in a
+        # download) and would resume into the wrong folder.
+        try:
+            targets = self.config.get("install_targets") or {}
+            if not isinstance(targets, dict):
+                targets = {}
+            targets[app_name] = target
+            self.config.set("install_targets", targets)
+        except OSError as e:
+            decky.logger.warning("install target save failed for %s: %s", app_name, e)
+
         async def _run():
             try:
                 await decky.emit("install_progress", app_name, "starting", 0.0, "")
@@ -1748,22 +1873,33 @@ class Plugin:
                 try:
                     if self.config.get("auto_add_to_steam") and await self._still_logged_in():
                         await self._add_to_steam(app_name, await self._installed_title(app_name))
+                    add_note = ""
                 except Exception as e:  # noqa: BLE001
                     # The install itself succeeded; a failed shortcut must not
-                    # turn it into an error — the user can retry from the detail
-                    # page (add_to_steam callable).
+                    # turn it into an error — but saying nothing leaves the user
+                    # with a game that cannot start from Steam ("sound, no
+                    # picture"), so surface it.
                     decky.logger.warning("add_to_steam after install failed: %s", e)
-                await decky.emit("install_progress", app_name, "done", 100.0, "")
+                    add_note = "已安装，但添加到 Steam 失败：%s" % str(e)[:120]
+                await decky.emit("install_progress", app_name, "done", 100.0, add_note)
+                self._last_percent.pop(app_name, None)
+                self._forget_terminal(app_name)
             except asyncio.CancelledError:
                 if app_name in self._pausing:
                     self._pausing.discard(app_name)
-                    await decky.emit("install_progress", app_name, "paused", 0.0, "已暂停，可稍后继续")
+                    paused_at = self._last_percent.pop(app_name, 0.0)
+                    await decky.emit("install_progress", app_name, "paused", paused_at,
+                                     "已暂停，可稍后继续")
+                    self._remember_terminal(app_name, "paused", paused_at, "已暂停，可稍后继续")
                 else:
-                    await decky.emit("install_progress", app_name, "cancelled", 0.0, "")
+                    await decky.emit("install_progress", app_name, "cancelled",
+                                     self._last_percent.pop(app_name, 0.0), "")
                 raise
             except Exception as e:
                 decky.logger.error("install %s: %s", app_name, e)
-                await decky.emit("install_progress", app_name, "error", 0.0, str(e))
+                err_percent = self._last_percent.pop(app_name, 0.0)
+                await decky.emit("install_progress", app_name, "error", err_percent, str(e))
+                self._remember_terminal(app_name, "error", err_percent, str(e))
 
         task = asyncio.create_task(_run())
         self._install_tasks[app_name] = task
@@ -1830,6 +1966,10 @@ class Plugin:
                 stdout=log_fh,
                 stderr=asyncio.subprocess.STDOUT,
                 env=self.legendary._env(),
+                # Its own process group: legendary forks download workers, and
+                # killing only the parent left them writing into a folder we
+                # had just deleted (measured 758 MB, 2026-11-10).
+                start_new_session=True,
             )
         except (OSError, PermissionError, FileNotFoundError) as e:
             raise LegendaryNotFound("无法启动 Legendary(%s): %s" % (exe, e))
@@ -1844,6 +1984,14 @@ class Plugin:
         finally:
             self._install_procs.pop(app_name, None)
             self._external_pids.pop(app_name, None)
+            # A cancelled task never reaches the tail of `_pump_install_log`,
+            # so the snapshot lived on and every later `get_active_installs()`
+            # resurrected a download that no longer existed (audit 3.2).
+            self._live_progress.pop(app_name, None)
+            # Cancellation only stops the coroutine; the child process keeps
+            # downloading unless it is told to stop (and then keeps recreating
+            # the folder we just deleted).
+            self._stop_process_tree(proc)
 
         if proc.returncode != 0:
             detail = last_error.strip()
@@ -1894,6 +2042,8 @@ class Plugin:
                 "total_bytes": total_bytes,
                 "external": bool(pid),
             }
+            if isinstance(percent, (int, float)) and percent >= 0:
+                self._last_percent[app_name] = float(percent)
             await decky.emit(
                 "install_progress", app_name, state, percent, message, speed, eta,
                 downloaded_bytes, total_bytes,
@@ -1934,6 +2084,12 @@ class Plugin:
                 state = self._classify_activity(decoded)
                 if state:
                     batch_state = state
+                if "Install path:" in decoded:
+                    # legendary picks the folder name from the title, so this is
+                    # the only early, authoritative answer to "where is it going".
+                    chosen = decoded.split("Install path:", 1)[1].strip()
+                    if chosen:
+                        self._remember_install_path(app_name, chosen)
                 if "Progress:" in decoded:
                     message = self._strip_log_prefix(decoded)
             # One event per batch instead of one per line: legendary prints
@@ -2031,7 +2187,12 @@ class Plugin:
         """Map a legendary log line to an activity state (or '' for nothing)."""
         lower = line.lower()
         if "Progress:" in line:
-            return "progress"
+            # "Downloading" in every state the UI understands. This used to
+            # return "progress", a value `isActive()` in src/api.ts did not
+            # know: the download row was filtered out of the Downloads tab,
+            # the cover badge vanished and the detail page fell back to
+            # "下载并安装" while bytes were still arriving (audit 3.1).
+            return "downloading"
         # After the last chunk lands, legendary still assembles the files before
         # the process exits. Without this the UI jumped straight from 99% to
         # "已完成" while the game was not on disk yet.
@@ -2125,11 +2286,21 @@ class Plugin:
             if wine and not os.path.isdir(os.path.join(proton.compatdata_dir(appid), "pfx")):
                 note = "首次通过 Proton 启动要初始化兼容层，可能黑屏 1~2 分钟，请耐心等"
 
+            # Steam only switches the screen for a shortcut it owns. Callers
+            # use this to guide the user instead of waiting for an entry that
+            # does not exist (which produced "sound but no picture").
+            in_steam = False
+            try:
+                in_steam = self.steam.find_by_exe(self._launcher_script_path(app_name)) is not None
+            except Exception:
+                in_steam = False
+
             if not direct:
-                decky.logger.info("launch %s -> steam appid %s", app_name, appid)
+                decky.logger.info("launch %s -> steam appid %s (in_steam=%s)",
+                                  app_name, appid, in_steam)
                 return {
                     "ok": True, "appid": appid, "via": "steam",
-                    "note": note, "proton": bool(wine),
+                    "note": note, "proton": bool(wine), "in_steam": in_steam,
                 }
 
             env = self._game_session_env(appid)
@@ -2156,7 +2327,7 @@ class Plugin:
                 "ok": True, "appid": appid, "via": "direct",
                 "note": note, "proton": bool(wine),
             }
-        except (LegendaryError, OSError) as e:
+        except (LegendaryError, OSError, ValueError) as e:
             # Writing the Proton wrapper can fail on a full/read-only disk; that
             # used to escape the callable and leave the button dead.
             return {"ok": False, "error": str(e)}
@@ -2188,12 +2359,48 @@ class Plugin:
         env["SteamDeck"] = "1"
         return env
 
-    async def uninstall(self, app_name: str):
+    async def uninstall(self, app_name: str, remove_steam: bool = True):
+        """Uninstall a game, optionally removing its Steam shortcut too.
+
+        Leaving the shortcut behind means a dead entry in the Steam library
+        that exits the moment it is started — worse than removing it. Artwork
+        is kept: reinstalling reuses it, and an orphaned PNG is harmless.
+        """
         try:
             await self.legendary.uninstall(app_name)
-            return {"ok": True}
         except LegendaryError as e:
             return {"ok": False, "error": str(e)}
+        # 卸载后这条任务不该再出现在下载页（第三轮审计 3.3）。
+        self._forget_terminal(app_name)
+
+        steam_removed = False
+        if remove_steam:
+            try:
+                steam_removed = self.steam.remove_by_exe(self._launcher_script_path(app_name))
+            except Exception as e:  # noqa: BLE001 - uninstall already succeeded
+                decky.logger.warning("remove shortcut after uninstall failed: %s", e)
+        return {"ok": True, "steam_removed": steam_removed}
+
+    @staticmethod
+    def _stop_process_tree(proc, sig=signal.SIGTERM) -> None:
+        """Signal legendary *and* its download workers.
+
+        legendary forks worker processes; signalling only the parent leaves them
+        writing chunks into a folder we are about to delete (and they keep
+        recreating it). `start_new_session=True` at spawn makes the child a
+        process-group leader, so the group signal reaches all of them.
+        """
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.send_signal(sig)
+        except (ProcessLookupError, OSError):
+            pass
 
     async def cancel_install(self, app_name: str, delete: bool = False):
         """Stop an install task.
@@ -2204,19 +2411,54 @@ class Plugin:
         partial download so a retry starts from scratch.
         """
         task = self._install_tasks.get(app_name)
+        proc = self._install_procs.get(app_name)
+        self._stop_process_tree(proc)
         if task and not task.done():
             task.cancel()
-        proc = self._install_procs.get(app_name)
+            # Wait for the downloader to actually exit before touching its
+            # files: deleting chunks while Legendary is still flushing them
+            # leaves a corrupt half-state and sometimes a .resume that claims
+            # more progress than exists.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(task, return_exceptions=True), timeout=15.0
+                )
+            except asyncio.TimeoutError:
+                decky.logger.warning("cancel %s: install task did not stop in time", app_name)
+        # The task may have spawned legendary *after* the lookup above
+        # (cancelling during "准备中" used to leave that child running, still
+        # writing files into the folder we were about to delete). Give it a
+        # moment to register, then stop it like any other download.
+        if proc is None:
+            for _ in range(10):
+                proc = self._install_procs.get(app_name)
+                if proc is not None:
+                    break
+                if task is not None and task.done():
+                    break
+                await asyncio.sleep(0.2)
+            self._stop_process_tree(proc)
         if proc is not None and proc.returncode is None:
-            proc.terminate()
+            try:
+                await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=10.0)
+            except asyncio.TimeoutError:
+                self._stop_process_tree(proc, signal.SIGKILL)
+            except (asyncio.CancelledError, ProcessLookupError):
+                pass
         # Download inherited from a previous backend instance: we only hold its
         # pid, and the user still has the right to stop it (7.17).
         pid = self._external_pids.pop(app_name, None)
         if pid and self._pid_alive(pid):
             try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        # 取消 = 用户不要这个任务了：把持久化快照一起清掉，否则重载插件后
+        # 下载页会再冒出一行"已暂停/继续"，点继续还从零重新下（第三轮审计 3.3）。
+        self._forget_terminal(app_name)
         if delete:
             await self._clear_partial_download(app_name)
         return {"ok": True}
@@ -2227,10 +2469,105 @@ class Plugin:
         return await self.cancel_install(app_name, delete=False)
 
     async def resume_install(self, app_name: str, install_dir: str = ""):
-        """Resume a paused download. Legendary reuses the on-disk chunks."""
+        """Resume a paused download into the folder it started in."""
         # Drop the paused marker so install() will accept a new task.
         self._install_tasks.pop(app_name, None)
-        return await self.install(app_name, install_dir)
+        target = (install_dir or "").strip()
+        if not target:
+            targets = self.config.get("install_targets") or {}
+            if isinstance(targets, dict):
+                target = str(targets.get(app_name) or "").strip()
+        return await self.install(app_name, target)
+
+    #: Never deleted, whatever installed.json claims.
+    _FORBIDDEN_DELETE = {
+        "/", "/home", "/root", "/usr", "/etc", "/var", "/opt", "/tmp", "/run", "/boot",
+    }
+
+    def _install_roots(self) -> list:
+        """Directories a game folder is allowed to live under."""
+        candidates = []
+        configured = str(self.config.get("install_dir") or "").strip()
+        if configured:
+            candidates.append(configured)
+        try:
+            candidates.append(default_games_dir())
+        except Exception:
+            pass
+        targets = self.config.get("install_targets") or {}
+        if isinstance(targets, dict):
+            candidates.extend(str(v) for v in targets.values() if v)
+        roots = []
+        for value in candidates:
+            try:
+                roots.append(os.path.realpath(str(value)))
+            except (OSError, ValueError):
+                continue
+        return [r for r in roots if r]
+
+    def _safe_install_target(self, app_name: str, install_path,
+                             require_marker: bool = True) -> str:
+        """`install_path` if it is provably a game folder we may delete.
+
+        `installed.json` is a plain local file, so a stale record, a crash or a
+        hand edit can point `install_path` at anything. "Cancel download" is a
+        recursive delete, so it verifies three things first: the path is not a
+        system/home directory, it lives under an install root, and (by default)
+        it actually looks like a Legendary install (`.egstore` / `__install__`).
+        Anything else is left alone — a leftover folder costs disk space, a
+        wrong delete costs the user's data.
+
+        `require_marker=False` is only for the "cancel a download we just
+        stopped" path. Measured on legendary 0.21.1 (2026-11-10): a *finished*
+        install has **no** `.egstore` / `__install__` either, so the marker test
+        made that delete path unreachable. The caller compensates by requiring
+        legendary's own record for this app and the absence of a version — i.e.
+        the download never completed. Keep that pairing intact.
+        """
+        raw = str(install_path or "").strip()
+        if not raw:
+            return ""
+        try:
+            path = os.path.realpath(raw)
+        except (OSError, ValueError):
+            return ""
+        if path in self._FORBIDDEN_DELETE or path.count(os.sep) < 3:
+            return ""
+        if path == os.path.realpath(os.path.expanduser("~")):
+            return ""
+        inside = any(path == r or path.startswith(r + os.sep) for r in self._install_roots())
+        if not inside:
+            decky.logger.warning("refusing to delete %s: not under an install root", path)
+            return ""
+        if require_marker and not any(
+            os.path.exists(os.path.join(path, marker))
+            for marker in (".egstore", "__install__")
+        ):
+            decky.logger.warning("refusing to delete %s: no Legendary markers", path)
+            return ""
+        return path
+
+    def _install_paths_map(self) -> dict:
+        """app_name -> folder legendary chose, persisted across backend restarts."""
+        paths = getattr(self, "_install_paths", None)
+        if not isinstance(paths, dict):
+            try:
+                stored = self.config.get("install_paths") or {}
+            except Exception:
+                stored = {}
+            paths = dict(stored) if isinstance(stored, dict) else {}
+            self._install_paths = paths
+        return paths
+
+    def _remember_install_path(self, app_name: str, path: str):
+        paths = self._install_paths_map()
+        if paths.get(app_name) == path:
+            return
+        paths[app_name] = path
+        try:
+            self.config.set("install_paths", paths)
+        except OSError as e:
+            decky.logger.warning("install path save failed for %s: %s", app_name, e)
 
     async def _clear_partial_download(self, app_name: str):
         """Remove Legendary's partial-download state for a title.
@@ -2244,23 +2581,84 @@ class Plugin:
         try:
             record = self.legendary.installed_records().get(app_name) or {}
             install_path = (record.get("install_path") or "").strip()
-            # Only delete the half-finished folder if Legendary knows about it;
-            # otherwise the title never started downloading and there is
-            # nothing to clear.
-            if install_path and os.path.isdir(install_path):
-                # A completed game also has an install_path. Never delete a
-                # directory that looks like a finished install.
-                done = record.get("version") and os.path.exists(
-                    os.path.join(install_path, ".egstore")
+            if record.get("version"):
+                # The download actually finished before the cancel landed (small
+                # titles can complete in seconds). Never delete a real install.
+                decky.logger.info(
+                    "clear_partial_download %s: install finished, nothing to remove", app_name
                 )
-                if not done:
-                    import shutil
-                    shutil.rmtree(install_path, ignore_errors=True)
-            # Remove the .resume file(s) that reference this app's chunks.
+                return
+            removed_any = False
+            # `installed.json` gets an entry as soon as legendary starts writing,
+            # so its `install_path` is the folder name legendary chose (the
+            # title, not the app id). `install_targets` is the fallback when the
+            # record is still empty; the folder there is named after the app id.
+            candidates = []
+            if install_path:
+                candidates.append(install_path)
+            # The path legendary logged at the start of the download. This is
+            # the only candidate that exists while a download is in flight
+            # (installed.json has no entry yet, and the folder is named after the
+            # title, so `<base>/<app_name>` does not exist).
+            try:
+                known = self._install_paths_map().get(app_name) or ""
+            except Exception:
+                known = ""
+            if known and known not in candidates:
+                candidates.append(known)
+            try:
+                targets = self.config.get("install_targets") or {}
+                base = str(targets.get(app_name) or "").strip() if isinstance(targets, dict) else ""
+            except Exception:
+                base = ""
+            if base:
+                guess = os.path.join(base, app_name)
+                if os.path.isdir(guess) and guess not in candidates:
+                    candidates.append(guess)
+            for candidate in candidates:
+                if not candidate or not os.path.isdir(candidate):
+                    continue
+                # require_marker=False: legendary 0.21.1 leaves no `.egstore`
+                # behind, so a marker test would make this unreachable. Safe
+                # because we already proved the install never finished (no
+                # version) and the path came from legendary's own record or our
+                # install_targets, and it still has to pass the root/depth/home
+                # checks inside `_safe_install_target`.
+                safe = self._safe_install_target(app_name, candidate, require_marker=False)
+                if safe:
+                    shutil.rmtree(safe, ignore_errors=True)
+                    # A downloader that was still alive can recreate files while
+                    # we delete; one retry with a short pause catches that
+                    # (measured: 346 MB left behind on 2026-11-10).
+                    if os.path.isdir(safe):
+                        await asyncio.sleep(0.8)
+                        shutil.rmtree(safe, ignore_errors=True)
+                    if os.path.isdir(safe):
+                        decky.logger.warning("partial download still present: %s", safe)
+                        continue
+                    removed_any = True
+                    decky.logger.info("removed partial download %s", safe)
+            # Remove the .resume file(s) that reference this app's chunks —
+            # but only if the folder actually went away. Deleting resume state
+            # while the bytes stay on disk costs the user both the space and the
+            # ability to continue.
+            # 这里不能再要求 `candidates` 非空：极早取消时 legendary 还没打印
+            # `Install path:`，候选列表是空的，但磁盘上同样什么都没删 —— 一旦
+            # 走到下面就会把 `.resume` 删掉，用户空间没释放、续传也没了（复审 4.2）。
+            if not removed_any:
+                decky.logger.info(
+                    "clear_partial_download %s: kept .resume (no folder removed)", app_name
+                )
+                return
             tmp_dir = os.path.join(self.legendary.config_dir(), "tmp")
             if os.path.isdir(tmp_dir):
                 for name in os.listdir(tmp_dir):
-                    if name.endswith(".resume") and app_name[:12].lower() in name.lower():
+                    # 用完整 app_name（文件名就是 `<app_name>.resume`）。以前取前 12 位，
+                    # 同前缀的两款游戏会互删断点（复审 #9）。
+                    if (
+                        name.lower() == app_name.lower() + ".resume"
+                        or (name.endswith(".resume") and app_name.lower() in name.lower())
+                    ):
                         try:
                             os.unlink(os.path.join(tmp_dir, name))
                         except OSError:
@@ -2275,6 +2673,28 @@ class Plugin:
         dir where Legendary keeps resume state and partial manifests, never a
         game's actual files.
         """
+        active = {
+            name for name, task in (getattr(self, "_install_tasks", {}) or {}).items()
+            if task is not None and not task.done()
+        }
+        # Downloads inherited from a previous backend instance are not in
+        # `_install_tasks` — they only exist as a pid we are tailing. Deleting
+        # `<config>/tmp` while one of those is writing breaks its resume state
+        # (audit 3.4).
+        active |= set(getattr(self, "_external_pids", {}) or {})
+        active |= set(getattr(self, "_install_procs", {}) or {})
+        active |= {
+            name for name, snap in (getattr(self, "_live_progress", {}) or {}).items()
+            if isinstance(snap, dict) and snap.get("state") in
+            ("starting", "downloading", "installing", "verifying", "patching", "prereq")
+        }
+        if active:
+            # These files are the resume state of the running download; deleting
+            # them mid-flight turns a resumable install into a broken one.
+            return {
+                "ok": False,
+                "error": "有 %d 个任务正在下载，请先暂停或取消后再清理" % len(active),
+            }
         removed = 0
         try:
             tmp_dir = os.path.join(self.legendary.config_dir(), "tmp")
@@ -2324,21 +2744,30 @@ class Plugin:
                     "%s is a Windows title but no Proton build was found", app_name
                 )
                 return ""
-            path = os.path.join(self._proton_dir(), "%s.sh" % app_name)
+            path = os.path.join(self._proton_dir(), "%s.sh" % _safe_app_id(app_name))
             return proton.write_wrapper(path, appid, binary)
         except Exception as e:
             decky.logger.error("proton wrapper for %s failed: %s", app_name, e)
             return ""
 
     async def _ensure_image_cache(self):
-        """Load Epic's per-game artwork URLs once per session."""
+        """Load Epic's per-game artwork URLs once per session.
+
+        A failure must NOT be cached as "no artwork exists": that made every
+        later cover/icon request silently skip, while 「补齐封面」 still reported
+        success (audit 3.9). Keep the cache empty and retry after a short TTL.
+        """
         if self._image_cache is not None:
+            return
+        failed_at = getattr(self, "_image_cache_failed_at", 0.0) or 0.0
+        if failed_at and time.time() - failed_at < self.IMAGE_CACHE_RETRY:
             return
         try:
             self._image_cache = await self.legendary.key_images()
+            self._image_cache_failed_at = 0.0
         except Exception as e:
             decky.logger.warning("artwork metadata unavailable: %s", e)
-            self._image_cache = {}
+            self._image_cache_failed_at = time.time()
 
     async def _apply_artwork(self, app_name: str, appid: int, overwrite: bool = False):
         """Download Epic's art into Steam's grid folder.
@@ -2498,7 +2927,7 @@ class Plugin:
         `_write_launcher_script` uses the same name, so this doubles as the
         stable key when looking a shortcut up in shortcuts.vdf.
         """
-        return os.path.join(self._launcher_dir(), "%s.sh" % app_name)
+        return os.path.join(self._launcher_dir(), "%s.sh" % _safe_app_id(app_name))
 
     def _launch_helper_path(self):
         """Path of the launch shim inside the runtime dir.
@@ -2576,6 +3005,17 @@ class Plugin:
             self._runtime_dir(), "logs", "launch-%s.log" % app_name
         )
 
+    def _launch_marker_path(self, app_name: str) -> str:
+        """Touched by the shim once a game process exists.
+
+        The launcher script reads it after the shim returns: present means the
+        exit status belongs to the game, absent means nothing ever ran and the
+        plain `legendary launch` fallback should still be tried.
+        """
+        return os.path.join(
+            self._runtime_dir(), "logs", "launch-%s.started" % app_name
+        )
+
     def _install_log_path(self, app_name: str) -> str:
         """Where `legendary install` writes its output for this title.
 
@@ -2585,7 +3025,7 @@ class Plugin:
         tail the same file and pick the progress back up. See 7.17.
         """
         return os.path.join(
-            self._runtime_dir(), "logs", "install-%s.log" % app_name
+            self._runtime_dir(), "logs", "install-%s.log" % _safe_app_id(app_name)
         )
 
     @staticmethod
@@ -2647,6 +3087,13 @@ class Plugin:
         if wine:
             helper_shell += " --wine %s" % shlex.quote(_posix_path(wine))
         helper_shell += " --log %s" % shlex.quote(_posix_path(self._launch_log_path(app_name)))
+        # The shim touches this file the moment a game process exists. The
+        # script below uses it to decide whether the plain `legendary launch`
+        # fallback is still needed: exit code 90 cannot answer that question,
+        # because a game is free to exit with 90 itself and would then be
+        # started twice. See HANDOFF 3.12.
+        marker = shlex.quote(_posix_path(self._launch_marker_path(app_name)))
+        helper_shell += " --marker %s" % marker
 
         # The shim command and the plain-launch fallback both get wrapped in
         # `~/lsfg` when frame-gen is on. We write the wrapper as a *function*
@@ -2694,14 +3141,20 @@ class Plugin:
             # Quoted, not just wrapped in double quotes: a path containing `$`
             # or a backtick would otherwise be expanded by bash at run time.
             f'EPICDECK_SHIM={shlex.quote(helper)}\n'
+            f'EPICDECK_MARKER={marker}\n'
             + lsfg_prologue +
             'for EPICDECK_PY in /usr/bin/python3 /usr/bin/python3.11 /usr/bin/python; do\n'
             '  if [ -x "$EPICDECK_PY" ] && [ -f "$EPICDECK_SHIM" ]; then\n'
+            # Stale markers from an earlier run would make us trust an exit
+            # status that never involved a game, so clear it first.
+            '    rm -f "$EPICDECK_MARKER"\n'
             f'    {lsfg_prefix}"$EPICDECK_PY" "$EPICDECK_SHIM" {helper_shell} --{extra_shell} "$@"\n'
             '    EPICDECK_RC=$?\n'
-            '    # 90 means the shim never started a game; fall through to the plain\n'
+            '    # A marker means the shim got a game running: its status is the\n'
+            '    # game\'s own and must be passed through untouched (even 90).\n'
+            '    # No marker means nothing started, so fall through to the plain\n'
             '    # launch below instead of leaving the user with a dead entry.\n'
-            '    [ "$EPICDECK_RC" -eq 90 ] || exit "$EPICDECK_RC"\n'
+            '    [ -f "$EPICDECK_MARKER" ] && exit "$EPICDECK_RC"\n'
             '    break\n'
             '  fi\n'
             'done\n'
@@ -2825,6 +3278,13 @@ class Plugin:
         }
 
     async def set_launch_args(self, app_name: str, args: str):
+        # The wrapper is built with shlex.split(); an unbalanced quote raises
+        # there, inside the launch path, and used to leave the button stuck on
+        # "starting". Reject it at the point of entry, with a clear message.
+        try:
+            shlex.split(args or "")
+        except ValueError as e:
+            return {"ok": False, "error": "启动参数引号不匹配: %s" % e}
         stored = self.config.get("launch_args") or {}
         if not isinstance(stored, dict):
             stored = {}
@@ -2977,6 +3437,13 @@ class Plugin:
             }
 
         await self._ensure_image_cache()
+        if self._image_cache is None:
+            # We never got the metadata — saying "已是最新" here is a lie.
+            return {
+                "ok": False,
+                "updated": 0,
+                "error": "读取 Epic 封面元数据失败（网络或登录状态），请稍后重试",
+            }
         icons = {}
         updated = 0
         for name, entry in targets:
@@ -3007,8 +3474,21 @@ class Plugin:
     async def get_settings(self):
         return dict(self.config._data)
 
+    #: Settings that change how the Steam shortcut starts a game. Steam runs
+    #: `launchers/<app>.sh` directly, so changing these without rewriting the
+    #: wrappers means the toggle silently does nothing.
+    _LAUNCHER_SETTINGS = {"use_proton", "proton_path"}
+
     async def set_setting(self, key: str, value):
         self.config.set(key, value)
+        if key in self._LAUNCHER_SETTINGS:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._sync_launcher_scripts)
+                decky.logger.info("launchers rewritten after %s changed", key)
+            except Exception as e:  # noqa: BLE001 - never fail the setting itself
+                decky.logger.warning("launcher rewrite after %s failed: %s", key, e)
+                return {"ok": True, "warning": str(e)}
         return {"ok": True}
 
     # -- interface language (HANDOFF 7.13.0a) ------------------------------
@@ -3081,8 +3561,20 @@ class Plugin:
 
     # -- ProtonDB tier (HANDOFF 7.13.2) ------------------------------------
     def _protondb_title(self, app_name: str) -> str:
-        """Title to search Steam with: English first, since the store's own
-        search matches localised names anyway and English survives them best."""
+        """Title to search Steam with: the English one, always.
+
+        The store search is language-specific. Querying the Chinese storefront
+        with an English title returns pure-Chinese names, and the similarity
+        check scores those 0.0 (`Hogwarts Legacy` vs `霍格沃茨之遗`), so the
+        badge silently never appears. Once the UI is Chinese, `title_cache`
+        no longer holds the English name — but the library snapshot does, in
+        `source_title`.
+        """
+        for row in getattr(self, "_lib_cache", None) or []:
+            if isinstance(row, dict) and row.get("app_name") == app_name:
+                source = str(row.get("source_title") or "").strip()
+                if source:
+                    return source
         cache = self.config.get("title_cache") or {}
         if isinstance(cache, dict):
             for locale in ("en-US", "en", "en-GB"):
@@ -3113,21 +3605,70 @@ class Plugin:
             return {"ok": False, "error": str(exc)[:160]}
         return {"ok": True, **info}
 
+    #: How many timestamped save backups to keep per game.
+    CLOUD_BACKUP_KEEP = 3
+
+    async def _backup_cloud_saves(self, app_name: str) -> str:
+        """Copy the local save folder aside before a download can overwrite it.
+
+        `legendary sync-saves` has no undo: pulling a stale cloud copy over a
+        newer local save loses progress. The copy is a sibling directory with a
+        timestamp, and only the newest few are kept so it cannot grow forever.
+        """
+        try:
+            info = await self.legendary.cloud_save_info(app_name)
+        except Exception as e:  # noqa: BLE001
+            decky.logger.warning("cloud backup: info failed for %s: %s", app_name, e)
+            return ""
+        save_path = str(info.get("save_path") or "").strip()
+        if not save_path or not os.path.isdir(save_path):
+            return ""
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest = "%s.epicdeck-backup-%s" % (save_path.rstrip("/"), stamp)
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, shutil.copytree, save_path, dest)
+        except Exception as e:  # noqa: BLE001
+            decky.logger.warning("cloud backup failed for %s: %s", app_name, e)
+            return ""
+        decky.logger.info("cloud backup for %s -> %s", app_name, dest)
+
+        # Prune old backups of this same game (prefix-scoped, never touches
+        # anything else in the folder).
+        try:
+            parent = os.path.dirname(save_path.rstrip("/")) or "."
+            base = os.path.basename(save_path.rstrip("/")) + ".epicdeck-backup-"
+            backups = sorted(
+                os.path.join(parent, name)
+                for name in os.listdir(parent)
+                if name.startswith(base) and os.path.isdir(os.path.join(parent, name))
+            )
+            for old_path in backups[: -self.CLOUD_BACKUP_KEEP]:
+                shutil.rmtree(old_path, ignore_errors=True)
+        except OSError as e:
+            decky.logger.debug("cloud backup prune failed: %s", e)
+        return dest
+
     async def sync_cloud_saves(self, app_name: str, mode: str = "sync"):
         """Manual cloud-save sync. Deliberately *not* hooked into launch.
 
         Auto-syncing on every launch would add minutes on a bad connection and
         can overwrite newer local saves; the user asks for it explicitly here.
+        Downloads are preceded by a local backup for the same reason.
         """
         if mode not in ("sync", "upload", "download"):
             return {"ok": False, "error": "无效的同步方向"}
+        backup = ""
+        if mode in ("sync", "download"):
+            backup = await self._backup_cloud_saves(app_name)
         try:
             output = await self.legendary.sync_saves(app_name, mode)
         except LegendaryError as exc:
-            return {"ok": False, "error": str(exc)[:400]}
+            return {"ok": False, "error": str(exc)[:400], "backup": backup}
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": str(exc)[:400]}
-        return {"ok": True, "output": output[-2000:]}
+            return {"ok": False, "error": str(exc)[:400], "backup": backup}
+        return {"ok": True, "output": output[-2000:], "backup": backup}
 
     #: How long a *failed* ProtonDB lookup suppresses retries. The Steam store
     #: endpoint takes ~12 s to time out on a blocked network, and retrying it on
@@ -3141,6 +3682,13 @@ class Plugin:
         cache = self.config.get("protondb") or {}
         if not isinstance(cache, dict):
             cache = {}
+        # Bump when the lookup itself changes: failures recorded by the old
+        # strategy (English title against the Chinese storefront) would keep
+        # the badge hidden for an hour after the fix.
+        if int(self.config.get("protondb_scheme") or 0) < 2:
+            cache = {k: v for k, v in cache.items() if isinstance(v, dict) and v.get("tier")}
+            self.config.set("protondb", cache)
+            self.config.set("protondb_scheme", 2)
         entry = cache.get(app_name) if isinstance(cache.get(app_name), dict) else None
 
         # Recent failure and no tier yet: stay quiet instead of hammering the API.
@@ -3215,6 +3763,44 @@ class Plugin:
                 }
         return out
 
+    #: Terminal states we keep across a reload so the Downloads tab still lists
+    #: them (paused download = the user must be able to hit 继续 after restarting
+    #: the plugin). Cancelled is intentionally NOT kept — the user threw it away.
+    _KEEP_STATES = ("paused", "error")
+
+    def _remember_terminal(self, app_name: str, state: str, percent, message: str):
+        """Persist a paused/error row so it survives a plugin reload (audit 2.3)."""
+        if state not in self._KEEP_STATES:
+            return
+        try:
+            snaps = self.config.get("install_snapshots") or {}
+            if not isinstance(snaps, dict):
+                snaps = {}
+            # Prune anything older than a week so the file cannot grow forever.
+            cutoff = time.time() - 7 * 24 * 3600
+            snaps = {
+                k: v for k, v in snaps.items()
+                if isinstance(v, dict) and float(v.get("ts") or 0) >= cutoff
+            }
+            snaps[app_name] = {
+                "state": state,
+                "percent": float(percent or 0.0),
+                "message": message or "",
+                "ts": int(time.time()),
+            }
+            self.config.set("install_snapshots", snaps)
+        except Exception as e:  # noqa: BLE001 - never break the install flow
+            decky.logger.warning("install snapshot save failed for %s: %s", app_name, e)
+
+    def _forget_terminal(self, app_name: str):
+        try:
+            snaps = self.config.get("install_snapshots") or {}
+            if isinstance(snaps, dict) and app_name in snaps:
+                snaps.pop(app_name, None)
+                self.config.set("install_snapshots", snaps)
+        except Exception:
+            pass
+
     async def get_active_installs(self):
         """Downloads that are still running, including inherited ones.
 
@@ -3251,6 +3837,35 @@ class Plugin:
                 "total_bytes": None,
                 "external": True,
             })
+        # Paused/errored rows survive a reload (audit 2.3): merge them in unless a
+        # live task already reports the same title.
+        try:
+            snaps = self.config.get("install_snapshots") or {}
+        except Exception:
+            snaps = {}
+        if isinstance(snaps, dict):
+            for app_name, snap in snaps.items():
+                if app_name in known or not isinstance(snap, dict):
+                    continue
+                if snap.get("state") not in self._KEEP_STATES:
+                    continue
+                # 旧配置里可能留着很久以前的条目：合并时再按 7 天过滤一次。
+                try:
+                    if float(snap.get("ts") or 0) < time.time() - 7 * 24 * 3600:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                out.append({
+                    "app_name": app_name,
+                    "state": snap.get("state"),
+                    "percent": float(snap.get("percent") or 0.0),
+                    "message": snap.get("message") or "",
+                    "speed": "",
+                    "eta": "",
+                    "downloaded_bytes": None,
+                    "total_bytes": None,
+                    "external": False,
+                })
         for row in out:
             row["title"] = titles.get(row.get("app_name"), "")
         return out
@@ -3458,15 +4073,34 @@ class Plugin:
             status = await self.legendary.auth_status()
             add(f"  已登录: {status.get('logged_in', False)}")
             add(f"  账号 ID: {_mask_personal(str(status.get('account_id', '')))}")
-            add(f"  显示名: {status.get('display_name', '')}")
+            add(f"  显示名: {_mask_personal(str(status.get('display_name', '')))}")
         except Exception as e:
             add(f"  读取失败: {e}")
         add("")
 
-        # 插件配置(脱敏)
-        add("[插件配置]")
-        for k, v in sorted(self.config._data.items()):
-            add(f"  {k}: {v!r}")
+        # 插件配置(白名单)
+        #
+        # 以前是把整个 config 倒出来,里面包含完整游戏名、游玩时长、标题缓存、
+        # 账号相关数据。用户把这份日志发到 issue 时,等于公开了整个游戏库。
+        # 这里只保留排障真正需要的标量设置。
+        SAFE_CONFIG_KEYS = (
+            "install_dir", "first_run_done", "legendary_path", "auto_add_to_steam",
+            "title_locale", "auto_fetch_size", "third_party_titles", "use_proton",
+            "proton_path", "auto_cover", "max_workers", "preferred_cdn", "no_https",
+            "lsfg_default", "ui_language", "protondb_scheme", "auto_protondb",
+        )
+        add("[插件配置 (仅排障相关项)]")
+        data = self.config._data if isinstance(self.config._data, dict) else {}
+        for key in SAFE_CONFIG_KEYS:
+            if key in data:
+                add(f"  {key}: {data[key]!r}")
+        targets = data.get("install_targets")
+        if isinstance(targets, dict):
+            add(f"  install_targets: {len(targets)} 项")
+        paths = data.get("install_paths")
+        if isinstance(paths, dict):
+            add(f"  install_paths: {len(paths)} 项")
+        add("  (游戏名、游玩时长、标题/体积缓存、账号相关数据不在此文件中)")
         add("")
 
         # 插件日志

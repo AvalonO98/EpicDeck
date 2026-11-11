@@ -4,7 +4,7 @@
 
 [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) 插件：登录 Epic、浏览库、下载安装、点开就玩，并自动把游戏写进 Steam 库——带封面图标，Windows 游戏由 Proton 运行。不需要 Epic 客户端，不用回桌面模式，不用手配 wine。
 
-`0.9.2` · BSD-3-Clause · SteamOS / Steam Deck · Python + Legendary
+`0.9.5-beta.13` · BSD-3-Clause · SteamOS / Steam Deck · Python + Legendary
 
 ## English
 
@@ -46,7 +46,7 @@ git clone https://github.com/AvalonO98/EpicDeck.git && cd EpicDeck
 pnpm install && pnpm build && pnpm package   # 产出 EpicDeck-v<version>.zip
 ```
 
-Legendary 不用手动装：首次没检测到会显示「一键安装」，自动下载官方二进制（约 3 MB）。
+Legendary 不用手动装：首次没检测到会显示「一键安装」，自动下载官方二进制（约 14 MB）。
 
 首次流程：Quick Access → EpicDeck → 登录 → 选下载目录 → 安装游戏（装完自动进 Steam 库；封面没出现就用「重启 Steam 刷新游戏库」）。
 

@@ -184,6 +184,8 @@ export const launchGame = callable<
     /** Shortcut appid; the frontend hands it to Steam so gamescope switches. */
     appid?: number;
     via?: "steam" | "direct";
+    /** False when no Steam shortcut exists yet: the caller must add one first. */
+    in_steam?: boolean;
     error?: string;
     note?: string;
     proton?: boolean;
@@ -209,7 +211,9 @@ export const getSettings = callable<[], Record<string, any>>("get_settings");
 export const getUILanguage = callable<
   [],
   { ok: boolean; lang: "zh" | "en"; steam?: string; source?: string }
->("get_ui_language");export const setSetting = callable<[key: string, value: any], { ok: boolean }>("set_setting");
+>("get_ui_language");
+
+export const setSetting = callable<[key: string, value: any], { ok: boolean }>("set_setting");
 /** One running download as reported by the backend on boot. */
 export interface ActiveInstall {
   app_name: string;
@@ -300,11 +304,6 @@ export interface ProtonDbTier {
 export const getProtonDb = callable<[app_name: string, force?: boolean], ProtonDbTier>(
   "get_protondb"
 );
-export const getProtonDbCached = callable<
-  [app_names?: string[]],
-  Record<string, { tier: string; label: string; total: number; appid: number }>
->("get_protondb_cached");
-
 // Game Mode has no browser window we can call; the backend hands the URL to
 // Steam's built-in one.
 export const openUrl = callable<[url: string], { ok: boolean; error?: string }>("open_url");
@@ -367,14 +366,6 @@ export function fmtEta(hms: string): string {
   return h > 0 ? `${h}:${mmss}` : `${Number(m[2])}:${m[3]}`;
 }
 
-export function fmtMinutes(totalMinutes: number): string {
-  if (!totalMinutes || totalMinutes <= 0) return "—";
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = Math.round(totalMinutes % 60);
-  if (hours <= 0) return tf("{0} 分钟", minutes);
-  return minutes > 0 ? tf("{0} 小时 {1} 分", hours, minutes) : tf("{0} 小时", hours);
-}
-
 /** "刚刚" / "12 分钟前" / "3 天前" — used for cache age. */
 export function fmtAgo(ts: number): string {
   if (!ts) return "";
@@ -415,7 +406,10 @@ export function maskPersonal(value: string): string {
   const keep = len >= 9 ? 3 : 2;
   const head = s.slice(0, keep);
   const tail = s.slice(len - keep);
-  return head + "*".repeat(Math.max(1, len - keep * 2)) + tail;
+  // 固定 3 个星号：以前按长度铺星，32 位账号 ID 会变成一串 26 颗星的噪声
+  // （第三轮审计 V5）。掩码只为"看不出原文"，不需要暴露长度。
+  const stars = Math.min(3, Math.max(1, len - keep * 2));
+  return head + "*".repeat(stars) + tail;
 }
 
 export const STATE_LABEL: Record<string, string> = {
@@ -431,16 +425,27 @@ export const STATE_LABEL: Record<string, string> = {
   error: "出错",
 };
 
+/**
+ * States that mean "something is happening right now".
+ *
+ * A wrong/missing value here hides the download from every screen at once: the
+ * Downloads tab filters on it, the cover badge disappears, the detail page
+ * falls back to "install" and the QAM badge shows 0. Keep `progress` in the
+ * list even though the backend now reports `downloading` — an older backend
+ * (or a future state) must not make the UI go blind again (audit 3.1).
+ */
+const ACTIVE_STATES = new Set([
+  "starting",
+  "downloading",
+  "installing",
+  "verifying",
+  "patching",
+  "prereq",
+  "progress",
+]);
+
 export function isActive(progress?: InstallProgress): boolean {
-  if (!progress) return false;
-  return (
-    progress.state === "starting" ||
-    progress.state === "downloading" ||
-    progress.state === "installing" ||
-    progress.state === "verifying" ||
-    progress.state === "patching" ||
-    progress.state === "prereq"
-  );
+  return !!progress && ACTIVE_STATES.has(progress.state);
 }
 
 // "auto" follows the Steam UI language; the rest pin a specific one. Epic
@@ -496,7 +501,8 @@ export const SORT_OPTIONS: { data: SortMode; label: string }[] = [
 
 export type InstallFilter = "all" | "installed" | "not_installed";
 
-// Order doubles as the L1/R1 cycle order: 全部 → 已安装 → 未安装 → 全部.
+// Display order of the filter chips. Note: L1/R1 does NOT cycle filters any more —
+// it flips pages inside the library and switches tabs elsewhere (审计 2.10)。
 export const INSTALL_FILTER_ORDER: InstallFilter[] = ["all", "installed", "not_installed"];
 
 export const INSTALL_FILTER_LABEL: Record<InstallFilter, string> = {

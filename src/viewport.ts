@@ -91,7 +91,25 @@ export function useViewport(ref: RefObject<HTMLElement | null>): Viewport {
 
     const observer = new Observer(() => apply());
     observer.observe(el);
-    return () => observer.disconnect();
+    // 页面在"被屏保盖住 / 不可见"时挂载，ResizeObserver 的通知会被推迟甚至丢掉，
+    // 于是整页按 0.95 的缩放渲染（实测 15.2px 而不是 16px），用户只感觉"字小了"。
+    // 除了 observer，再挂 resize / visibilitychange，并在挂载后补测两次（第三轮审计 3.10）。
+    const onResize = () => apply();
+    view?.addEventListener?.("resize", onResize);
+    const onVisible = () => {
+      if (!el.ownerDocument?.hidden) apply();
+    };
+    el.ownerDocument?.addEventListener?.("visibilitychange", onVisible);
+    const timers = [
+      view?.setTimeout?.(apply, 300),
+      view?.setTimeout?.(apply, 1000),
+    ].filter(Boolean);
+    return () => {
+      observer.disconnect();
+      view?.removeEventListener?.("resize", onResize);
+      el.ownerDocument?.removeEventListener?.("visibilitychange", onVisible);
+      timers.forEach((t) => view?.clearTimeout?.(t));
+    };
   }, [ref]);
 
   return viewport;

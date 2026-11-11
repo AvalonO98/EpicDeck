@@ -15,6 +15,390 @@
 安装/卸载语义、架构、callable 清单的改动，都要落到 README 对应章节
 （尤其是「当前版本」一行、`数据放在哪`、`架构`、`常见问题`）。
 
+## [0.9.5] - 2026-11-09（未发布；当前测试包 0.9.5-beta.13）
+
+### 批次 1：下载链路（审计 3.1–3.5 / 2.5）
+
+按《EpicDeck-独立审计-2026-11-10.md》批次 1（下载链路）修复。
+
+### 修复
+
+- **下载中 `state="progress"`（P0，审计 3.1）**：`_classify_activity` 把 `Progress:` 行
+  映射成 `"progress"`，而前端 `isActive()` 不认识这个值 —— 下载页整行被过滤、封面角标消失、
+  详情页退回「下载并安装」、QAM 徽标归零。后端改为 `"downloading"`，前端
+  `ACTIVE_STATES` 集合保留 `"progress"` 兜底，避免旧后端/新状态再让 UI 失明。
+- **取消/暂停后幽灵下载（审计 3.2）**：`_live_progress.pop()` 挪进
+  `_install_streaming` 的 `finally`，任务被 cancel 时也会清理。
+- **「取消并删除」删不掉半成品目录（审计 3.3）**：`installed.json` 只在安装完成后才有
+  `install_path`，下载中被 `_clear_partial_download` 拿到空值就跳过了 rmtree，却照删
+  `.resume`。现在用 `install_targets` 兜底候选（须含 `.egstore`，仍过
+  `_safe_install_target` 三条件）；**一个目录都没删掉时不再删 `.resume`**。
+- **清理下载缓存漏判外部下载（审计 3.4）**：活动集合并入 `_external_pids` /
+  `_install_procs` / `_live_progress` 的活动状态。
+- **外部下载时能起第二个 legendary（审计 3.5）**：`install()` 增加继承下载守卫。
+- **`_pausing` 残留（审计 3.8）**：`install()` 入口 `discard`。
+- **暂停显示 0%（审计 2.5）**：后端记录 `_last_percent`，暂停/取消/出错事件带上真实百分比；
+  前端 `pause` 保留原进度。
+- **取消删目录的三处真机坑（0.9.5-beta.1 实机追加）**：
+  1. `legendary 0.21.1` 的**已完成安装也没有** `.egstore` / `__install__`，
+     `_safe_install_target` 的标记条件让这条删除路径根本走不到 → 改为
+     `require_marker=False`（仅取消路径，且仍要求"legendary 记录里没有 version"，
+     即下载从未完成）；
+  2. legendary 用**标题**命名目录（`DREDGEmKMzx`），`<base>/<app_name>` 猜不中，
+     `installed.json` 在下载中可能还没有记录 → 尾随日志捕获
+     `Install path: …` 存进 `install_paths`（持久化，重载后仍可用）；
+  3. legendary 会 fork 下载 worker，只 `proc.terminate()` 父进程时 worker 继续写，
+     会把刚删掉的目录重新建出来（实测残留 758 MB）→ 子进程改为
+     `start_new_session=True`，取消/收尾一律 `killpg` 整组；`rmtree` 失败重试一次
+     并写警告，不再 `ignore_errors` 静默。
+
+### 批次 2：焦点与导航（审计第 1 章）
+
+- **容器不再能成为锚点（P0，审计 1.2）**：点一下封面之间的空隙，浏览器把焦点交给
+  `.ed-surface` 本身，`settleFocus` 原第 3 分支无条件接受 → 锚点变容器 →
+  `usable()` 一律 false、`currentFocused()` 返回 null，方向键被吞却没反应，整个界面
+  失联（点两下空白必现）。现在 `settleFocus` 开头拦截非叶子节点：保持原锚点并
+  按回去，没有锚点就落页面第一个控件；`currentFocused` 的兜底也从 `null` 改成
+  "第一个可聚焦控件"。
+- **L1/R1 翻页后落焦（P0，审计 1.3）**：翻页只调 `bumper()`、不落焦，而网格以页码为
+  key 整块重建，被聚焦的封面随旧页卸载 → 焦点掉 body。新增 `flipPageAndFocus()`，
+  L1/R1 与"网格左右到头"共用：按当前列在新页落焦。
+- **边界不再"传送到另一端"（P1，审计 1.4）**：`bumper` 改为返回"是否真的换页"，
+  第一页按左 / 末页按右保持原位。
+- **切标签光标跟随（P1，审计 1.5）**：`data-ed-focus-action` 早已没有任何写入方
+  （"聚焦即切页" 0.9.3 删掉了），`tabOffset` 的查询永远落空。给 chip 加
+  `data-ed-tab` 用它定位，并删掉死掉的 `focusActions` 注册表与 `runFocusAction`。
+- **复检不再抢用户的输入（P2，审计 1.9）**：`reverifyFocus` 只在焦点"丢了"
+  （body / 页面外）时拉回，不再把用户主动移到的位置抢回去；帧数 12 → 4。
+- **设置页落焦（P1，审计 1.7）**：从顶栏 chip 进入设置时，旧守卫把"当前焦点是 chip"
+  当成"用户已经在页面里"，直接 return，既不滚顶也不落焦。现在顶栏 chip 不算。
+- **下载设置落焦（P2，审计 1.14）**：滚到"下载"分组后把光标也放过去。
+- **输入框上下键（P2，审计 1.10）**：左右仍放行给输入框移光标，上下由我们接管
+  （以前整个放行，Steam 按 DOM 顺序把光标甩到翻页键）。
+- **禁用控件移出焦点序列（P1，审计 1.6）**：翻页箭头到头、`ActionButton disabled`
+  改为 `tabIndex=-1` + `aria-disabled`，`CANDIDATE_SELECTOR` 排除
+  `[aria-disabled="true"]`，光标不再停在"按了没反应"的死键上。
+- **A 键只接管自己的控件（P2，审计 1.11）**：白名单
+  `.ed-chip/.ed-tile/.ed-action/.ed-pager/.ed-loc`，Steam 的 Dropdown/ToggleField/
+  ButtonItem 交回 Steam 的激活路径；防抖 250ms → 120ms，连按两下不再被吞。
+- **「返回」语义统一（P3，审计 1.12）**：顶栏"返回"改成与 B 一致——有详情先关详情，
+  没有才退出插件。
+
+
+### 批次 3：数据与安全（审计第 2、3 章）
+
+- **启动鉴权超时不再清库缓存（P1，审计 2.1）**：`authStatus` 15 秒没回来会被当成
+  "未登录"，`clearLibraryCache()` 把 localStorage 里的整库快照删掉并显示"请登录"，
+  后端恢复也不会自动回来。现在 `withTimeout` 的回退值带 `__timeout` 标记，超时只报
+  "账号状态读取超时，请刷新"，缓存保留、`bootPromise` 置空允许重试。
+- **标题补丁形状（审计 3.7）**：后端 `library_patch` 发的是 `{app: "中文名"}`，
+  前端按 `patch[app].title` 读，于是**所有标题补丁都被静默丢弃**（只有重载才变中文）。
+  三处 emit 改成 `{app: {"title": ...}}`。
+- **封面元数据失败不再永久固化（审计 3.9）**：以前异常时把 `_image_cache` 写成 `{}`，
+  之后所有封面/图标请求都跳过，而「补齐封面」还报"已是最新"。现在失败保持 `None`、
+  10 分钟后重试；`refresh_artwork` 在拿不到元数据时返回 `ok:false` + 明确错误。
+- **手机登录异常兜底（审计 3.10）**：`login_with_code` 抛非 `LegendaryError`（写
+  `user.json` 失败）时任务直接结束，状态永远停在 `finishing`、前端一直转圈。补 try/except。
+- **删除三处 `CERT_NONE` 回退（审计 3.11）**：`protondb` / `title_sources` /
+  `update_check` 在证书校验失败时会**关闭校验**，与 `SECURITY.md` 的承诺相反
+  （MITM 可伪造"最新版本"/标题）。现在一律 fail closed，交给 handshake 失败。
+- **`shortcuts.vdf` 并发写（审计 3.6）**：事件循环与线程池都会做
+  "load→改→save"，共用固定临时文件，8 线程并发只剩 1 条。加模块级 `RLock` +
+  `_serialized` 装饰器包住五个写入口，临时文件改 `tempfile.mkstemp` 唯一名。
+- **"未安装"徽章数字（审计 2.2）**：改为排除 `non_installable`，与点开后的列表一致。
+- **启动参数不再被丢弃（审计 2.4）**：900ms 防抖内按 B / 切标签会丢掉输入；离开详情页时
+  补一次 fire-and-forget 保存。
+- **刷新可重入（审计 2.6）**：`refreshing` 期间忽略重复点击，避免并发全量请求。
+
+### 批次 4：打磨与工程（0.9.5-beta.4）
+
+离线可验的部分全部改完，`regression.py` 12/12、`smoke_backend.py` 96/96、`tsc --noEmit` 干净。
+**这批尚未部署到设备**（真机仍在 beta.3 上跑），验收清单见 HANDOFF 7.29。
+
+- **焦点环其实从来没显示过（审计 1.13）**：CSS 选的是 `.ed-tile-focused`，代码加的类名是
+  `ed-focus`，两条规则一条都没命中。改成 `.ed-tile.ed-focus`；`claimFocusRing` 仍清掉
+  `gpfocus`（不清会同时高亮两张瓦片）。
+- **上下不互逆（审计 1.8，最小改动）**：从工具栏进入网格时记 `gridEntryRef`，网格里按"上"
+  优先回来源控件；不重构行列模型。
+- **排序 collator（审计 2.8）**：英文界面用 `en`，中文用 `zh-Hans-CN`（原来固定中文，英文名
+  在 en 界面里按拼音排）。
+- **`steammenu` 死链（审计 2.9）**：删掉 `src/steammenu.tsx` 与 `fullscreen.tsx` 里的
+  `setSteamMenuEntryEnabled` 调用。
+- **i18n 小问题（审计 2.10）**：补 `Legendary {0}{1}` 英文条目、删重复键、
+  `INSTALL_FILTER_ORDER` 的过时注释。
+- **退出码 90 会让游戏启动两次（审计 3.12）**：启动脚本原来用
+  `[ "$EPICDECK_RC" -eq 90 ] || exit` 判断"要不要回退到 `legendary launch`"，
+  **游戏自己以 90 退出时就会被再启动一次**。改为 shim 真正拉起游戏进程后写 marker 文件
+  （`launch-<app>.started`），脚本每次启动前先 `rm -f` 再从 marker 判断；`_fallback` 走
+  `execv` 前也写 marker，exec 失败则撤回。
+- **死代码（审计 3.14）**：删掉 `steam.find_game/remove_game`、`Legendary.install/launch`、
+  `store.activeDownloads`。
+- **手机页与后端的授权码规则不一致（审计 3.14）**：`localauth.extract_code` 收
+  16–64 位字母数字，`main.extract_authorization_code` 只认 32 位 hex —— 手机上看到
+  "已发送"，下一步却报"没有识别到授权码"。两边统一成 32 位 hex，并加断言锁死一致。
+- **CI 一定会挂（审计 5.1）**：`pnpm install --frozen-lockfile` + `cache: pnpm`，而仓库里
+  没有 `pnpm-lock.yaml`。改为 `--no-frozen-lockfile` 并去掉 pnpm 缓存；等 lockfile 提交后
+  再改回来。
+- **`tsc --noEmit` 7 条错（审计 5.2）**：`skipLibCheck` 让 `@decky/api` 对 `react-router`
+  的引用不再致命；`react-icons/fa` 本地安装缺 `.d.ts`，用 `tsconfig.paths` 指到
+  `src/types/react-icons-fa.d.ts`（只声明实际用到的 14 个图标）。顺带抓到一个**真 bug**：
+  `fullscreen.tsx` 用了 `DIR_UP` 却没 import，网格内按上/下会抛 `ReferenceError`
+  （rollup 不做类型检查，所以上一版带着它构建成功了）。
+- **回归盲区（审计 5.3）**：i18n 覆盖从"只看 `t("…")` 字面量"改成"**任何中文字面量都必须
+  有英文条目**"（白名单：TABS 标签 + 语言自称），label map 检查也不再跳过 `TABS`。
+- **回归跨平台（审计 5.4）**：`regression.py` 支持 `--tmpdir` / `PYTHONPYCACHEPREFIX`，
+  默认把 `.pyc` 放到系统临时目录；`rollup build` 不再走 `npx`（Windows 上是 shell shim），
+  直接调 `node node_modules/rollup/dist/bin/rollup`。
+- **CDP 文档（审计 5.8）**：`CONTRIBUTING.md` 补四个脚本的用法和三条硬规矩
+  （不要注入 Escape、不要 `.focus()` 造状态、先确认屏保没亮）。
+
+### 设置页按"上/下"会跳过整块内容（待发 0.9.5-beta.5）
+
+- **吸顶顶栏被并进了内容行**：`moveFocusRowCol` 按"垂直中心"把候选控件聚成行，而顶栏
+  （`data-ed-level="header"`）是吸顶的、屏幕 Y 恒定，于是任何滚动经过该高度的内容行都会
+  和它并成同一行（设备上实测：「插件设置」那一行与顶栏芯片同属 `cy≈62~64` 的"一行"）。
+  行索引因此随滚动位置漂移，"下一行"会整块跳过 —— 从设置页顶部按"下"，17 次按键就走完了
+  2646px 的整页，中间十几个控件从没拿到过焦点。
+  改为：候选按 `closest('[data-ed-level="header"]')` 拆成 pinned / flowing 两组各自聚类，
+  顶栏永远排在内容行之前；顶栏按"下"时取**顶栏底边以下**的第一行（不能直接取
+  `rows[contentStart]`，那一行可能正滚在顶栏背后，跳过去会突然向上翻滚）；左右只在本组内走。
+  修后同一页面 24 步走到版本行，上/下对称、无死点。
+- **新增调试入口 `window.__epicdeckNavRC()`**：走 `onRootDirection` 里那条真实路径
+  （`moveFocusRowCol`）。原来的 `__epicdeckNav()` 走几何版 `moveFocus`，流式布局下**不是**
+  用户按键执行的那条代码，用它验收会得出错误结论。
+
+### 批次 5：原生控件看不见焦点（0.9.5-beta.5）
+
+- **设置页的开关 / 下拉 / 输入框聚焦时没有焦点环**。`claimFocusRing` 会给焦点元素加
+  `ed-focus`，但 CSS 只给 `.ed-chip/.ed-tile/.ed-action/.ed-row/.ed-info/.ed-loc/.ed-pager`
+  写了样式 —— Steam 原生控件（哈希类名）拿到了类却一条规则都匹配不上，于是"光标落到
+  开关上等于消失"。
+  补两层：① 给非自有控件加统一的外描边（`outline: 2px #4aa3ff`，不参与布局）；
+  ② **同样的环再挂一份到 `:focus`**——实测 `ed-focus` 会被 Steam 的焦点管理抹掉
+  （`hasEdFocus=false` 而元素仍是 `document.activeElement`），只靠类会时有时无。
+- **路径输入框改成内嵌环**：它的外壳是 `overflow:hidden`（`padding: 0 4px 0 40px`），
+  外扩 2px 的描边会被裁掉，等于没画；改成 `inset 0 0 0 2px`。
+- 顺带修掉一个观感问题：聚焦下拉时 Steam 会把整个按钮刷成白底黑字，现在保持深色 + 蓝环。
+- `cdp_shot.py` 支持裁剪放大：`cdp_shot.py out.png "大屏幕" x,y,w,h,scale`
+  （38×22 的开关在 1080px 全屏图里根本看不出有没有环）。
+
+### 设置页按「上」没反应：Steam 原生控件把方向键事件吃了（0.9.5-beta.6）
+
+- **症状**：焦点进到设置页之后，按「上」完全不动（「下」也会被 Steam 按 DOM 顺序代劳，
+  跳到相邻元素而不是上下一行）。**几何模型没问题**——用 `__epicdeckNavRC()` 走真实行/列
+  逻辑，从设置页底部连按 24 次「上」可以一路走到顶栏「刷新」，无死区。
+- **根因**：真机方向键在页面上是 DOM 事件 `vgp_ondirection`（`detail={button:9}`）。
+  Decky 的 `Focusable` 靠它派发 `onGamepadDirection`，但 **Steam 自己的控件**
+  （ToggleField / Dropdown / ButtonItem）会先把这个事件消化掉，挂在 `.ed-surface` 上的
+  React prop 就永远不被调用。实测同一位置：按「左」能收到 `{button:11}`，按「上」
+  一条记录都没有 —— 这就是"有时候能上、有时候不能"的来源。
+- **修法**：在 **window 捕获阶段**接管 `vgp_ondirection`，先于任何控件拿到同一次按键，
+  跑我们自己的 `moveFocusRowCol` / `moveFocus` 并掐掉事件。只接管"焦点在 `.ed-surface`
+  内"的按键（QAM / Steam 界面 / 我们自己的 ConfirmModal 一律放行）；
+  `onGamepadDirection` 保留作兜底，两条入口共用同一处理器，已有的 60ms 同键去重守卫生效。
+- **左右放行**：移动失败且焦点在 `[role=checkbox|switch|slider]` / `input[type=range]` /
+  `select` 上时不吞事件，交给 Steam —— 让「左右拨开关」这个 Steam 本能操作恢复可用。
+- **诊断**：新增 `window.__epicdeckDiag()`，一次取齐 `__epicdeckDirLog`（方向事件是否到达）、
+  `__epicdeckNavLog`（每次按键结果，失败时附 `describeRows()` 行模型快照）、
+  `__epicdeckFocusLog`（焦点争夺）。以后遇到"某个方向没反应"，先看第一份有没有那条记录。
+
+### 第三轮审计第二批（2026-11-11，0.9.5-beta.13）
+
+**代码质量**
+
+- **`usePluginSelector` + 封面 memo（审计 3.5，P2）**：以前 `usePluginState()` 订阅整个
+  state，而 `install_progress` 每秒写 1–2 次 —— 下载时外壳、库页、15 张封面、详情页全部重渲染。
+  新增 `usePluginSelector(selector, isEqual)`（按 state 快照缓存 + 浅比较，值没变就返回旧引用），
+  外壳只订阅「除 progress 之外」的字段（活动下载数单独算），`LibraryTile` 改成 `memo` 并各自
+  订阅 `progress[app_name]`，`DetailView` 只订阅自己那一行。实测下载中封面徽标仍实时跳动
+  （74% → 81% → 86% → 91%），顶栏「下载 1」正常。
+- **12 个手写 `Focusable` 统一成 `ActionButton`（审计 3.6，P2）**：详情页 5 个动作按钮、
+  下载页 7 个（暂停/取消/继续/查看/下载设置×2）原本各自实现 `once()` 去重、各自决定
+  `onClick`/`onActivate`。现在全部走 `ActionButton`（自带 300ms 去重 + `noFocusRing` +
+  禁用态移出焦点序列），顺带删掉 15 行 `once()` 守卫和 `guardRef`。
+- **删除死代码（审计 3.7，P3）**：`getProtonDbCached`、`fmtMinutes`、`activeLabel`、
+  `DIRECTION_BUTTONS` 四个无人引用的导出；`.ed-row` 整套 CSS（没有任何元素用这个类）；
+  `data-ed-own` 保留但注明是预留钩子。`langFromSteam` 保留（`test_i18n.py` 在用）。
+
+**观感**
+
+- **网格左边线（V8）**：封面从 x=21.6 起、筛选 chip 从 x=16 起，差 5.6px。网格外层加
+  `-0.35em` 负 margin 抵掉给焦点环留的内边距，实测 chip x=16 / tile x=16，环仍有 5.6px 余量。
+- **封面状态字可读性（V9）**：底部渐变起点 45% → 32%、中段 0.55 → 0.62，标题与状态行加
+  `text-shadow`，浅色封面（龙腾世纪）上的「未安装 / 体积」不再发灰。
+- **提示条文案（V11）**：详情页 L1/R1 实际是切标签，但底部仍写「上一页」；改成按
+  `detail` 切换成「上一个标签 / 下一个标签」（新增两条英文词条）。
+- **下载空态居中（V13）**：卡片贴在上半屏、下面 230px 空白 → 外层 `flex:1` + 居中，
+  实测卡片中心 267 / 内容区中心 267。
+
+**目录与文档（D6 / D7 / D10）**
+
+- `src/types.d.ts` 并入 `src/types/assets.d.ts`，类型入口只剩一个目录（D6）。
+- CONTRIBUTING 新增「`scripts/` 里都是什么」总表（21 个脚本逐个说明），并把「共 10 项」
+  更正为「10 项 / 带 `--build` 是 12 项」（D7 / D10）。
+- `regression.py --tmpdir` 现在真的管住全部临时文件：三个套件的 `mkdtemp` 改为读
+  `EPICDECK_TMPDIR`，`regression` 把同一个目录通过 `TMPDIR/TEMP/TMP` 传给子进程。
+  实测 `--tmpdir /tmp/edtmp` 后套件的 `epicdeck-smoke-*` 就落在该目录（D10）。
+
+**设计 token（B7 部分）**
+
+- 新增 `src/tokens.ts`：品牌蓝、次级蓝、成功、警告、危险两档共 7 个语义色。
+  26 处硬编码十六进制收敛到 token（`GLOBAL_CSS` 里用 `${COLOR.accent}` 插值）。
+  **字号与透明度没有收敛**：21 种字号是逐屏对着截图调的 em 值，机械合并成 5 档需要逐屏
+  重新验证，属于视觉回归风险，留给专门一轮（理由写进 `tokens.ts` 头注释）。
+
+### 第三轮审计第一批（2026-11-11，0.9.5-beta.12）
+
+**工程红线**
+
+- **`tsc --noEmit` 3 条错（审计 3.1，CI 必红）**：`hooksRef` 的初始值 `() => false` 被 TS
+  推断成字面量 `false`，赋 boolean 实现就报 TS2322。补显式 `DebugHooks` 类型，现 `tsc` 干净。
+- **取消/卸载后 `install_snapshots` 不清（审计 3.3）**：取消一个暂停中的下载 → 目录与
+  `.resume` 都删了，但 7 天内的 paused 快照仍在，重载后下载页又冒出一行「已暂停/继续」，
+  点继续从零重下。`cancel_install` / `uninstall` 补 `_forget_terminal()`；
+  `get_active_installs` 合并快照时再按 `ts` 过滤一次。
+
+**观感**
+
+- **搜索框完全空白（V1）**：加 `placeholder="搜索"`（实测 `input.placeholder` 已生效）。
+- **两套焦点环（V2）**：12 个手写 `Focusable.ed-action` + 2 个翻页键补 `noFocusRing`，
+  不再出现"白方框套在蓝色圆角按钮外面"。
+- **下载空态按钮撑满整行（V3/3.2）**：772px → 250px（`fit-content` + auto margin 居中）。
+- **详情页两个返回入口（V4）**：删掉内容区的「← 游戏库」chip，返回统一交给顶栏「返回」/B。
+- **账号 ID 掩码太长（V5）**：固定 3 颗星（`1b6***0f9`），不再铺 26 颗。
+- **示例被 Steam 转大写（V6）**：三处 `TextField` 的 label（自定义路径 / 首选 CDN /
+  启动参数）改成字段下方的小字提示，`/run/media/...` 不再显示成 `/RUN/MEDIA/...`。
+- **`useViewport` 在不可见时挂载会停在 0.95 缩放（3.10）**：补 `resize` /
+  `visibilitychange` 监听与挂载后 300ms、1s 两次补测。
+- **`library_patch` 每来一条就写 localStorage（3.4）**：改 1s trailing 防抖，页面隐藏时立即落盘。
+
+**文档/目录**
+
+- CHANGELOG 两个 `## [0.9.5]` 合并成一个（测试包标到 beta.12）；README「Legendary 约 3 MB」→ 14 MB；
+  CONTRIBUTING 删掉"仓库没有 lockfile"三处旧说明；新增 `.gitattributes`（`*.sh|*.py|*.ts eol=lf`，
+  避免 Windows 的 CRLF 让 Deck 上 `deploy.sh` 报 `pipefail: invalid option name`）；
+  历史审查/计划归档到 `docs/audits/` 并加 `docs/README.md` 索引。
+
+### 复审遗留清单收尾（2026-11-11，beta.7–beta.8）
+
+- **焦点丢到 `<body>` 后无人捞回（beta.8）**：`focusout` 兜底补挂 `pointerup`（捕获阶段）。
+  Chromium 在"聚焦节点被移除"时不一定派发 `focusout`，焦点掉了以后页面看起来正常、
+  方向键却全静默；实测「点筛选 chip 既不生效也不聚焦」就是这个。
+
+- **4.2 极早取消保住 `.resume`**：`_clear_partial_download` 的守卫从
+  `not removed_any and candidates` 改成 `not removed_any` —— legendary 还没打印
+  `Install path:` 时候选为空，以前会走到删 `.resume` 的分支（空间没释放、续传也没了）。
+- **4.4 回来源前校验可聚焦**：网格按"上"回 `gridEntryRef` 时加 `canFocus()`，
+  避免落回刚被翻页禁用的箭头（`aria-disabled` + `tabIndex=-1`）。
+- **4.3 翻页不抢光标**：`flipPageAndFocus` 在焦点位于工具栏时只翻页、不落焦
+  （以前会把光标拽进第 1 张封面）。
+- **4.6 调试钩子不再有缝隙**：`__epicdeckNav/NavRC/Bump/Tab/Diag` 注册一次、
+  函数体走 ref，CDP 不会再拿到 `undefined`。
+- **4.8 点击不再被"拉回"**：`settleFocus` 第 2 分支用 `pointerdown` 时间戳区分
+  "用户点的"和"Steam 插队"，120ms 内的指针按下直接接受这次焦点变化。
+- **5.1 收尾：鉴权未知 ≠ 未登录**：`store` 新增 `authUnknown`，超时时保留上一次
+  登录态；全屏页显示「无法确认登录状态 + 重试」，QAM 也不再弹登录表单。
+- **2.3 收尾：暂停/出错任务持久化**：后端把 `paused`/`error` 行写进
+  `install_snapshots`（7 天自动清理），`get_active_installs` 一并返回，重载插件后
+  下载页仍能看到并可「继续」。
+- **复审 #8 配置写入加锁**：`config.save()` 加 `RLock` + 字典快照，避免并发
+  `set()` 时 `dictionary changed size during iteration`。
+- **复审 #9 `.resume` 全名匹配**：不再用 `app_name[:12]`，同前缀的游戏不会互删断点。
+
+## [0.9.4] - 2026-11-09（未发布；当前测试包 0.9.4-beta.3）
+
+实机部署 0.9.3 后立刻暴露的三个问题。
+
+### 修复
+
+- **`py_modules/steam.py` 用了 `re` 却没 import**：`_active_user()` 解析
+  `registry.vdf` 时抛 `NameError`，被 `_sync_launcher_scripts()` 吞成
+  「launcher sync skipped」，连带 `list_shortcuts()` 全部失效（封面/图标/快捷方式
+  同步都走这条路径）。0.9.3 部署后日志第一行就报这个，属审查修复引入的回归。
+- **「登出」没有二次确认**：`signOut()` 会删掉本机凭据（并清库缓存），
+  误触后必须回 Epic 重新授权。现补上与「切换账号」一致的确认框
+  （实机误触复现：点一下即登出，未登录 + 游戏数 0）。
+- **B 关详情后焦点掉到 `<body>`，整个页面收不到方向键**：`closeDetail()` 原来用
+  固定 80ms 定时器去聚焦封面，但那一刻详情页还占着位置、`[data-ed-app]` 尚未挂载，
+  循环空转；随后兜底逻辑又把焦点还给已经卸载的详情按钮（对脱离文档的节点
+  `focus()` 静默失效），焦点最终停在 `body`。而 `body` 不触发 `focusin`，
+  `settleFocus` 拉不回来，方向键处理器又挂在页面根节点上 —— 表现就是「按 B 返回后
+  界面失联」。改为：`closeDetail` 只记录 app_name，由 `useEffect([detail])` 在
+  提交后按名字找封面（找不到每 100ms 重试，最多 12 次），并 `reverifyFocus` 12 帧
+  防 Steam 抢焦点；同时新增文档级 `focusout` 兜底（锚点失效时回退到第一张封面/顶栏
+  按钮；Decky 确认框打开时不抢）。实机复测：B 之后焦点落在原封面，左/右方向键
+  正常（`__epicdeckNavLog` 记录 `moved: true`）。
+
+## [0.9.3] - 2026-11-09
+
+代码审查（`EpicDeck-审查报告.md`）修复。按报告编号列出，方便对照。
+
+### 修复（P0）
+
+- **浏览器登录可能抓到上一次的旧授权码**：自动 Ctrl+A/Ctrl+C 分支现在要求剪贴板内容
+  **与会话开始时的 baseline 不同**（此前只有手动粘贴分支做了这个比较）。等待提示从
+  「15 秒」改为与实际首抓延迟一致的「20~30 秒」。
+- **ProtonDB 徽章对多数游戏不显示**：搜索改用**英文商店**（`l=english`，失败再回退
+  `l=schinese`），并用库快照里的 `source_title`（Epic 英文原名）作为查询词。旧的失败
+  缓存通过 `protondb_scheme` 版本号自动作废。
+- **未登录时无法进入设置**：全屏页在未登录时也允许切到「设置」，QAM 登录面板下方新增
+  「设置与诊断」入口；设置页账号区在未登录时显示「去登录」而不是登出按钮。
+- **危险操作没有二次确认**：卸载、取消下载（含删除断点）、重启 Steam、清理下载缓存、
+  下载/双向同步云存档、切换账号，全部加确认框，文案写明会删除/覆盖什么。
+- **取消下载可能删错目录**：删除前半成品目录要同时满足「不在系统/家目录」「位于已配置
+  安装根目录下」「含 `.egstore` 或 `__install__`」；并先等下载进程退出（15s 超时）再清理。
+  > **更正（2026-11-10）**：这条实际没生效。`legendary 0.21.1` 的已完成安装也没有
+  > `.egstore`/`__install__`，标记条件让删除路径根本走不到，而 `.resume` 照删 ——
+  > 于是「取消并删除」既不删目录、又让断点失效。已在 0.9.5（审计 3.3）用
+  > `install_targets` 兜底 + 标记条件改为"未完成即可删"修掉，并在真机上验过。
+- **未加入 Steam 时启动会「有声音没画面」**：启动前若没有快捷方式，先自动添加到 Steam
+  再启动；自动添加失败会在安装完成提示里说明。
+- **切换 Proton 设置对 Steam 直接启动不生效**：`set_setting` 在 `use_proton` /
+  `proton_path` 变化后重写所有启动脚本，不再需要重载插件。
+- **暂停后恢复丢失自定义安装目录**：安装开始时记录 `install_targets`，恢复时沿用；
+  取消下载的清理也用这份记录兜底。
+
+### 修复（P1 / 数据安全）
+
+- **新购买的游戏没有体积/封面**：库的 app 集合变大时重置 `_meta_done` 与图片缓存。
+- **强制刷新被取消可能丢 `entitlements.json`**：`finally` 中若原文件缺失则先恢复备份。
+- **启动参数引号不匹配会卡住「正在启动」**：保存前 `shlex.split` 校验，`launch` 也捕获
+  `ValueError`；前端所有动作统一 `try/finally` 复位 `busy`。
+- **扫码页离开后仍开着局域网服务**：离开页面即 `cancel_login()`。
+- **剪贴板错误回显内容**：失败提示不再带剪贴板片段。
+- **云存档下载会覆盖本地**：下载/双向同步前把存档目录复制到 `*.epicdeck-backup-<时间>`，
+  只保留最近 3 份。
+- **导出诊断日志包含整个游戏库**：改为白名单输出排障设置，账号 ID 与显示名掩码。
+- **下载过程中可以清理下载缓存**：有活动下载时拒绝并提示先暂停。
+- **卸载后 Steam 条目残留**：卸载同时移除快捷方式（封面保留，重装可复用）。
+- **升级后重复弹出首次运行向导**：已有 `install_dir` 的旧配置自动补 `first_run_done`。
+
+### 修复（交互）
+
+- **最后一页封面被拉满整屏**：网格行数按整页容量计算，并 `alignContent: start`。
+- **详情页按 B 返回后第一次方向键失灵**：关闭详情时把焦点还给对应封面。
+  > **更正（2026-11-10）**：这条当时没修好，`0.9.4` 才定位到真正原因（固定 80ms 定时器
+  > 抢在卡片挂载之前跑，焦点最终落在 `body`）。结论见上方 `[0.9.4]`。
+- **聚焦即切页 / 聚焦即筛选**：tab 与筛选改为 A 键确认，光标经过不再挂载页面。
+  > **更正（2026-11-10）**：改完之后 **用 L1/R1 切标签，光标不再跟到新 chip**
+  > （A 键确认那条路径没问题）。已在 0.9.5（审计 1.5）补上，见下一节。
+- **设置页反复抢焦点**：只在 40/220ms 尝试落焦，且用户已移动焦点后不再拉回。
+- **字体过小**：0.70–0.78em 的说明文字统一提高到 0.8–0.84em。
+
+### 安全与工程
+
+- TLS **不再**在证书校验失败时回退到 `CERT_NONE`（该上下文被带 token 的请求复用）。
+- 登录写入的 `user.json` 设为 `0600`。
+- `app_name` 作为路径片段前校验字符集（启动脚本 / Proton 包装 / 安装日志）。
+- Steam 快捷方式优先写入 `registry.vdf` 里 `ActiveUser` 对应的账号目录。
+- `SECURITY.md` 更正：说明 `EPIC_LAUNCHER_SECRET` 是公开客户端常量；补充诊断导出范围。
+- `NOTICE` 补上打包进 `dist` 的 MIT 依赖版权与许可全文。
+- CI 增加 `tsc --noEmit` 与 `scripts/regression.py`；`pnpm test` 不再固定失败；
+  beta tag 标为 prerelease，避免被当成最新稳定版。
+- 「Legendary 约 3 MB」更正为约 14 MB。
+- `Config` 默认值改 `deepcopy`，避免不同实例共享嵌套 dict。
+- 修正一处未翻译的 JSX 文本（「日志已导出到:」）。
+
 ## [0.9.2] - 2026-11-06
 
 ### 新增

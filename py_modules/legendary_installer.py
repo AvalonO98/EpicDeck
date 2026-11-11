@@ -77,10 +77,10 @@ def _ssl_context():
     ):
         if os.path.isfile(candidate):
             return ssl.create_default_context(cafile=candidate)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+    # Fail closed. The previous fallback disabled verification entirely, and
+    # `epic_api` reuses this context for requests carrying a Bearer token —
+    # "verification failed, so trust anything" is exactly wrong there.
+    return ssl.create_default_context()
 
 # Map (system, machine) -> asset name on the release page.
 # machine is normalized to x86_64 / aarch64 before lookup.

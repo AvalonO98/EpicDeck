@@ -26,7 +26,7 @@ export const DIR_RIGHT = 12;
 export const DIR_DOWN = 10;
 
 const CANDIDATE_SELECTOR =
-  '[tabindex]:not([tabindex="-1"]),button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),a[href]';
+  '[tabindex]:not([tabindex="-1"]):not([aria-disabled="true"]),button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),a[href]';
 
 /**
  * Elements that are *containers* rather than leaves. They carry `tabindex` from
@@ -39,6 +39,19 @@ function isLeafFocusable(el: HTMLElement): boolean {
   } catch {
     return true;
   }
+}
+
+/** First element in `root` that a cursor may legitimately land on. */
+function firstLeaf(root: HTMLElement): HTMLElement | null {
+  try {
+    const nodes = Array.from(root.querySelectorAll<HTMLElement>(CANDIDATE_SELECTOR));
+    for (const el of nodes) {
+      if (isLeafFocusable(el) && isVisible(el, root.ownerDocument)) return el;
+    }
+  } catch {
+    /* malformed tree: nothing to fall back to */
+  }
+  return null;
 }
 
 function isVisible(el: HTMLElement, doc: Document): boolean {
@@ -80,6 +93,14 @@ let remembered: HTMLElement | null = null;
  * 真实的(程序性聚焦、切标签),正常接受。
  */
 let ownedTarget: HTMLElement | null = null;
+//: 最近一次真实的指针按下（触摸/鼠标）。用来把"用户自己点控件"与"Steam 插队"区分开。
+let lastPointerAt = 0;
+
+/** Record a real pointer press; call from a document capture listener. */
+export function notePointerDown() {
+  lastPointerAt = Date.now();
+  return lastPointerAt;
+}
 /** 本次移动是否已经吸收过一次 Steam 插队(每次移动只吸收一次)。 */
 let ownedSettled = false;
 
@@ -87,6 +108,18 @@ export function rememberFocus(el: HTMLElement | null | undefined) {
   remembered = el ?? null;
   ownedTarget = null;
   ownedSettled = false;
+}
+
+/**
+ * The element focus should fall back to when Steam drops it on `<body>`.
+ *
+ * 2026-11-09 实机：B 关详情后 Steam 把自己的 B 处理跑完，焦点落到 `body`。
+ * `body` 拿到焦点**不会**触发 `focusin`，所以 `settleFocus` 的拉回逻辑根本没有机会
+ * 执行；而 `onRootDirection` 只挂在插件根节点上，焦点不在里面就收不到方向键 ——
+ * 表现就是「按 B 关掉详情后整个界面失联」。
+ */
+export function peekAnchor(): HTMLElement | null {
+  return remembered;
 }
 
 /**
@@ -112,14 +145,46 @@ export function focusOwned(el: HTMLElement) {
  * back on it.
  */
 export function settleFocus(target: HTMLElement, root: HTMLElement): HTMLElement {
+  // 0) 容器（页面根 / Panel / NavRow）永远不能成为锚点。
+  //
+  // 点一下封面之间的空隙、工具栏空白或标题文字时，浏览器把焦点交给最近的
+  // 可聚焦祖先 —— 也就是 `.ed-surface` 自己。锚点一旦变成容器，`usable()` 会
+  // 一律返回 false、`currentFocused()` 也返回 null，方向键被 preventDefault 吞掉
+  // 却什么都不发生，整个界面从此对摇杆/A 键无响应（审计 1.2，实机点两下空白必现）。
+  // 保持原锚点并把它按回去；没有可用锚点就落到页面第一个控件。
+  if (!isLeafFocusable(target)) {
+    if (remembered && remembered.isConnected && root.contains(remembered)) {
+      try {
+        remembered.focus();
+      } catch {
+        /* fall through to the first-leaf fallback */
+      }
+      if (root.ownerDocument.activeElement === remembered) return remembered;
+    }
+    const first = firstLeaf(root);
+    if (first) {
+      remembered = first;
+      return first;
+    }
+    return target;
+  }
   // 1) 正是我们自己移到的元素 → 确认。
   if (ownedTarget && target === ownedTarget) {
     remembered = target;
     return target;
   }
   // 2) 我们刚移过、还没吸收过插队 → 这是 Steam 对同一次按键的响应,拉回。
+  //
+  // 但用户用手指/鼠标点某个控件时，浏览器同样会给新元素 focusin —— 那不是插队。
+  // 旧逻辑会把它当成 Steam 抢焦点、把焦点按回旧元素：点击生效了、焦点环却留在
+  // 原处，接着按 A 作用在旧元素上（复审 4.8）。120ms 内有指针按下就接受。
   if (ownedTarget && !ownedSettled && root.contains(ownedTarget)) {
     ownedSettled = true;
+    if (Date.now() - lastPointerAt < 120) {
+      ownedTarget = null;
+      remembered = target;
+      return target;
+    }
     try {
       ownedTarget.focus();
       remembered = ownedTarget;
@@ -147,7 +212,11 @@ export function settleFocus(target: HTMLElement, root: HTMLElement): HTMLElement
 export function reverifyFocus(expected: HTMLElement, root: HTMLElement, frames = 2) {
   if (!root.contains(expected)) return;
   const doc = root.ownerDocument;
-  if (doc.activeElement !== expected) {
+  // 只在"焦点丢了"时拉回。之前是"activeElement 不是 expected 就拉回"，于是
+  // 返回后 200ms 内用户推的第一下摇杆会被下一帧抢回去，感觉像"第一下没反应"（审计 1.9）。
+  const active = doc.activeElement as HTMLElement | null;
+  const lost = !active || active === doc.body || active === root || !root.contains(active);
+  if (lost) {
     try {
       expected.focus();
       remembered = expected;
@@ -256,7 +325,10 @@ export function currentFocused(root: HTMLElement): HTMLElement | null {
     return marked[0];
   }
 
-  return active && root.contains(active) && isLeafFocusable(active) ? active : null;
+  if (active && root.contains(active) && isLeafFocusable(active)) return active;
+  // 宁可返回页面里第一个可聚焦控件，也不要返回 null：null 会让方向键"被吞但没反应"，
+  // 用户看到的是整个界面失联，而不是光标跳一下。
+  return firstLeaf(root);
 }
 
 /**
@@ -466,6 +538,126 @@ export function moveFocus(
  * picking the horizontally nearest one on the target row matches the intuition
  * ("上下切换行,左右切换按钮", 2026-11-06 用户要求).
  */
+type NavRow = { center: number; items: HTMLElement[] };
+
+/** 顶栏（`data-ed-level="header"`）是吸顶的，聚类时必须和内容分开。 */
+function isPinned(el: HTMLElement): boolean {
+  return !!el.closest?.('[data-ed-level="header"]');
+}
+
+/** 每个可见的叶子可聚焦元素；当前元素无条件保留，行聚类需要它做参照。 */
+function collectCandidates(root: HTMLElement, active: HTMLElement, doc: Document): HTMLElement[] {
+  let all: HTMLElement[] = [];
+  try {
+    all = Array.from(root.querySelectorAll<HTMLElement>(CANDIDATE_SELECTOR));
+  } catch {
+    return [active];
+  }
+  const out: HTMLElement[] = [];
+  for (const el of all) {
+    if (el === active) {
+      out.push(el);
+      continue;
+    }
+    if (active.contains(el) || el.contains(active)) continue;
+    if (!isLeafFocusable(el) || !isVisible(el, doc)) continue;
+    out.push(el);
+  }
+  return out;
+}
+
+const rowCenter = (el: HTMLElement): number => {
+  const b = el.getBoundingClientRect();
+  return b.top + b.height / 2;
+};
+
+/**
+ * Cluster controls into rows by vertical-centre proximity. Buttons sharing a
+ * flex row sit ~0px apart; a control in the next Group sits 40px+ lower, so a
+ * band of half the shorter control's height (floor 16px) separates them cleanly.
+ */
+function clusterRows(list: HTMLElement[]): NavRow[] {
+  const sorted = list.slice().sort((a, b) => rowCenter(a) - rowCenter(b));
+  const out: NavRow[] = [];
+  for (const el of sorted) {
+    const cy = rowCenter(el);
+    const last = out[out.length - 1];
+    const band = last
+      ? Math.max(16, Math.min(el.getBoundingClientRect().height, last.items[0].getBoundingClientRect().height) * 0.5)
+      : 0;
+    if (last && Math.abs(cy - last.center) <= band) {
+      last.items.push(el);
+      last.center = (last.center * (last.items.length - 1) + cy) / last.items.length;
+    } else {
+      out.push({ center: cy, items: [el] });
+    }
+  }
+  return out;
+}
+
+/**
+ * 顶栏单独成组并且永远排在内容行之前，"跨过顶栏"的那一步单独算。
+ *
+ * 为什么必须分开：吸顶元素的屏幕 Y 恒定，滚到同一高度的内容行会被并进同一
+ * "行"。2026-11-10 实机走查直接复现——设置页里「插件设置」那一行和顶栏芯片
+ * 聚成了同一行（cy 62 vs 64），"相邻行"索引因此错位，按"下"整块跳过。
+ */
+function splitRows(candidates: HTMLElement[]): { rows: NavRow[]; contentStart: number } {
+  const pinned = clusterRows(candidates.filter(isPinned));
+  const content = clusterRows(candidates.filter((el) => !isPinned(el)));
+  return { rows: pinned.concat(content), contentStart: pinned.length };
+}
+
+/** 离 `y` 最近的行（只在 [from,to) 里找）。 */
+function nearestRowIndex(rows: NavRow[], from: number, to: number, y: number): number {
+  let best = -1;
+  let gap = Number.POSITIVE_INFINITY;
+  for (let i = from; i < to; i += 1) {
+    const g = Math.abs(y - rows[i].center);
+    if (g < gap) {
+      gap = g;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/**
+ * Compact snapshot of the row model + where the cursor sits in it.
+ *
+ * 实机排查用：`onRootDirection` 把失败的那一次按键连同这个快照写进
+ * `__epicdeckNavLog`，于是"点了没反应"能区分成三种完全不同的原因——
+ * 行模型里根本没有顶栏（pinned=0）、当前行已经是第 0 行（atTop）、
+ * 或者算出了目标但 DOM 焦点被抢走（domFocus 对不上）。
+ */
+export function describeRows(scope?: HTMLElement | null) {
+  const root = scope || (document.querySelector(".ed-surface") as HTMLElement | null);
+  if (!root) return null;
+  const doc = root.ownerDocument;
+  const active = usable(remembered, root) ? (remembered as HTMLElement) : currentFocused(root);
+  const label = (el: HTMLElement | null | undefined) =>
+    (el?.innerText || el?.className || "").trim().replace(/\s+/g, " ").slice(0, 14);
+  if (!active) return { active: null, rows: [], pinned: 0 };
+  const candidates = collectCandidates(root, active, doc);
+  const { rows, contentStart } = splitRows(candidates);
+  const fy = rowCenter(active);
+  const myRow = isPinned(active)
+    ? nearestRowIndex(rows, 0, contentStart, fy)
+    : nearestRowIndex(rows, contentStart, rows.length, fy);
+  return {
+    active: label(active),
+    domFocus: label(doc.activeElement as HTMLElement | null),
+    anchored: usable(remembered, root),
+    pinned: contentStart,
+    rows: rows.length,
+    atRow: myRow,
+    content: rows.slice(contentStart, contentStart + 3).map((row) => ({
+      cy: Math.round(row.center),
+      items: row.items.map(label),
+    })),
+  };
+}
+
 export function moveFocusRowCol(
   button: number,
   scope?: HTMLElement | null
@@ -480,65 +672,21 @@ export function moveFocusRowCol(
   const active = usable(remembered, root) ? (remembered as HTMLElement) : currentFocused(root);
   if (!active) return false;
 
-  // Collect every visible leaf focusable within the scope — *including* the
-  // active element, so the row/column cluster knows which row/column it is in.
-  // The active element is skipped only when picking the movement target.
-  let all: HTMLElement[] = [];
-  try {
-    all = Array.from(root.querySelectorAll<HTMLElement>(CANDIDATE_SELECTOR));
-  } catch {
-    return false;
-  }
-  const candidates: HTMLElement[] = [];
-  for (const el of all) {
-    if (el === active) {
-      candidates.push(el);
-      continue;
-    }
-    if (active.contains(el) || el.contains(active)) continue;
-    if (!isLeafFocusable(el) || !isVisible(el, doc)) continue;
-    candidates.push(el);
-  }
+  // 当前元素无条件保留，行聚类需要它做参照；其余只留可见的叶子控件。
+  const candidates = collectCandidates(root, active, doc);
   if (candidates.length === 0) return false;
 
   const r = active.getBoundingClientRect();
   const fx = r.left + r.width / 2;
   const fy = r.top + r.height / 2;
 
-  const rowKey = (el: HTMLElement): number => {
-    const b = el.getBoundingClientRect();
-    return b.top + b.height / 2;
-  };
-  const sorted = candidates.slice().sort((a, b) => rowKey(a) - rowKey(b));
+  const { rows, contentStart } = splitRows(candidates);
 
-  // Cluster into rows by vertical-centre proximity. Buttons sharing a flex row
-  // sit ~0px apart; a control in the next Group sits 40px+ lower, so a band of
-  // half the shorter control's height (floor 16px) separates them cleanly.
-  const rows: { center: number; items: HTMLElement[] }[] = [];
-  for (const el of sorted) {
-    const cy = rowKey(el);
-    const last = rows[rows.length - 1];
-    const band = last
-      ? Math.max(16, Math.min(el.getBoundingClientRect().height, last.items[0].getBoundingClientRect().height) * 0.5)
-      : 0;
-    if (last && Math.abs(cy - last.center) <= band) {
-      last.items.push(el);
-      last.center = (last.center * (last.items.length - 1) + cy) / last.items.length;
-    } else {
-      rows.push({ center: cy, items: [el] });
-    }
-  }
-
-  // Locate the row the active element sits in.
-  let myRowIndex = -1;
-  let myRowGap = Number.POSITIVE_INFINITY;
-  for (let i = 0; i < rows.length; i += 1) {
-    const gap = Math.abs(fy - rows[i].center);
-    if (gap < myRowGap) {
-      myRowGap = gap;
-      myRowIndex = i;
-    }
-  }
+  // Locate the row the active element sits in. 顶栏只在顶栏里找，内容只在内容里
+  // 找——否则吸顶那一行会把它旁边经过的内容行抢走。
+  const myRowIndex = isPinned(active)
+    ? nearestRowIndex(rows, 0, contentStart, fy)
+    : nearestRowIndex(rows, contentStart, rows.length, fy);
   if (myRowIndex < 0) return false;
 
   const horizontal = button === DIR_LEFT || button === DIR_RIGHT;
@@ -577,20 +725,47 @@ export function moveFocusRowCol(
   }
 
   // Vertical: jump to the adjacent row and pick the x-nearest control there.
-  const nextI = button === DIR_UP ? myRowIndex - 1 : myRowIndex + 1;
-  if (nextI < 0 || nextI >= rows.length) return false;
-  const row = rows[nextI].items;
-  let target: HTMLElement | null = null;
-  let bestDx = Number.POSITIVE_INFINITY;
-  for (const el of row) {
-    if (el === active) continue;
-    const b = el.getBoundingClientRect();
-    const dx = Math.abs(b.left + b.width / 2 - fx);
-    if (dx < bestDx) {
-      bestDx = dx;
-      target = el;
+  const pickInRow = (rowIndex: number): HTMLElement | null => {
+    let best: HTMLElement | null = null;
+    let bestDx = Number.POSITIVE_INFINITY;
+    for (const el of rows[rowIndex].items) {
+      if (el === active) continue;
+      const b = el.getBoundingClientRect();
+      const dx = Math.abs(b.left + b.width / 2 - fx);
+      if (dx < bestDx) {
+        bestDx = dx;
+        best = el;
+      }
     }
+    return best;
+  };
+
+  let nextI: number;
+  if (button === DIR_UP) {
+    if (myRowIndex <= 0) return false;
+    nextI = myRowIndex - 1;
+  } else if (myRowIndex < contentStart) {
+    // 顶栏按"下"：去**顶栏底边以下**的第一行。不能直接取 rows[contentStart]，
+    // 内容行可能正滚到顶栏背后（cy 比顶栏底边还小），跳过去会突然向上翻滚。
+    const headerBottom = Math.max(
+      ...rows
+        .slice(0, contentStart)
+        .flatMap((row) => row.items.map((el) => el.getBoundingClientRect().bottom))
+    );
+    nextI = -1;
+    for (let i = contentStart; i < rows.length; i += 1) {
+      if (rows[i].center >= headerBottom - 2) {
+        nextI = i;
+        break;
+      }
+    }
+    if (nextI < 0) return false;
+  } else {
+    if (myRowIndex + 1 >= rows.length) return false;
+    nextI = myRowIndex + 1;
   }
+
+  const target = pickInRow(nextI);
   if (!target) return false;
   scrollIntoViewport(root, target);
   focusOwned(target);
@@ -622,6 +797,9 @@ export function moveFocusRowCol(
  */
 export function claimFocusRing(target: HTMLElement, root: HTMLElement) {
   try {
+    // 我们也清掉 Steam 的 `gpfocus`：审计 1.13 建议"交回 Steam"，但实测如果不清，
+    // 上一张封面会保持 gpfocus，CSS 里 `.ed-tile.gpfocus` 同样命中，屏幕上会同时
+    // 有两张高亮。这里保留清理，只画一个环（`noFocusRing` 已关掉 Steam 的方框）。
     for (const el of Array.from(root.querySelectorAll(".ed-focus, .gpfocus"))) {
       if (el !== target) {
         el.classList.remove("ed-focus");
@@ -634,4 +812,8 @@ export function claimFocusRing(target: HTMLElement, root: HTMLElement) {
   }
 }
 
-export const DIRECTION_BUTTONS = [DIR_LEFT, DIR_UP, DIR_RIGHT, DIR_DOWN];
+/** True when `el` may legitimately receive the cursor right now (复审 4.4). */
+export function canFocus(el: HTMLElement | null | undefined, root: HTMLElement): boolean {
+  return usable(el, root);
+}
+

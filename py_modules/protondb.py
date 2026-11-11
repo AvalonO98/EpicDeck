@@ -120,10 +120,10 @@ def _ssl_context() -> ssl.SSLContext:
     try:
         return ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
     except Exception:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
+        # No CA bundle we can trust. Keep verification ON and let the handshake
+        # fail (fail closed) — SECURITY.md forbids CERT_NONE fallbacks, and a
+        # MITM could otherwise push a fake "latest version" / title (audit 3.11).
+        return ssl.create_default_context()
 
 
 def _normalise(text: str) -> str:
@@ -213,30 +213,39 @@ def search_appid(title: str, timeout: float = 12.0) -> tuple[int, str, float]:
         _last_error = "cooling down after earlier failures"
         return 0, "", 0.0
 
-    query = urllib.parse.urlencode({"term": title, "l": "schinese", "cc": "CN"})
-    url = SEARCH_URL + "?" + query
-
     best_id, best_name, best_score = 0, "", 0.0
-    for attempt in range(2):
-        ok, payload, _ = _get_json(url, timeout)
-        if ok and isinstance(payload, dict):
-            for item in payload.get("items") or []:
-                if not isinstance(item, dict) or item.get("type") != "app":
-                    continue
-                name = str(item.get("name") or "")
-                score = similarity(title, name)
-                if score > best_score:
-                    try:
-                        appid = int(item.get("id"))
-                    except (TypeError, ValueError):
-                        continue
-                    best_id, best_name, best_score = appid, name, score
+    # The store localises result names, and the matcher cannot compare an
+    # English query with a pure-Chinese name (`Hogwarts Legacy` vs `霍格沃茨之遗`
+    # scores 0.0). Ask the English storefront for the English title first, then
+    # the Chinese one for titles that only exist localised.
+    answered = False
+    for lang, country in (("english", "US"), ("schinese", "CN")):
+        if best_score >= 0.97:
             break
-        if attempt == 0:
-            time.sleep(1.0)
-        else:
-            # Both attempts failed: assume the endpoint is unreachable.
-            _note_failure()
+        query = urllib.parse.urlencode({"term": title, "l": lang, "cc": country})
+        url = SEARCH_URL + "?" + query
+        for attempt in range(2):
+            ok, payload, _ = _get_json(url, timeout)
+            if ok and isinstance(payload, dict):
+                answered = True
+                for item in payload.get("items") or []:
+                    if not isinstance(item, dict) or item.get("type") != "app":
+                        continue
+                    name = str(item.get("name") or "")
+                    score = similarity(title, name)
+                    if score > best_score:
+                        try:
+                            appid = int(item.get("id"))
+                        except (TypeError, ValueError):
+                            continue
+                        best_id, best_name, best_score = appid, name, score
+                break
+            if attempt == 0:
+                time.sleep(0.8)
+
+    if not answered:
+        # Every request failed: the endpoint is unreachable, not out of results.
+        _note_failure()
 
     if best_score < MIN_RATIO:
         return 0, best_name, best_score

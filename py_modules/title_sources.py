@@ -69,15 +69,10 @@ def _ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:
         pass
-    ctx = ssl.create_default_context()
-    try:
-        # Steam Deck images ship a trimmed CA bundle; a broken chain must not
-        # turn every lookup into a silent failure.
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    except Exception:
-        pass
-    return ctx
+    # Steam Deck images ship a trimmed CA bundle. Without certifi we still keep
+    # verification ON: a failed handshake means "no Chinese title", which is far
+    # cheaper than trusting whatever the network hands us (audit 3.11).
+    return ssl.create_default_context()
 
 
 def _blocked() -> bool:

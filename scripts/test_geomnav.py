@@ -24,15 +24,20 @@ RUNNER = r"""
 const path = require('path');
 const m = require('./geomnav.js');
 
-// Minimal stand-ins: settleFocus only needs focus() and contains().
+// Minimal stand-ins: settleFocus only needs focus()、contains() 和 ownerDocument。
+const docStub = { body: { name: 'body', tagName: 'BODY' }, activeElement: null };
 function el(name) {
   return {
     name,
     isConnected: true,
-    focus() { this.focusedByUs = globalThis.now; globalThis.lastFocused = this.name; },
+    focus() {
+      this.focusedByUs = globalThis.now;
+      globalThis.lastFocused = this.name;
+      docStub.activeElement = this;
+    },
   };
 }
-const root = { contains: (e) => !!e && e.name !== 'outside' };
+const root = { contains: (e) => !!e && e.name !== 'outside', ownerDocument: docStub };
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const out = [];
@@ -72,8 +77,14 @@ const check = (name, cond, detail) => out.push([name, !!cond, detail || '']);
   let slow2 = el('slow2');
   check('slow press still rejects the foreign move', m.settleFocus(slow2, root) === slow1);
 
-  // 4c. reverifyFocus pulls focus back when Steam moved it without a focusin.
+  // 4c. reverifyFocus only reclaims *lost* focus.
+  //
+  // 2026-11-10（审计 1.9）：以前是"activeElement 不是 expected 就抢回来"，于是从
+  // 详情页按 B 返回后 200ms 内，用户推的第一下摇杆会被下一帧拉回原封面，感觉像
+  // "第一下没反应"。现在只在焦点掉到 <body> / 页面外时补救。
   const fakeDoc = { activeElement: null, defaultView: null };
+  const bodyStub = { name: 'body', tagName: 'BODY' };
+  fakeDoc.body = bodyStub;
   const exp = el('exp');
   exp.focus = function () {
     globalThis.lastFocused = this.name;
@@ -81,13 +92,38 @@ const check = (name, cond, detail) => out.push([name, !!cond, detail || '']);
   };
   const fakeRoot = { contains: () => true, ownerDocument: fakeDoc };
   m.focusOwned(exp);
-  fakeDoc.activeElement = el('stolen'); // Steam moved it behind our back
+  fakeDoc.activeElement = bodyStub; // Steam parked focus on <body>
   m.reverifyFocus(exp, fakeRoot, 0);
   check(
-    'reverifyFocus puts focus back',
+    'reverifyFocus reclaims focus lost to <body>',
     fakeDoc.activeElement === exp,
     String(fakeDoc.activeElement && fakeDoc.activeElement.name)
   );
+
+  // 4d. …and it must NOT yank focus back from a deliberate move by the user.
+  fakeDoc.activeElement = el('moved');
+  m.reverifyFocus(exp, fakeRoot, 0);
+  check(
+    'reverifyFocus leaves a deliberate move alone',
+    fakeDoc.activeElement && fakeDoc.activeElement.name === 'moved',
+    String(fakeDoc.activeElement && fakeDoc.activeElement.name)
+  );
+
+  // 4e. A container (page root / Panel / NavRow) must never become the anchor.
+  //
+  // 点一下封面之间的空隙时，浏览器把焦点交给 .ed-surface 自己；锚点一旦变成容器，
+  // usable() 一律 false、currentFocused() 返回 null，方向键"被吞但没反应"，
+  // 整个界面失联（审计 1.2）。
+  const anchor2 = el('anchor2');
+  m.focusOwned(anchor2);
+  const container = {
+    name: 'container',
+    isConnected: true,
+    focus() { globalThis.lastFocused = this.name; docStub.activeElement = this; },
+    querySelector: () => el('child'),
+  };
+  const kept = m.settleFocus(container, root);
+  check('a container never becomes the anchor', kept === anchor2, kept && kept.name);
 
   // 5. Navigator never anchors on an element outside its root.
   m.rememberFocus(null);
@@ -109,7 +145,9 @@ function globalThisLastFocus() {
 
 
 def main() -> int:
-    tmp = tempfile.mkdtemp(prefix="epicdeck-geomnav-")
+    tmp = tempfile.mkdtemp(
+    prefix="epicdeck-geomnav-", dir=os.environ.get("EPICDECK_TMPDIR") or None
+)
     try:
         shutil.copy(os.path.join(SRC, "geomnav.ts"), os.path.join(tmp, "geomnav.ts"))
         subprocess.run(

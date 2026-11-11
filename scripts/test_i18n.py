@@ -68,7 +68,9 @@ console.log(JSON.stringify(out));
 
 
 def main():
-    tmp = tempfile.mkdtemp(prefix="epicdeck-i18n-")
+    tmp = tempfile.mkdtemp(
+    prefix="epicdeck-i18n-", dir=os.environ.get("EPICDECK_TMPDIR") or None
+)
     try:
         build(tmp)
         rows = run(tmp)

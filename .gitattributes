@@ -1,15 +1,13 @@
-# 部署目标全是 Linux(Steam Deck / SteamOS),脚本里带 CRLF 会在 bash 解析阶段
-# 直接炸:`set -euo pipefail` 末尾的 \r 被当成选项名的一部分,报
-# "pipefail: invalid option name"。本机 core.autocrlf=true,所以这里显式锁死 LF。
-*.sh            text eol=lf
-*.py            text eol=lf
-*.js            text eol=lf
-*.ts            text eol=lf
-*.tsx           text eol=lf
-*.json          text eol=lf
-*.md            text eol=lf
-*.vdf           -text
+# 行尾统一：Windows 上 core.autocrlf=true 会把 .sh 写成 CRLF，
+# 到了 Deck 上 bash 直接报 "pipefail: invalid option name"。
+* text=auto eol=lf
 
-# Windows 侧脚本保持 CRLF
-*.bat           text eol=crlf
-*.ps1           text eol=crlf
+*.sh   text eol=lf
+*.py   text eol=lf
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.json text eol=lf
+*.vdf  binary
+*.png  binary
+*.ico  binary
+*.zip  binary

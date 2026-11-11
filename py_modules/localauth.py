@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import html
 import http.server
+import json
+import re
 import secrets
 import socket
 import threading
@@ -280,16 +282,22 @@ def _make_handler(ctx: LocalAuthServer):
     return Handler
 
 
+_CODE_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
 def extract_code(raw: str) -> str:
     """Pull the authorization code out of whatever the user pasted.
 
     Accepts the bare code, a JSON blob from Epic's redirect page, or the whole
     URL. Kept here (not only in main.py) so the HTTP handler can validate
     before answering the phone.
-    """
-    import json
-    import re
 
+    The accepted set must be *identical* to `main.extract_authorization_code`,
+    which only trusts a 32-hex code. This function used to take any 16-64
+    alphanumeric run, so the phone page answered "已发送" for something the
+    backend then rejected with "没有识别到授权码" — a failure the user cannot
+    act on. Keep both sides in one shape.
+    """
     text = (raw or "").strip()
     if not text:
         return ""
@@ -305,17 +313,20 @@ def extract_code(raw: str) -> str:
             if isinstance(data, dict):
                 for key in ("authorizationCode", "authorization_code", "code"):
                     value = data.get(key)
-                    if isinstance(value, str) and value.strip():
+                    if isinstance(value, str) and _CODE_RE.match(value.strip()):
                         return value.strip()
 
-    match = re.search(r"[?&]code=([A-Za-z0-9]{8,})", text)
+    # Epic's are hex, 32 chars. Anything shorter is a client id, not a code.
+    match = re.search(r"[?&]code=([0-9a-fA-F]{32})", text)
     if match:
         return match.group(1)
 
-    # A bare code: Epic's are hex, typically 32 chars.
-    if re.fullmatch(r"[A-Za-z0-9]{16,64}", text):
+    if _CODE_RE.match(text):
         return text
-    return ""
+
+    # Last resort: the client id also looks like hex, so take the last run.
+    hits = re.findall(r"[0-9a-fA-F]{32}", text)
+    return hits[-1] if hits else ""
 
 
 async def wait_for_code(server: LocalAuthServer, timeout: float) -> str:

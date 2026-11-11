@@ -13,7 +13,9 @@ import types
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-tmp = tempfile.mkdtemp(prefix="epicdeck-smoke-")
+tmp = tempfile.mkdtemp(
+    prefix="epicdeck-smoke-", dir=os.environ.get("EPICDECK_TMPDIR") or None
+)
 
 
 class _Logger:
@@ -259,7 +261,11 @@ async def run():
             str(second.get("reason")),
         )
     cached_map = await plugin.get_protondb_cached(["051eaac0842c46d7a5a62858ad534d5a"])
-    check("cached map has no tier for a failed lookup", cached_map == {}, str(cached_map))
+    if first.get("ok"):
+        # Network was reachable: the tier must be cached, not dropped.
+        check("a successful lookup is cached", bool(cached_map), str(cached_map))
+    else:
+        check("cached map has no tier for a failed lookup", cached_map == {}, str(cached_map))
 
     # -- cloud saves ---------------------------------------------------
     cloud = await plugin.get_cloud_saves("051eaac0842c46d7a5a62858ad534d5a")
@@ -340,15 +346,24 @@ async def run():
 
     # -- 手机扫码登录(7.22)------------------------------------------------
     # The phone pastes whatever it got into the LAN page; extract_code must pull
-    # the authorization code out of a bare code, a JSON blob, or a URL.
+    # the authorization code out of a bare code, a JSON blob, or a URL. It also
+    # has to accept *exactly* what the backend accepts (32 hex): when the page
+    # took 16-64 alphanumerics it answered "已发送" for codes main.py rejected
+    # one step later (审计 3.14).
     from py_modules.localauth import extract_code as _xcode
     check("extracts a bare code", _xcode("a" * 32) == "a" * 32)
     check("extracts from JSON",
-          _xcode('{"authorizationCode":"deadbeefdeadbeefdeadbeef"}')
-          == "deadbeefdeadbeefdeadbeef")
-    check("extracts from URL", _xcode("https://x/?code=ABC123ABC123ABC123") == "ABC123ABC123ABC123")
+          _xcode('{"authorizationCode":"%s"}' % ("d" * 32)) == "d" * 32)
+    check("extracts from URL", _xcode("https://x/?code=%s" % ("c" * 32)) == "c" * 32)
+    check("rejects a code that is too short",
+          _xcode('{"authorizationCode":"deadbeefdeadbeef"}') == "")
+    check("rejects a non-hex code", _xcode("z" * 32) == "")
     check("rejects garbage", _xcode("hello world") == "")
     check("rejects empty", _xcode("") == "")
+    for sample in ("a" * 32, "https://x/?code=%s" % ("c" * 32),
+                   '{"authorizationCode":"%s"}' % ("d" * 32), "hello", ""):
+        check("phone page and backend agree on %r" % sample[:24],
+              _xcode(sample) == main.extract_authorization_code(sample), "")
 
     # -- 不可安装条目(7.20)----------------------------------------------
     # legendary returns launcher-only titles (EA App / Origin) without any
@@ -367,7 +382,7 @@ async def run():
         ("[DLManager] INFO: Waiting for installation to finish...", "installing"),
         ("[DLManager] INFO: All done! Download manager quitting...", "installing"),
         ("[cli] INFO: Finished installation process in 1860.23 seconds.", "installing"),
-        ("[DLManager] INFO:  = Progress: 100.00% (76745/76745)", "progress"),
+        ("[DLManager] INFO:  = Progress: 100.00% (76745/76745)", "downloading"),
     ]:
         got_state = main.Plugin._classify_activity(line)
         check("classify %r -> %s" % (line[22:52], want), got_state == want, str(got_state))
@@ -424,6 +439,139 @@ async def run():
         not (dirty.get("ok") and dirty.get("disk") == 4),
         json.dumps(dirty, ensure_ascii=False)[:120],
     )
+
+    # -- 审计 3.3: 下载中取消要能靠 install_targets 找到半成品目录 ----------
+    base = os.path.join(tmp, "games")
+    half = os.path.join(base, "halfgame")
+    os.makedirs(os.path.join(half, ".egstore"), exist_ok=True)
+    with open(os.path.join(half, "chunk.bin"), "wb") as fh:
+        fh.write(b"x" * 64)
+    plugin.config.set("install_dir", base)
+    plugin.config.set("install_targets", {"halfgame": base})
+    plugin.legendary.installed_records = lambda: {}  # 下载中: installed.json 还没有它
+    plugin.legendary.config_dir = lambda: os.path.join(tmp, "legendary")
+    os.makedirs(os.path.join(tmp, "legendary", "tmp"), exist_ok=True)
+    resume = os.path.join(tmp, "legendary", "tmp", "halfgame.resume")
+    with open(resume, "wb") as fh:
+        fh.write(b"resume")
+    await plugin._clear_partial_download("halfgame")
+    check("cancel removes the half-written folder via install_targets",
+          not os.path.isdir(half), half)
+    check("cancel also drops the .resume once the folder went away",
+          not os.path.exists(resume), resume)
+
+    # -- 审计 3.5: 外部下载（重载后只认 pid）不得再起第二个 legendary -------
+    plugin._external_pids["busy"] = 999999
+    guarded = await plugin.install("busy")
+    check("install refuses while an inherited download owns the title",
+          guarded.get("ok") is False and "下载中" in str(guarded.get("error")),
+          json.dumps(guarded, ensure_ascii=False))
+    plugin._external_pids.pop("busy", None)
+
+    # -- 取消流程不得删掉"其实已经装完"的目录（0.21.1 没有 .egstore 标记）----
+    done_dir = os.path.join(base, "donegame")
+    os.makedirs(done_dir, exist_ok=True)
+    plugin.legendary.installed_records = lambda: {
+        "donegame": {"install_path": done_dir, "version": "11"}
+    }
+    await plugin._clear_partial_download("donegame")
+    check("cancel never deletes a finished install", os.path.isdir(done_dir), done_dir)
+
+    # -- 复审 2.3: 暂停/出错的任务重载后仍要在下载页出现 --------------------
+    plugin._remember_terminal("snapapp", "paused", 42.0, "已暂停")
+    active_rows = await plugin.get_active_installs()
+    snaprow = next((r for r in active_rows if r.get("app_name") == "snapapp"), None)
+    check(
+        "paused download survives a reload",
+        bool(snaprow) and snaprow.get("state") == "paused" and snaprow.get("percent") == 42.0,
+        json.dumps(snaprow or {}, ensure_ascii=False)[:120],
+    )
+    plugin._forget_terminal("snapapp")
+    active_after = await plugin.get_active_installs()
+    check(
+        "finished/cancelled rows are not resurrected",
+        all(r.get("app_name") != "snapapp" for r in active_after),
+        str([r.get("app_name") for r in active_after])[:80],
+    )
+
+    # -- 审计 3.11: SSL 不得回退到 CERT_NONE --------------------------------
+    import ssl as _ssl
+
+    from py_modules import protondb as _protondb
+    from py_modules import title_sources as _titles
+    from py_modules import update_check as _update
+
+    for mod in (_protondb, _titles, _update):
+        ctx = mod._ssl_context()
+        check(
+            "ssl context keeps verification (%s)" % mod.__name__.split(".")[-1],
+            ctx.verify_mode != _ssl.CERT_NONE,
+            str(ctx.verify_mode),
+        )
+
+    # -- 审计 3.4: 清理下载缓存必须认出"继承来的"下载 -----------------------
+    plugin._external_pids["busy2"] = 999999
+    cleared = await plugin.clear_download_cache()
+    check("clear cache refuses while an inherited download is alive",
+          cleared.get("ok") is False and "下载" in str(cleared.get("error")),
+          json.dumps(cleared, ensure_ascii=False))
+    plugin._external_pids.pop("busy2", None)
+
+    # -- 审计 3.12: 退出码 90 不再被当成"没起游戏" --------------------------
+    # 生成脚本原来用 `[ rc -eq 90 ] || exit rc` 判断要不要回退到
+    # `legendary launch`。游戏自己以 90 退出时就会被再启动一次。现在判断依据
+    # 是 shim 写的 marker 文件，退出码再像哨兵也不影响。
+    from py_modules import launchshim as _shim
+
+    marker = os.path.join(tmp, "logs", "launch-rc90.started")
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    plan = {
+        "launch_command": [sys.executable],
+        "game_executable": "-c",
+        "game_directory": "",
+        "game_parameters": ["import sys; sys.exit(90)"],
+        "working_directory": tmp,
+        "environment": {},
+    }
+
+    real_subprocess = _shim.subprocess
+    _shim.subprocess = types.SimpleNamespace(
+        run=lambda *a, **k: types.SimpleNamespace(
+            returncode=0, stdout=json.dumps(plan), stderr=""
+        ),
+        Popen=real_subprocess.Popen,
+        TimeoutExpired=real_subprocess.TimeoutExpired,
+    )
+    try:
+        rc = _shim.main(["--legendary", "legendary", "--app", "rc90", "--marker", marker])
+    finally:
+        _shim.subprocess = real_subprocess
+
+    check("a game exiting with 90 keeps its own status", rc == 90, str(rc))
+    check("a started game leaves the marker behind", os.path.isfile(marker), marker)
+    _shim._clear_marker(marker)
+    check("marker can be cleared", not os.path.exists(marker), marker)
+
+    # The generated script must key on the marker, and must delete a stale one
+    # before each attempt (otherwise one old marker disables the fallback).
+    class _ExeLegendary:
+        def _resolve(self):
+            return sys.executable
+
+    original_legendary = plugin.legendary
+    plugin.legendary = _ExeLegendary()
+    try:
+        script_path = plugin._write_launcher_script("rc90")
+        script_text = open(script_path, encoding="utf-8").read()
+    finally:
+        plugin.legendary = original_legendary
+    check("launcher script passes the marker to the shim",
+          "--marker " in script_text, "")
+    check("launcher script trusts the marker, not exit code 90",
+          '[ -f "$EPICDECK_MARKER" ]' in script_text
+          and "-eq 90" not in script_text, "")
+    check("launcher script clears a stale marker first",
+          'rm -f "$EPICDECK_MARKER"' in script_text, "")
 
     print()
     failed = 0

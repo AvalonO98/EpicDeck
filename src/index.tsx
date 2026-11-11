@@ -17,7 +17,6 @@ import { FullScreenPage, openFullScreen } from "./fullscreen";
 import { QamPanel } from "./qam";
 import { LIBRARY_ROUTE } from "./routes";
 import { moveFocus } from "./geomnav";
-// import { installSteamMenuEntry, setSteamMenuEntryEnabled } from "./steammenu";
 import { t, useLangVersion } from "./i18n";
 import { bootstrapLang } from "./langboot";
 
@@ -44,17 +43,9 @@ export default definePlugin(() => {
     </>
   ));
 
-  // "EpicDeck 游戏库" in the STEAM button menu. Patched lazily: the menu only
-  // mounts when it is opened, so the installer keeps re-applying itself.
-  // DISABLED: the sidebar menu entry is not finished yet (patch installs but the
-  // item never shows — HANDOFF 7.13), so do not inject it at all for now.
-  // const uninstallMenuEntry = installSteamMenuEntry();
-  //
-  // // Honour the user's choice without blocking startup — the menu reads the flag
-  // // on every render, so a late answer simply applies to the next menu open.
-  // void getSettings()
-  //   .then((settings) => setSteamMenuEntryEnabled(settings?.show_menu_entry !== false))
-  //   .catch(() => {});
+  // 侧边栏菜单入口（steammenu.tsx）已删除：它改的是 React fiber 的 type，风险高，
+  // 且 HANDOFF 7.13 记录"补丁装上但菜单项不显示"。设置项也早已从 UI 移除，整条链
+  // 只剩一个没人读的布尔值（审计 2.9）。需要时再从 git 历史里取回。
 
   // Reachable from the Steam devtools console and from CDP: lets a developer
   // jump to the page without hunting for the QAM entry. The two Steam scroll

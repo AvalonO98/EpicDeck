@@ -37,10 +37,10 @@ def _ssl_context() -> ssl.SSLContext:
     try:
         return ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
     except Exception:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
+        # No CA bundle we can trust. Keep verification ON and let the handshake
+        # fail (fail closed) — SECURITY.md forbids CERT_NONE fallbacks, and a
+        # MITM could otherwise push a fake "latest version" / title (audit 3.11).
+        return ssl.create_default_context()
 
 
 def normalize(version: str) -> tuple:

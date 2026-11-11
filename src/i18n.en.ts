@@ -273,10 +273,10 @@ export const EN_EXTRA: Record<string, string> = {
   // -- dependencies -------------------------------------------------------
   "未检测到 Legendary(SteamOS 无 pip,无法用 pip 安装)。":
     "Legendary was not found (SteamOS has no pip, so it cannot be installed that way).",
-  "SteamOS 没有 pip，插件会直接从 GitHub Releases 下载官方独立二进制（约 3 MB）。":
-    "SteamOS has no pip, so the plugin downloads the official standalone binary from GitHub Releases (~3 MB).",
-  "点击下方按钮,将自动从 GitHub Releases 下载官方独立二进制(约 3 MB,无需 Python)。":
-    "Press the button below to download the official standalone binary from GitHub Releases (~3 MB, no Python needed).",
+  "SteamOS 没有 pip，插件会直接从 GitHub Releases 下载官方独立二进制（约 14 MB）。":
+    "SteamOS has no pip, so the plugin downloads the official standalone binary from GitHub Releases (~14 MB).",
+  "点击下方按钮,将自动从 GitHub Releases 下载官方独立二进制(约 14 MB,无需 Python)。":
+    "Press the button below to download the official standalone binary from GitHub Releases (~14 MB, no Python needed).",
   "一键安装 Legendary": "Install Legendary",
   "重新安装 Legendary": "Reinstall Legendary",
   "缺少 Legendary": "Legendary missing",
@@ -305,8 +305,8 @@ export const EN_EXTRA: Record<string, string> = {
     "After signing in, the page shows a block of JSON like:",
   "看到这段 JSON 就说明登录成功了，插件会自己把授权码取走。":
     "That JSON means sign-in worked — the plugin reads the code from it automatically.",
-  "请稍等约 15 秒，确保授权码被完整读取。":
-    "Wait about 15 seconds so the code is fully read.",
+  "请稍等约 20~30 秒，确保授权码被完整读取。":
+    "Wait 20–30 seconds so the code is fully read.",
   "第一次登录可能因网络较慢，若长时间没出现代码，可关闭浏览器重新登录。":
     "The first sign-in may be slow due to network — if the code doesn't appear, close the browser and try again.",
   "然后再按 B 键关掉浏览器，回到插件即可。":
@@ -393,4 +393,41 @@ export const EN_EXTRA: Record<string, string> = {
 
   "体积未知": "Size unknown",
 
+  "正在添加到 Steam": "Adding to Steam",
+  "首次启动前需要先建立 Steam 条目": "A Steam entry is required before the first launch",
+  "添加到 Steam 失败": "Could not add to Steam",
+
+  // -- confirmations ------------------------------------------------------
+  "卸载游戏？": "Uninstall this game?",
+  "会删除游戏文件（存档保留）。想保留游戏请先取消。": "Deletes the game files; saves are kept.",
+  "卸载": "Uninstall",
+  "取消下载？": "Cancel the download?",
+  "会删除已下载的进度，下次需要重新下载。只想暂时停下请用「暂停」。": "Downloaded progress is deleted and the next attempt starts over. Use Pause to resume later.",
+  "下载云端存档？": "Download the cloud saves?",
+  "双向同步存档？": "Sync saves both ways?",
+  "本地存档会先备份，然后被云端版本覆盖。": "Your local saves are backed up, then replaced by the cloud version.",
+  "重启 Steam？": "Restart Steam?",
+  "正在运行的游戏会被中断，未保存的进度可能丢失。": "A running game will be interrupted and unsaved progress can be lost.",
+  "重启": "Restart",
+  "上一个标签": "Previous tab",
+  "下一个标签": "Next tab",
+  "重试": "Retry",
+  "无法确认登录状态": "Can't confirm your sign-in state",
+  "Legendary {0}{1}": "Legendary {0}{1}",
+  "账号状态读取超时，请稍后点「刷新」重试": "Reading the account state timed out. Try Refresh in a moment.",
+  "读取 Epic 封面元数据失败（网络或登录状态），请稍后重试": "Could not read Epic's artwork metadata (network or sign-in). Try again later.",
+  "清理下载缓存？": "Clear the download cache?",
+  "只删除 Legendary 的临时文件与断点记录；正在下载时请先暂停。": "Removes Legendary's temporary files and resume state. Pause any active download first.",
+  "清理": "Clear",
+
+  "去登录": "Sign in",
+  "切换 Epic 账号？": "Switch Epic account?",
+  "会退出当前账号、清空本账号缓存，并清除 Steam 内置浏览器的网站数据（用于重新选择 Epic 账号）。": "Signs out, clears this account's cache, and wipes Steam's built-in browser data so Epic asks which account to use.",
+  "登出 Epic 账号？": "Sign out of Epic?",
+  "会删除本机保存的登录凭据，下次需要重新登录。游戏文件与存档不受影响。": "Deletes the saved sign-in on this device; you will have to sign in again. Game files and saves are not touched.",
+
+  "设置与诊断": "Settings & diagnostics",
+  "网络、语言、安装目录、导出日志": "Network, language, install folder, log export",
+
+  "日志已导出到:": "Diagnostic log exported to: ",
 };

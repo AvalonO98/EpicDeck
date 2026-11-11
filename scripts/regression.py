@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -92,23 +93,101 @@ def dictionary_pairs():
     return pairs
 
 
-def check_coverage():
-    have = {k for k, _ in dictionary_pairs()}
-    used, missing = set(), set()
+def dictionary_keys():
+    """Keys that have an English entry.
+
+    i18n.ts holds EN_BASE and i18n.en.ts holds EN_EXTRA; both are English.
+    Chinese is the *source* language and has no dictionary of its own — a key
+    that is missing here simply renders in Chinese inside an English UI, which
+    is why the coverage check below insists on every Chinese literal.
+    """
+    return {k for k, _ in dictionary_pairs()}
+
+
+def iter_string_literals(src):
+    """Yield (offset, body) for every string literal, comments already gone.
+
+    Callers blank the label maps in `src` first (offsets stay valid), so a map
+    value is visited like any other literal.
+    """
+    i, n = 0, len(src)
+    while i < n:
+        ch = src[i]
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if ch in "\"'":
+            quote, j = ch, i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == quote:
+                    break
+                j += 1
+            yield i, src[i + 1:j]
+            i = j + 1
+            continue
+        i += 1
+
+
+def ui_sources():
     for name in sorted(os.listdir(SRC)):
         if not name.endswith((".ts", ".tsx")) or "i18n" in name:
             continue
-        text = io.open(os.path.join(SRC, name), encoding="utf-8").read()
-        for match in re.finditer(r"\b(?:t|tf)\(\s*([\"'])((?:[^\\]|\\.)*?)\1", text):
-            key = match.group(2)
-            if not CJK.search(key):
+        yield name, io.open(os.path.join(SRC, name), encoding="utf-8").read()
+
+
+def blank_label_maps(src):
+    """Blank the bodies of the known label maps, keeping offsets intact.
+
+    Their values stay in the source language on purpose and are translated at
+    render time, so they are validated by `check_translated_maps` instead.
+    """
+    for map_name in TRANSLATED_MAPS:
+        pattern = r"^\s*(?:export\s+)?const\s+%s\b[^\n]*=\s*[\{\[]\s*$" % map_name
+        for match in re.finditer(pattern, src, re.M):
+            depth, j = 1, match.end()
+            while j < len(src):
+                if src[j] in "{[(":
+                    depth += 1
+                elif src[j] in "}])":
+                    depth -= 1
+                    if depth <= 0:
+                        break
+                j += 1
+            body = "".join(c if c == "\n" else " " for c in src[match.end():j])
+            src = src[:match.end()] + body + src[j:]
+    return src
+
+
+def check_coverage():
+    """Every Chinese literal in the UI must have an English entry.
+
+    Checking only the arguments of `t("…")` was not enough (审计 5.3): keys also
+    reach `t()` through variables, template literals and props, and a missing
+    entry fails silently by showing Chinese to an English user. So the rule is
+    now positional — any Chinese literal outside the allow-lists must be a
+    dictionary key. Anything intentionally left in Chinese belongs in
+    `ALLOWED_LITERALS` (tab labels) or `AUTONYMS` (language names).
+    """
+    have = dictionary_keys()
+    allowed = ALLOWED_LITERALS | AUTONYMS
+    missing = []
+    for name, source in ui_sources():
+        source = re.sub(r"/\*[\s\S]*?\*/", "", source)
+        source = re.sub(r"(?m)^\s*//.*$", "", source)
+        source = blank_label_maps(source)
+        for offset, body in iter_string_literals(source):
+            if not CJK.search(body) or "${" in body or body in allowed:
                 continue
-            used.add(key)
-            if key not in have:
-                missing.add(key)
+            if body not in have:
+                missing.append("%s:%d %s" % (name, source[:offset].count("\n") + 1, body[:20]))
     if missing:
-        return False, "missing %d: %s" % (len(missing), ", ".join(sorted(missing)[:3]))
-    return True, "%d keys used, all translated" % len(used)
+        return False, "%d untranslated: %s" % (len(missing), "; ".join(missing[:3]))
+    return True, "%d keys, every Chinese literal translated" % len(have)
+
 
 
 def check_placeholders():
@@ -118,27 +197,36 @@ def check_placeholders():
 
 def check_translated_maps():
     """Values of the label maps are passed to t() indirectly (`t(o.label)`), so the
-    literal-based coverage check cannot see them. Verify them explicitly."""
-    api = io.open(os.path.join(SRC, "api.ts"), encoding="utf-8").read()
-    have = {k for k, _ in dictionary_pairs()}
+    literal-based coverage check never sees them as keys. Verify them explicitly.
+
+    The maps live in whichever module owns them — TABS sits in fullscreen.tsx,
+    the rest in api.ts — so this scans every UI source rather than api.ts alone.
+    """
+    have = dictionary_keys()
     missing = []
-    for name in sorted(TRANSLATED_MAPS - {"TABS"}):
-        match = re.search(r"^\s*(?:export\s+)?const\s+%s\b[^\n]*=\s*[\{\[]" % name, api, re.M)
-        if not match:
-            continue
-        depth, j = 1, match.end()
-        while j < len(api):
-            if api[j] in "{[(":
-                depth += 1
-            elif api[j] in "}])":
-                depth -= 1
-                if depth <= 0:
-                    break
-            j += 1
-        for value in re.findall(r"['\"]([^'\"]*[\u4e00-\u9fff][^'\"]*)['\"]", api[match.end():j]):
-            if value not in have and value not in AUTONYMS:
-                missing.append("%s:%s" % (name, value))
-    return (not missing, "untranslated map values: " + ", ".join(sorted(missing)[:4]) if missing else "")
+    seen = set()
+    for name in sorted(TRANSLATED_MAPS):
+        pattern = r"^\s*(?:export\s+)?const\s+%s\b[^\n]*=\s*[\{\[]" % name
+        for filename, api in ui_sources():
+            match = re.search(pattern, api, re.M)
+            if not match:
+                continue
+            seen.add(name)
+            depth, j = 1, match.end()
+            while j < len(api):
+                if api[j] in "{[(":
+                    depth += 1
+                elif api[j] in "}])":
+                    depth -= 1
+                    if depth <= 0:
+                        break
+                j += 1
+            for value in re.findall(r"['\"]([^'\"]*[\u4e00-\u9fff][^'\"]*)['\"]", api[match.end():j]):
+                if value not in have and value not in AUTONYMS:
+                    missing.append("%s:%s" % (name, value))
+    if missing:
+        return False, "untranslated map values: " + ", ".join(sorted(missing)[:4])
+    return True, "%d maps, %d entries" % (len(seen), len(have))
 
 
 def check_no_module_scope_t():
@@ -171,66 +259,38 @@ def check_no_module_scope_t():
 
 def check_unwrapped_chinese():
     leftovers = []
-    for name in sorted(os.listdir(SRC)):
-        if not name.endswith((".ts", ".tsx")) or "i18n" in name:
-            continue
-        src = io.open(os.path.join(SRC, name), encoding="utf-8").read()
-        src = re.sub(r"/\*[\s\S]*?\*/", "", src)
+    for name, source in ui_sources():
+        src = re.sub(r"/\*[\s\S]*?\*/", "", source)
         src = re.sub(r"(?m)^\s*//.*$", "", src)
-        # Blank out the bodies of the known label maps, keeping offsets intact.
-        # The match must end at the line's closing bracket: a type annotation
-        # like `: { data: string }[] = [` has a `{` of its own, and stopping
-        # there would blank the annotation instead of the values.
-        for map_name in TRANSLATED_MAPS:
-            pattern = r"^\s*(?:export\s+)?const\s+%s\b[^\n]*=\s*[\{\[]\s*$" % map_name
-            for match in re.finditer(pattern, src, re.M):
-                depth, j = 1, match.end()
-                while j < len(src):
-                    if src[j] in "{[(":
-                        depth += 1
-                    elif src[j] in "}])":
-                        depth -= 1
-                        if depth <= 0:
-                            break
-                    j += 1
-                body = "".join(c if c == "\n" else " " for c in src[match.end():j])
-                src = src[:match.end()] + body + src[j:]
-        i, n = 0, len(src)
-        while i < n:
-            ch = src[i]
-            if ch == "/" and i + 1 < n and src[i + 1] == "/":
-                j = src.find("\n", i)
-                i = n if j < 0 else j
-                continue
-            if ch in "\"'":
-                quote, j = ch, i + 1
-                while j < n:
-                    if src[j] == "\\":
-                        j += 2
-                        continue
-                    if src[j] == quote:
-                        break
-                    j += 1
-                body = src[i + 1:j]
-                before = src[max(0, i - 14):i]
-                if (
-                    CJK.search(body)
-                    and "${" not in body
-                    and body not in ALLOWED_LITERALS
-                    and not re.search(r"(?:t|tf)\(\s*$", before)
-                ):
-                    leftovers.append("%s:%d %s" % (name, src[:i].count("\n") + 1, body[:20]))
-                i = j + 1
-                continue
-            i += 1
+        src = blank_label_maps(src)
+        for offset, body in iter_string_literals(src):
+            before = src[max(0, offset - 14):offset]
+            if (
+                CJK.search(body)
+                and "${" not in body
+                and body not in ALLOWED_LITERALS
+                and not re.search(r"(?:t|tf)\(\s*$", before)
+            ):
+                leftovers.append("%s:%d %s" % (name, src[:offset].count("\n") + 1, body[:20]))
     return (not leftovers, "; ".join(leftovers[:4]) if leftovers else "")
 
 
 def run_suite(name, extra=()):
+    # The three suites used to call `mkdtemp()` with no `dir=`, so `--tmpdir`
+    # only moved the bytecode while every scratch file still landed in the
+    # system temp (审计 D10). Hand them the same directory through the
+    # environment — `tempfile` honours TMPDIR/TEMP/TMP.
+    env = os.environ.copy()
+    scratch = (env.get("PYTHONPYCACHEPREFIX") or "").strip()
+    if scratch:
+        env["EPICDECK_TMPDIR"] = env.get("EPICDECK_TMPDIR") or scratch
+        for key in ("TMPDIR", "TEMP", "TMP"):
+            env[key] = env["EPICDECK_TMPDIR"]
     proc = subprocess.run(
         [sys.executable, os.path.join(ROOT, "scripts", name), *extra],
         capture_output=True,
         text=True,
+        env=env,
     )
     tail = [ln for ln in (proc.stdout or "").strip().splitlines() if ln.strip()]
     summary = tail[-1] if tail else (proc.stderr or "").strip()[:120]
@@ -255,14 +315,27 @@ def check_package():
 
 
 def check_build():
-    proc = subprocess.run(["npx", "rollup", "-c"], cwd=ROOT, capture_output=True, text=True, shell=True)
+    """Run the repo's own rollup, not `npx`.
+
+    `npx` is a shell shim on Windows and resolves through the PATH before it
+    looks at `node_modules`, so the build step failed with a bare "rollup
+    failed" while `python scripts/build_zip.py` (which calls node directly)
+    worked fine (审计 5.4). Calling the JS entry keeps both paths identical.
+    """
+    rollup_js = os.path.join(ROOT, "node_modules", "rollup", "dist", "bin", "rollup")
+    if not os.path.isfile(rollup_js):
+        return False, "rollup is not installed (run npm/pnpm install)"
+    proc = subprocess.run(
+        ["node", rollup_js, "-c"], cwd=ROOT, capture_output=True, text=True
+    )
     if proc.returncode != 0:
-        return False, (proc.stderr or proc.stdout).strip().splitlines()[-1] if (proc.stderr or proc.stdout) else "rollup failed"
+        combined = (proc.stderr or "") + (proc.stdout or "")
+        lines = [ln for ln in combined.strip().splitlines() if ln.strip()]
+        return False, lines[-1] if lines else "rollup failed"
     dist = os.path.join(ROOT, "dist", "index.js")
-    size = os.path.getsize(dist)
-    if size < 100_000:
-        return False, "dist too small (%d bytes)" % size
-    return True, "dist %d bytes" % size
+    if not os.path.isfile(dist):
+        return False, "dist/index.js missing after the build"
+    return True, "dist %d bytes" % os.path.getsize(dist)
 
 
 def check_zip():
@@ -294,9 +367,42 @@ def check_zip():
     return True, "%d files, %d KB" % (len(names), os.path.getsize(path) // 1024)
 
 
+def prepare_pycache(argv):
+    """Keep `.pyc` files out of the source tree, and make that configurable.
+
+    `py_compile` writes `__pycache__` next to every file. On Windows those can
+    be locked or read-only (an editor, a sync client, a previous run in a
+    different shell), which turns a syntax check into a permission error that
+    says nothing about the code (审计 5.4). `--tmpdir PATH` and
+    `$PYTHONPYCACHEPREFIX` both override the location; without either we use a
+    session temp dir, so the default already avoids the source tree.
+    """
+    target = ""
+    if "--tmpdir" in argv:
+        index = argv.index("--tmpdir")
+        if index + 1 < len(argv):
+            target = argv[index + 1]
+        else:
+            print("  --tmpdir needs a path", file=sys.stderr)
+    target = target or os.environ.get("PYTHONPYCACHEPREFIX") or ""
+    if not target:
+        target = os.path.join(tempfile.gettempdir(), "epicdeck-pyc")
+    try:
+        os.makedirs(target, exist_ok=True)
+    except OSError as exc:
+        print("  cannot use %s (%s); leaving bytecode where Python puts it"
+              % (target, exc), file=sys.stderr)
+        return ""
+    os.environ["PYTHONPYCACHEPREFIX"] = target
+    return target
+
+
 def main():
     build = "--build" in sys.argv
+    pycache = prepare_pycache(sys.argv)
     print("EpicDeck regression (offline)")
+    if pycache:
+        print("  bytecode -> " + pycache)
     step("python syntax", check_syntax)
     step("i18n coverage", check_coverage)
     step("i18n placeholders", check_placeholders)

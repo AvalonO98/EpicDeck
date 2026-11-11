@@ -30,10 +30,14 @@ implementation therefore:
     file in with an atomic rename.
 """
 
+import functools
 import os
+import re
 import shutil
 import struct
 import subprocess
+import tempfile
+import threading
 import time
 import zlib
 
@@ -45,6 +49,23 @@ TYPE_UINT64 = 0x07
 TYPE_END = 0x08
 
 MAX_BACKUPS = 8
+
+
+#: `shortcuts.vdf` is read-modify-written from two places: the event loop
+#: (install finished → add shortcut) and a thread pool (`set_setting` →
+#: `_sync_launcher_scripts` → icon backfill). Without a lock they interleave,
+#: share one temp file and lose entries — 8 concurrent writers left 1 entry in
+#: the audit's repro (3.6). The lock serialises the whole read→modify→save.
+_VDF_LOCK = threading.RLock()
+
+
+def _serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with _VDF_LOCK:
+            return fn(self, *args, **kwargs)
+
+    return wrapper
 
 
 class SteamError(Exception):
@@ -236,6 +257,14 @@ class SteamShortcuts:
         """
         if not os.path.isdir(self.userdata_root):
             return None
+        # Steam writes the signed-in account here. The mtime heuristic below
+        # can pick the *other* account on a shared Deck, which puts shortcuts
+        # where the current user never looks.
+        active = self._active_user()
+        if active:
+            cfg = os.path.join(self.userdata_root, active, "config")
+            if os.path.isdir(cfg):
+                return cfg
         candidates = []
         try:
             uids = os.listdir(self.userdata_root)
@@ -263,6 +292,22 @@ class SteamShortcuts:
             return None
         candidates.sort(key=lambda c: c[0], reverse=True)
         return candidates[0][1]
+
+    def _active_user(self) -> str:
+        """Numeric Steam id of the signed-in account, from registry.vdf."""
+        for path in (
+            os.path.expanduser("~/.steam/registry.vdf"),
+            os.path.expanduser("~/.local/share/Steam/registry.vdf"),
+        ):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read(300000)
+            except OSError:
+                continue
+            match = re.search(r'"ActiveUser"\s+"(\d+)"', text)
+            if match:
+                return match.group(1)
+        return ""
 
     def _shortcuts_path(self):
         cfg = self._config_dir()
@@ -336,14 +381,28 @@ class SteamShortcuts:
 
         self._backup(path)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".epicdeck.tmp"
-        with open(tmp, "wb") as f:
-            f.write(blob)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        # Unique name: a shared `.epicdeck.tmp` let two writers truncate each
+        # other (and `os.replace` then failed because the file had vanished).
+        fd, tmp = tempfile.mkstemp(
+            prefix=os.path.basename(path) + ".", suffix=".tmp",
+            dir=os.path.dirname(path) or ".",
+        )
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(blob)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            tmp = ""
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     # -- public API -------------------------------------------------------
+    @_serialized
     def backfill_icons(self, launcher_dir: str, icon: str) -> int:
         """Give shortcuts written by older versions an icon if they lack one.
 
@@ -385,6 +444,7 @@ class SteamShortcuts:
         cfg = self._config_dir()
         return os.path.join(cfg, "grid") if cfg else ""
 
+    @_serialized
     def set_icons(self, icons: dict) -> int:
         """Point shortcuts' `icon` field at per-game images, in one write.
 
@@ -437,6 +497,7 @@ class SteamShortcuts:
                 entries.append(_entry_from_dict(node))
         return entries
 
+    @_serialized
     def add_game(self, app_name: str, exe: str, start_dir: str = "",
                  icon: str = "", launch_options: str = "", tags=None,
                  title: str = ""):
@@ -553,33 +614,6 @@ class SteamShortcuts:
         self._save_tree(path, data)
         return appid
 
-    def remove_game(self, app_name: str) -> bool:
-        path = self._shortcuts_path()
-        if not path:
-            return False
-        data = self._load_tree(path)
-        shortcuts = data.setdefault("shortcuts", {})
-        keep = []
-        removed = False
-        for key in sorted(shortcuts, key=lambda k: int(str(k)) if str(k).isdigit() else 0):
-            node = shortcuts[key]
-            if isinstance(node, dict) and str(node.get("AppName", "")) == app_name:
-                removed = True
-                continue
-            keep.append(node)
-        if not removed:
-            return False
-        # Steam expects consecutive numeric keys starting at 0.
-        data["shortcuts"] = {str(i): node for i, node in enumerate(keep)}
-        self._save_tree(path, data)
-        return True
-
-    def find_game(self, app_name: str):
-        return next(
-            (e for e in self.list_shortcuts() if e.app_name == app_name),
-            None,
-        )
-
     def find_by_exe(self, exe: str):
         """Look a shortcut up by its executable — for us, the wrapper script.
 
@@ -594,6 +628,7 @@ class SteamShortcuts:
                 return entry
         return None
 
+    @_serialized
     def remove_by_exe(self, exe: str) -> bool:
         target = os.path.realpath(_unquote(exe)) if exe else ""
         if not target:

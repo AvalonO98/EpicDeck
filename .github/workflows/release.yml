@@ -35,6 +35,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Type-check frontend
+        run: pnpm exec tsc --noEmit
+
+      - name: Offline regression (backend + i18n + geometry)
+        run: |
+          python3 -m compileall -q main.py py_modules scripts
+          python3 scripts/regression.py
+
       - name: Build frontend
         run: pnpm build
 
@@ -118,7 +126,8 @@ jobs:
           name: "EpicDeck v${{ steps.version.outputs.version }}"
           tag_name: ${{ github.ref_name }}
           draft: false
-          prerelease: false
+          # A tag like v0.9.3-beta.1 must not be served as /releases/latest.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body_path: release_notes.md
           generate_release_notes: false
           files: |

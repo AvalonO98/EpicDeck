@@ -7,8 +7,9 @@
 import { Focusable, ProgressBar, ScrollPanel, ScrollPanelGroup } from "@decky/ui";
 import { useState, useRef, type CSSProperties, type ReactNode } from "react";
 import { FaExclamationTriangle, FaGamepad, FaRedo } from "react-icons/fa";
-import { STATE_LABEL, fmtEta, fmtSize, isActive, type InstallProgress, type LibraryFailure } from "./api";
+import { STATE_LABEL, fmtEta, fmtSize, type InstallProgress, type LibraryFailure } from "./api";
 import { t } from "./i18n";
+import { COLOR } from "./tokens";
 
 // Steam's Focusable swaps in its own class when gamepad focus lands on an
 // element, so every highlight has to live in CSS — inline styles cannot react
@@ -23,7 +24,6 @@ export const GLOBAL_CSS = `
 .ed-chip,
 .ed-action,
 .ed-pager,
-.ed-row,
 .ed-loc {
   outline: none;
   transition: background 120ms ease-out, box-shadow 120ms ease-out, transform 120ms ease-out;
@@ -41,12 +41,14 @@ export const GLOBAL_CSS = `
   box-shadow: 0 10px 24px rgba(0,0,0,0.55);
   transform: translateY(-3px) scale(1.025);
 }
+/* 这两个选择器以前写的是 .ed-tile-focused，而代码里从来没有这个类（加的是
+   .ed-focus），所以"聚焦时标题变纯白、遮罩不透明"两条规则一直没生效（审计 1.13）。 */
 .ed-tile.gpfocus .ed-tile-title,
-.ed-tile.ed-tile-focused .ed-tile-title {
+.ed-tile.ed-focus .ed-tile-title {
   color: #fff;
 }
 .ed-tile.gpfocus .ed-tile-shade,
-.ed-tile.ed-tile-focused .ed-tile-shade {
+.ed-tile.ed-focus .ed-tile-shade {
   opacity: 1;
 }
 .ed-chip {
@@ -58,7 +60,7 @@ export const GLOBAL_CSS = `
 .ed-chip.gpfocus,
 .ed-chip.ed-focus {
   background: rgba(74,163,255,0.38);
-  border-color: #4aa3ff;
+  border-color: ${COLOR.accent};
   color: #fff;
   box-shadow: 0 0 0 2px rgba(74,163,255,0.55);
 }
@@ -81,7 +83,7 @@ export const GLOBAL_CSS = `
   bottom: 2px;
   height: 3px;
   border-radius: 2px;
-  background: #4aa3ff;
+  background: ${COLOR.accent};
 }
 .ed-action {
   border-radius: 8px;
@@ -96,8 +98,8 @@ export const GLOBAL_CSS = `
 }
 .ed-action.gpfocus,
 .ed-action.ed-focus {
-  background: #4aa3ff;
-  border-color: #4aa3ff;
+  background: ${COLOR.accent};
+  border-color: ${COLOR.accent};
   color: #04121f;
   box-shadow: 0 8px 20px rgba(0,0,0,0.45);
 }
@@ -108,15 +110,10 @@ export const GLOBAL_CSS = `
 .ed-action[data-danger="true"] {
   background: rgba(255, 92, 92, 0.16);
   border-color: rgba(255, 92, 92, 0.5);
-  color: #ffb3b3;
+  color: ${COLOR.danger};
 }
 .ed-action[data-disabled="true"] {
   opacity: 0.42;
-}
-.ed-row.gpfocus,
-.ed-row.ed-focus {
-  background: rgba(74,163,255,0.2);
-  box-shadow: inset 0 0 0 2px rgba(74,163,255,0.7);
 }
 /* Read-only information that still needs to be reachable by the stick (the
    version line at the bottom of settings sits below the last button, and
@@ -133,7 +130,7 @@ export const GLOBAL_CSS = `
 }
 .ed-info.gpfocus,
 .ed-info.ed-focus {
-  border-color: #4aa3ff;
+  border-color: ${COLOR.accent};
   background: rgba(74,163,255,0.16);
   box-shadow: 0 0 0 2px rgba(74,163,255,0.45);
 }
@@ -148,9 +145,36 @@ export const GLOBAL_CSS = `
 }
 .ed-loc.gpfocus,
 .ed-loc.ed-focus {
-  border-color: #4aa3ff;
+  border-color: ${COLOR.accent};
   background: rgba(74,163,255,0.16);
   box-shadow: 0 0 0 2px rgba(74,163,255,0.45);
+}
+/* Steam 原生控件（下拉的 DialogButton、路径输入框、开关）用的是 Steam 自己的哈希类名，
+   上面那些 .ed-* 规则一条都不匹配。claimFocusRing 照样会给它们加 ed-focus，但没有
+   样式 → "光标落到原生控件上等于看不见"（2026-11-10 用户反馈）。这里补一圈和自有控件
+   同色的环。用 outline 而不是 background：不参与布局、不改 Steam 自己的配色，开关那种
+   38x22 的小控件也照样画得出来。
+   ":not()" 链把自有控件排除，免得和上面各自的方案叠成双环。 */
+/* 输入框/多行框除外：它们的外壳是 overflow:hidden，外扩的环会被裁掉，见下面那条规则。 */
+.ed-focus:not(.ed-chip):not(.ed-tile):not(.ed-action):not(.ed-info):not(.ed-loc):not(.ed-pager):not(input):not(textarea) {
+  outline: 2px solid ${COLOR.accent};
+  outline-offset: 2px;
+}
+/* 光靠 ed-focus 不够：Steam 的焦点管理会重写它自己节点上的 className，实测出现过
+   "hasEdFocus=false 但元素仍是 document.activeElement" —— 环跟着类一起消失，用户看到
+   的就是"光标没了"。「:focus」由浏览器维护，抹不掉，所以同样的环再挂一份在这里。 */
+.ed-surface :focus:not(.ed-chip):not(.ed-tile):not(.ed-action):not(.ed-info):not(.ed-loc):not(.ed-pager):not(input):not(textarea) {
+  outline: 2px solid ${COLOR.accent};
+  outline-offset: 2px;
+}
+/* 路径输入框的外壳是 overflow:hidden（padding 0 4px 0 40px），外扩 2px 的环会被裁掉，
+   等于没有。这类改成内嵌环：画在输入框自己的边框内侧，裁不到，颜色一致。 */
+input.ed-focus,
+textarea.ed-focus,
+.ed-surface input:focus,
+.ed-surface textarea:focus {
+  outline: none;
+  box-shadow: inset 0 0 0 2px ${COLOR.accent};
 }
 .ed-loc-path {
   font-family: monospace;
@@ -489,7 +513,7 @@ export function ErrorBlock({
           display: "flex",
           alignItems: "center",
           gap: "10px",
-          color: "#ffb84d",
+          color: COLOR.warningStrong,
           fontWeight: 700,
           fontSize: big ? "1.35em" : "1em",
         }}
@@ -517,15 +541,13 @@ export function ErrorBlock({
       >
         {hint}
       </div>
-      <Focusable
-        className="ed-action"
-        onClick={onRetry}
-        onActivate={onRetry}
-        data-disabled={retrying ? "true" : "false"}
+      <ActionButton
+        disabled={!!retrying}
         style={{ marginTop: "14px", padding: "10px 18px", width: "fit-content", fontSize: "0.95em" }}
+        onClick={onRetry}
       >
         <FaRedo /> {retrying ? t("正在重试…") : t("重试")}
-      </Focusable>
+      </ActionButton>
     </div>
   );
 }
@@ -547,29 +569,19 @@ export function StatBlock({
       className="ed-group"
       style={{ padding: "14px 16px", display: "flex", flexDirection: "column", gap: "4px", minWidth: 0 }}
     >
-      <div style={{ fontSize: "0.78em", letterSpacing: "0.06em", opacity: 0.55, textTransform: "uppercase" }}>
+      <div style={{ fontSize: "0.84em", letterSpacing: "0.06em", opacity: 0.55, textTransform: "uppercase" }}>
         {label}
       </div>
       <div style={{ fontSize: "1.45em", fontWeight: 700, color: accent ?? "#fff", lineHeight: 1.15 }}>
         {value}
       </div>
       {sub ? (
-        <div style={{ fontSize: "0.78em", opacity: 0.55, overflow: "hidden", textOverflow: "ellipsis" }}>
+        <div style={{ fontSize: "0.84em", opacity: 0.55, overflow: "hidden", textOverflow: "ellipsis" }}>
           {sub}
         </div>
       ) : null}
     </div>
   );
-}
-
-export function activeLabel(progress?: InstallProgress): { text: string; color: string } | null {
-  if (!progress || !isActive(progress)) return null;
-  return {
-    text:
-      (t(STATE_LABEL[progress.state] ?? "") || t("下载中")) +
-      (progress.percent >= 0 ? " " + progress.percent.toFixed(0) + "%" : ""),
-    color: "#4aa3ff",
-  };
 }
 
 /**
@@ -612,6 +624,9 @@ export function ActionButton({
     <Focusable
       className={className}
       noFocusRing={noFocusRing}
+      // 禁用态必须离开焦点序列，否则光标会停在"按 A 没反应"的按钮上（审计 1.6）。
+      tabIndex={disabled ? -1 : 0}
+      aria-disabled={disabled ? "true" : undefined}
       data-primary={primary ? "true" : "false"}
       data-danger={danger ? "true" : "false"}
       data-disabled={disabled ? "true" : "false"}

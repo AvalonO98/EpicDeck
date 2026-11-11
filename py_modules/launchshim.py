@@ -110,6 +110,10 @@ def _parse_args(argv):
     parser.add_argument("--app", required=True)
     parser.add_argument("--wine", default="")
     parser.add_argument("--log", default="")
+    # Written once a game process really exists. The launcher script keys its
+    # "did anything start?" decision on this file instead of on exit code 90,
+    # because a game is allowed to exit with 90 itself.
+    parser.add_argument("--marker", default="")
     # Diagnostics only: print the plan and the command we would run, then exit
     # without starting anything. Lets us verify the command line on a device
     # without taking over the screen with a real game.
@@ -119,6 +123,29 @@ def _parse_args(argv):
     if parsed.game_args and parsed.game_args[0] == "--":
         parsed.game_args = parsed.game_args[1:]
     return parsed
+
+
+def _mark_started(path, log):
+    """Record that a game process now exists. Best effort, never raises."""
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("%d\n" % os.getpid())
+    except OSError as exc:
+        log("marker write failed: %r" % (exc,))
+
+
+def _clear_marker(path):
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _plan_command(legendary, app, wine, game_args):
@@ -145,7 +172,7 @@ def _parse_plan(stdout):
     return json.loads(text[start:])
 
 
-def _fallback(legendary, app, wine, game_args, log, reason):
+def _fallback(legendary, app, wine, game_args, log, reason, marker=""):
     """Become the plain `launch` call, exactly like the old launcher script."""
     log("fallback to single-stage launch: %s" % reason)
     os.environ.pop("WINEPREFIX", None)
@@ -157,7 +184,15 @@ def _fallback(legendary, app, wine, game_args, log, reason):
     log("exec %s" % _shell(command))
     sys.stdout.flush()
     sys.stderr.flush()
-    os.execv(legendary, command)
+    # `execv` cannot report success, so the marker goes down first; if the exec
+    # itself fails nothing is running and we take it back so the launcher
+    # script still gets its chance to try the plain path.
+    _mark_started(marker, log)
+    try:
+        os.execv(legendary, command)
+    except OSError:
+        _clear_marker(marker)
+        raise
 
 
 def _forward_signals(proc, log):
@@ -212,7 +247,7 @@ def _build_command(plan):
     return command, working_directory, environment
 
 
-def _run_plan(plan, log):
+def _run_plan(plan, log, marker=""):
     """Start the game from a launch plan and block until it exits."""
     command, working_directory, environment = _build_command(plan)
 
@@ -230,6 +265,9 @@ def _run_plan(plan, log):
     log("cwd %s" % working_directory)
     proc = subprocess.Popen(command, cwd=working_directory, env=environment,
                             start_new_session=True)
+    # From here on a game exists, so its exit code -- whatever it is -- belongs
+    # to the game and must not trigger a second launch.
+    _mark_started(marker, log)
     _forward_signals(proc, log)
     return proc.wait()
 
@@ -240,6 +278,11 @@ def main(argv=None):
     log("--- launch %s (wine=%s, args=%s)"
         % (arguments.app, arguments.wine or "-", " ".join(arguments.game_args) or "-"))
 
+    def give_up(reason):
+        """Hand over to the plain `launch` path; never returns."""
+        _fallback(arguments.legendary, arguments.app, arguments.wine,
+                  arguments.game_args, log, reason, arguments.marker)
+
     try:
         plan_run = subprocess.run(
             _plan_command(arguments.legendary, arguments.app, arguments.wine,
@@ -247,24 +290,19 @@ def main(argv=None):
             capture_output=True, text=True, timeout=PLAN_TIMEOUT,
         )
     except Exception as exc:  # noqa: BLE001
-        _fallback(arguments.legendary, arguments.app, arguments.wine,
-                  arguments.game_args, log, "plan call failed: %r" % exc)
+        give_up("plan call failed: %r" % exc)
 
     if plan_run.returncode != 0:
         tail = (plan_run.stderr or "").strip().splitlines()[-3:]
-        _fallback(arguments.legendary, arguments.app, arguments.wine,
-                  arguments.game_args, log,
-                  "plan exit %d: %s" % (plan_run.returncode, " / ".join(tail)))
+        give_up("plan exit %d: %s" % (plan_run.returncode, " / ".join(tail)))
 
     try:
         plan = _parse_plan(plan_run.stdout)
     except ValueError as exc:
-        _fallback(arguments.legendary, arguments.app, arguments.wine,
-                  arguments.game_args, log, "plan is not JSON: %r" % exc)
+        give_up("plan is not JSON: %r" % exc)
 
     if not isinstance(plan, dict) or not plan.get("game_executable"):
-        _fallback(arguments.legendary, arguments.app, arguments.wine,
-                  arguments.game_args, log, "plan is missing game_executable")
+        give_up("plan is missing game_executable")
 
     if arguments.plan_only:
         try:
@@ -279,20 +317,20 @@ def main(argv=None):
         return 0
 
     try:
-        code = _run_plan(plan, log)
+        code = _run_plan(plan, log, arguments.marker)
     except OSError as exc:
-        _fallback(arguments.legendary, arguments.app, arguments.wine,
-                  arguments.game_args, log, "game could not start: %r" % exc)
+        give_up("game could not start: %r" % exc)
 
     log("game exited with %s" % code)
     return code
 
 
 if __name__ == "__main__":
-    # Exit code 90 tells the generated launcher script "no game was started",
-    # which makes it fall through to the plain `legendary launch` path. Any
-    # other code is a real game exit status and must be passed through
-    # untouched, so only failures that never reached the game map to 90.
+    # The launcher script decides "did a game start?" from the marker file, not
+    # from this process's exit status, so a game that legitimately exits with
+    # 90 no longer gets launched a second time. 90 is still what we return when
+    # *we* failed before the game existed -- it reads well in the launch log,
+    # and the missing marker is what actually drives the decision.
     try:
         status = main()
     except SystemExit:

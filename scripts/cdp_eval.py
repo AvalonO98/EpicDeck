@@ -2,6 +2,7 @@
 """Evaluate a JS expression in Steam's SharedJSContext via CDP.
 
 Usage: cdp_eval.py "<expression>"
+       cdp_eval.py @probe.js   (multi-line probe, keeps the shell out of it)
 
 Read-only probes only; the caller decides what to run.
 """
@@ -93,8 +94,15 @@ def recv_text(sock, buf):
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: cdp_eval.py <expression>")
+        print("usage: cdp_eval.py <expression> | cdp_eval.py @file.js")
         return 2
+    # `@file` keeps multi-line probes out of the shell. Passing a script through
+    # `"$(cat probe.js)"` re-quotes it twice and mangles anything with brackets
+    # and quotes; reading it here means the file's bytes are what gets evaluated.
+    expression = sys.argv[1]
+    if expression.startswith("@"):
+        with open(expression[1:], "r", encoding="utf-8") as handle:
+            expression = handle.read()
     page = find_page(sys.argv[2] if len(sys.argv) > 2 else "SharedJSContext")
     if page is None:
         print("NO_PAGE")
@@ -103,7 +111,7 @@ def main():
     send_text(sock, json.dumps({
         "id": 1,
         "method": "Runtime.evaluate",
-        "params": {"expression": sys.argv[1], "awaitPromise": True, "returnByValue": True},
+        "params": {"expression": expression, "awaitPromise": True, "returnByValue": True},
     }))
     buf = tail
     for _ in range(20):

@@ -379,6 +379,12 @@ class Legendary:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        # The file holds a refresh token. Default umask (022) makes it 0644,
+        # readable by every user on the Deck.
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         return {"account_id": account_id, "display_name": user["displayName"]}
 
     async def auth_status(self):
@@ -519,10 +525,21 @@ class Legendary:
             raise LegendaryError("读取游戏库失败: %s" % e)
         finally:
             if backup:
-                try:
-                    os.unlink(backup)
-                except OSError:
-                    pass
+                # A cancelled refresh (plugin reload cancels `_lib_task`) leaves
+                # the live file missing. Restore the backup before discarding
+                # it, otherwise the next `legendary list` has no entitlement
+                # list at all and the UI looks like the account owns nothing.
+                if not os.path.exists(ent):
+                    try:
+                        os.replace(backup, ent)
+                        backup = None
+                    except OSError:
+                        pass
+                if backup:
+                    try:
+                        os.unlink(backup)
+                    except OSError:
+                        pass
         if isinstance(games, dict):
             games = games.get("games", [])
 
@@ -663,33 +680,6 @@ class Legendary:
         if not disk and not download:
             return None
         return {"download": download, "disk": disk}
-
-    async def install(self, app_name: str, install_dir: str = "", base_path: str = ""):
-        args = ["install", app_name]
-        if install_dir:
-            args += ["--base-path", install_dir]
-        elif base_path:
-            args += ["--base-path", base_path]
-        args += ["-y"]  # assume yes to any prompt
-        return await self._run(*args, timeout=3600.0)
-
-    async def launch(self, app_name: str, extra_args: str = "", wine: str = ""):
-        """Launch an installed title.
-
-        Arguments after the app name go straight to the game (Legendary uses
-        REMAINDER), which is how per-game compatibility flags reach it.
-
-        `wine` is the "binary" Legendary puts in front of the game executable.
-        It does not have to be wine at all — any command works — which is how
-        Windows titles are handed to Steam's Proton (see py_modules/proton.py).
-        """
-        cmd = ["launch"]
-        if wine:
-            cmd += ["--wine", wine]
-        cmd.append(app_name)
-        if extra_args and extra_args.strip():
-            cmd += shlex.split(extra_args)
-        return await self._run(*cmd, timeout=60.0)
 
     async def uninstall(self, app_name: str):
         return await self._run("uninstall", app_name, "-y", timeout=120.0)

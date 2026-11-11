@@ -24,7 +24,17 @@ import {
   ConfirmModal,
 } from "@decky/ui";
 import { toaster } from "@decky/api";
-import { forwardRef, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  forwardRef,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import {
   FaArrowLeft,
   FaChevronLeft,
@@ -92,32 +102,42 @@ import {
   WarningBanner,
 } from "./components";
 import {
+  canFocus,
   claimFocusRing,
+  describeRows,
+  DIR_DOWN,
   DIR_LEFT,
   DIR_RIGHT,
+  DIR_UP,
   focusOwned,
   moveFocus,
   moveFocusRowCol,
+  notePointerDown,
+  peekAnchor,
   rememberFocus,
+  reverifyFocus,
   settleFocus,
 } from "./geomnav";
 import { LoginPanel } from "./login";
 import {
   actions,
   ensureBoot,
+  type PluginState,
   markFirstRunDone,
   onSignedIn,
   recheckEnv,
   reloadDirs,
   refreshLibrary,
   signOut,
+  shallowEqual,
   switchAccount,
   usePluginState,
+  usePluginSelector,
 } from "./store";
 import { STEAM_BOTTOM_INSET, STEAM_TOP_INSET, useViewport, type Viewport } from "./viewport";
 import { LIBRARY_ROUTE, PAGE_SIZE } from "./routes";
-import { setSteamMenuEntryEnabled } from "./steammenu";
-import { t, tf, useLangVersion } from "./i18n";
+import { COLOR } from "./tokens";
+import { getLang, t, tf, useLangVersion } from "./i18n";
 import { bootstrapLang } from "./langboot";
 
 export { LIBRARY_ROUTE };
@@ -163,33 +183,6 @@ const TABS: { id: TabId; label: string; icon: ReactNode }[] = [
   { id: "downloads", label: "下载", icon: <FaDownload /> },
   { id: "settings", label: "设置", icon: <FaCog /> },
 ];
-
-/**
- * Focus actions: "landing on this element also does something".
- *
- * React's `onFocus` is not usable here — Steam's `Focusable` consumes it for its
- * own nav bookkeeping, so a chip never hears about focus. Instead each such
- * element declares `data-ed-focus-action="tab:downloads"` and the page registers
- * the matching callback; the navigator runs it right after moving focus.
- */
-const focusActions = new Map<string, () => void>();
-
-export function setFocusAction(key: string, fn: (() => void) | null) {
-  if (fn) focusActions.set(key, fn);
-  else focusActions.delete(key);
-}
-
-export function runFocusAction(el: HTMLElement | null | undefined) {
-  const key = el?.getAttribute?.("data-ed-focus-action");
-  if (!key) return;
-  const fn = focusActions.get(key);
-  if (!fn) return;
-  try {
-    fn();
-  } catch (e) {
-    console.log("EpicDeck: focus action failed", key, e);
-  }
-}
 
 /**
  * Which interaction level currently has focus — read off the nearest ancestor
@@ -261,8 +254,12 @@ function Pager({
   const dim = (disabled: boolean): CSSProperties => (disabled ? { opacity: 0.3 } : {});
   return (
     <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
+      {/* 到头了就不该能被聚焦：以前只是变淡，光标会停在"按了没反应"的死键上（审计 1.6）。 */}
       <Focusable
         className="ed-pager"
+        noFocusRing
+        tabIndex={page <= 1 ? -1 : 0}
+        aria-disabled={page <= 1 ? "true" : undefined}
         style={{ ...btn, ...dim(page <= 1) }}
         onClick={page <= 1 ? undefined : onPrev}
         onActivate={page <= 1 ? undefined : onPrev}
@@ -282,6 +279,9 @@ function Pager({
       </div>
       <Focusable
         className="ed-pager"
+        noFocusRing
+        tabIndex={page >= pageCount ? -1 : 0}
+        aria-disabled={page >= pageCount ? "true" : undefined}
         style={{ ...btn, ...dim(page >= pageCount) }}
         onClick={page >= pageCount ? undefined : onNext}
         onActivate={page >= pageCount ? undefined : onNext}
@@ -311,17 +311,31 @@ function Group({ children, style }: { children: ReactNode; style?: CSSProperties
 
 // -- library ------------------------------------------------------------
 
-const LibraryTile = forwardRef<HTMLDivElement, {
+/** Compare two progress snapshots by what a cover actually renders. */
+function sameTileProgress(a?: InstallProgress, b?: InstallProgress): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.state === b.state && Math.round(a.percent) === Math.round(b.percent);
+}
+
+const LibraryTile = memo(forwardRef<HTMLDivElement, {
   game: Game;
-  progress?: InstallProgress;
   onOpen: (game: Game) => void;
-}>(function LibraryTile({ game, progress, onOpen }, ref) {
+}>(function LibraryTile({ game, onOpen }, ref) {
+  // Each cover subscribes to its own progress row instead of receiving it as a
+  // prop. A download writes `progress` 1–2 times a second; with the prop every
+  // cover in the grid re-rendered on every tick (audit 3.5).
+  const progress = usePluginSelector((state) => state.progress[game.app_name], sameTileProgress);
   const downloading = isActive(progress);
   return (
+    // `data-ed-app` is the handle used to return the cursor to this cover when
+    // the detail page closes; without it the first d-pad press after B is
+    // swallowed while the navigator hunts for a removed node.
     <Focusable
       ref={ref}
       noFocusRing
       className="ed-tile"
+      data-ed-app={game.app_name}
       onActivate={() => onOpen(game)}
       onClick={() => onOpen(game)}
       style={{
@@ -355,8 +369,10 @@ const LibraryTile = forwardRef<HTMLDivElement, {
         style={{
           position: "absolute",
           inset: 0,
+          // 45% 起步时，浅色封面（龙腾世纪那种）上「未安装 / 体积」几乎看不清；
+          // 提前到 32% 并加深中段（审计 V9）。
           background:
-            "linear-gradient(180deg, rgba(0,0,0,0) 45%, rgba(0,0,0,0.55) 72%, rgba(0,0,0,0.92) 100%)",
+            "linear-gradient(180deg, rgba(0,0,0,0) 32%, rgba(0,0,0,0.62) 68%, rgba(0,0,0,0.94) 100%)",
           opacity: 0.92,
           pointerEvents: "none",
         }}
@@ -371,7 +387,7 @@ const LibraryTile = forwardRef<HTMLDivElement, {
             borderRadius: "999px",
             background: "rgba(74,163,255,0.92)",
             color: "#04121f",
-            fontSize: "0.7em",
+            fontSize: "0.8em",
             fontWeight: 700,
           }}
         >
@@ -387,8 +403,8 @@ const LibraryTile = forwardRef<HTMLDivElement, {
             padding: "3px 6px",
             borderRadius: "999px",
             background: "rgba(0,0,0,0.55)",
-            color: "#9ecbff",
-            fontSize: "0.7em",
+            color: COLOR.accentSoft,
+            fontSize: "0.8em",
             display: "flex",
             alignItems: "center",
           }}
@@ -415,6 +431,8 @@ const LibraryTile = forwardRef<HTMLDivElement, {
             fontWeight: 600,
             lineHeight: 1.2,
             color: "rgba(255,255,255,0.96)",
+            // 亮封面 + 白色标题时靠阴影保住对比度（审计 V9）。
+            textShadow: "0 1px 3px rgba(0,0,0,0.85)",
             overflow: "hidden",
             display: "-webkit-box",
             WebkitLineClamp: 2,
@@ -425,15 +443,16 @@ const LibraryTile = forwardRef<HTMLDivElement, {
         </div>
         <div
           style={{
-            fontSize: "0.72em",
+            fontSize: "0.8em",
             color: game.is_installed
-              ? "#7ee2a8"
+              ? COLOR.success
               : game.non_installable
-                ? "#ffd27e"
+                ? COLOR.warning
                 : "rgba(255,255,255,0.6)",
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
+            textShadow: "0 1px 3px rgba(0,0,0,0.85)",
           }}
         >
           {game.is_installed
@@ -447,7 +466,7 @@ const LibraryTile = forwardRef<HTMLDivElement, {
       </div>
     </Focusable>
   );
-});
+}));
 
 function LibraryTab({
   onOpen,
@@ -458,9 +477,19 @@ function LibraryTab({
   onOpen: (game: Game) => void;
   libraryError?: ReactNode;
   viewport: Viewport;
-  registerBumper?: (fn: ((delta: number) => void) | null) => void;
+  registerBumper?: (fn: ((delta: number) => boolean) | null) => void;
 }) {
-  const { games, progress, sizePending, locale, refreshing } = usePluginState();
+  // No `progress` here any more: each cover subscribes to its own row, so a
+  // download no longer re-renders the toolbar and the whole grid (audit 3.5).
+  const { games, sizePending, locale, refreshing } = usePluginSelector(
+    (state) => ({
+      games: state.games,
+      sizePending: state.sizePending,
+      locale: state.locale,
+      refreshing: state.refreshing,
+    }),
+    shallowEqual
+  );
   const initial = useRef(readFsUI()).current;
 
   const [filter, setFilter] = useState<InstallFilter>(initial.filter);
@@ -481,20 +510,25 @@ function LibraryTab({
       if (!q) return true;
       return (g.title || "").toLowerCase().includes(q) || g.app_name.toLowerCase().includes(q);
     });
+    // 排序按当前界面语言比较：英文界面下用中文 collator 会把 A/a、重音字母
+    // 和标点的顺序排得很怪（审计 2.8）。
+    const collator = new Intl.Collator(getLang() === "en" ? "en" : "zh-Hans-CN", {
+      sensitivity: "base",
+    });
     filtered.sort((a, b) => {
       switch (sort) {
         case "alpha_desc":
-          return (b.title || "").localeCompare(a.title || "", "zh-Hans-CN");
+          return collator.compare(b.title || "", a.title || "");
         case "playtime":
           return (b.playtime_seconds || 0) - (a.playtime_seconds || 0);
         case "recent":
           return (b.first_seen || 0) - (a.first_seen || 0);
         default:
-          return (a.title || "").localeCompare(b.title || "", "zh-Hans-CN");
+          return collator.compare(a.title || "", b.title || "");
       }
     });
     return filtered;
-  }, [games, query, sort, filter]);
+  }, [games, query, sort, filter, getLang()]);
 
   const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
   const current = Math.min(page, pageCount);
@@ -513,6 +547,12 @@ function LibraryTab({
 
   const pageGames = visible.slice((current - 1) * PAGE_SIZE, current * PAGE_SIZE);
 
+  // `onOpen` arrives as an inline arrow from the shell, so its identity changes
+  // on every render of the shell. Keep a stable wrapper or `memo` never bails.
+  const onOpenRef = useRef(onOpen);
+  onOpenRef.current = onOpen;
+  const openGame = useCallback((game: Game) => onOpenRef.current(game), []);
+
   const chooseFilter = (next: InstallFilter) => {
     setFilter(next);
     setPage(1);
@@ -522,36 +562,23 @@ function LibraryTab({
   const counts: Record<InstallFilter, number> = {
     all: games.length,
     installed: installedCount,
-    not_installed: games.length - installedCount,
+    // 与过滤保持一致：`non_installable`（EA/Origin 类）不算"未安装"，
+    // 否则徽章数字比点开看到的条数多（审计 2.2）。
+    not_installed: games.filter((g) => !g.is_installed && !g.non_installable).length,
   };
 
-  // Landing on a filter chip applies it immediately.
-  useEffect(() => {
-    const offs = INSTALL_FILTER_ORDER.map((f) => {
-      setFocusAction(`filter:${f}`, () => {
-        setFilter((prev) => {
-          if (prev === f) return prev;
-          setPage(1);
-          writeFsUI({ filter: f, page: 1 });
-          return f;
-        });
-      });
-      return f;
-    });
-    return () => {
-      for (const f of offs) setFocusAction(`filter:${f}`, null);
-    };
-  }, []);
+  // Filters are applied with A (`chooseFilter`), not on focus.
 
   // Hand the pager up so L1/R1 can flip pages while focus is inside the grid.
   useEffect(() => {
     if (!registerBumper) return;
     registerBumper((delta) => {
       const next = Math.min(pageCount, Math.max(1, current + delta));
-      if (next !== current) {
-        setPage(next);
-        writeFsUI({ page: next });
-      }
+      // 报告"到底有没有换页"，调用方据此决定要不要落焦（审计 1.4）。
+      if (next === current) return false;
+      setPage(next);
+      writeFsUI({ page: next });
+      return true;
     });
     return () => registerBumper(null);
   }, [registerBumper, current, pageCount]);
@@ -565,6 +592,8 @@ function LibraryTab({
         {/* Chips are direct children of the row so Steam's horizontal flow can
             actually link them (a nested wrapper would break the nav flow even
             though it looks identical). */}
+        {/* Chips apply on A, not on focus: sliding towards the search box used
+            to apply "全部 / 已安装 / 未安装" one after another. */}
         {INSTALL_FILTER_ORDER.map((f) => (
           <Focusable
             key={f}
@@ -573,7 +602,6 @@ function LibraryTab({
             data-active={f === filter ? "true" : "false"}
             onClick={() => chooseFilter(f)}
             onActivate={() => chooseFilter(f)}
-            data-ed-focus-action={`filter:${f}`}
             style={{ padding: "6px 11px", fontSize: "0.86em", whiteSpace: "nowrap", flexShrink: 0 }}
           >
             {t(INSTALL_FILTER_LABEL[f])}{" "}
@@ -593,6 +621,7 @@ function LibraryTab({
               writeFsUI({ query: e.target.value, page: 1 });
             }}
             bShowClearAction
+            placeholder={t("搜索")}
           />
         </div>
 
@@ -652,7 +681,19 @@ function LibraryTab({
           )}
         </div>
       ) : (
-        <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }} data-ed-level="grid">
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            overflow: "hidden",
+            // 网格的 padding 是 0.35em（给放大后的焦点环留空间），于是封面从 x=21.6
+            // 起、工具栏 chip 从 x=16 起，左边线差 5.6px（审计 V8）。外层用等量负
+            // margin 抵掉，封面回到 16，环还剩 5.6px 余量不会被裁。
+            marginLeft: "-0.35em",
+            marginRight: "-0.35em",
+          }}
+          data-ed-level="grid"
+        >
           <div
             key={`${current}-${filter}-${sort}-${query}`}
             className="ed-fade"
@@ -663,8 +704,12 @@ function LibraryTab({
               // Only the column count changes with the window; the row count
               // follows from it, so a narrow window reflows to 4×4 instead of
               // squeezing five covers into thumbnails.
-              gridTemplateRows: `repeat(${Math.ceil(pageGames.length / viewport.cols)}, minmax(0, 1fr))`,
+              // A full page's worth of rows, not the current page's: with
+              // 3 games on the last page the old formula produced one row that
+              // filled the viewport and stretched every cover.
+              gridTemplateRows: `repeat(${Math.max(1, Math.ceil(PAGE_SIZE / viewport.cols))}, minmax(0, 1fr))`,
               gridTemplateColumns: `repeat(${viewport.cols}, minmax(0, 1fr))`,
+              alignContent: "start",
               gap: viewport.compact ? "0.5em" : "0.7em",
               height: "100%",
               // The focus ring scales tiles up; the padding keeps it from
@@ -674,7 +719,7 @@ function LibraryTab({
             }}
           >
             {pageGames.map((g) => (
-              <LibraryTile key={g.app_name} game={g} progress={progress[g.app_name]} onOpen={onOpen} />
+              <LibraryTile key={g.app_name} game={g} onOpen={openGame} />
             ))}
           </div>
 
@@ -702,8 +747,55 @@ const PROTONDB_COLOR: Record<string, string> = {
   pending: "#9aa3ad",
 };
 
+/**
+ * A yes/no dialog for destructive actions.
+ *
+ * Steam Deck's A button is easy to hit by accident, and these actions delete
+ * tens of gigabytes, throw away resume state, or interrupt a running game.
+ * `showModal` is fire-and-forget, so the promise is settled from the buttons.
+ */
+function confirmAction(title: string, body: string, okText: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    showModal(
+      <ConfirmModal
+        strTitle={title}
+        strDescription={<div style={{ fontSize: "0.9em", lineHeight: 1.5 }}>{body}</div>}
+        strOKButtonText={okText}
+        strCancelButtonText={t("取消")}
+        onOK={() => finish(true)}
+        onCancel={() => finish(false)}
+        onEscKeypress={() => finish(false)}
+      />
+    );
+  });
+}
+
+/** Detail progress changes matter at 0.1% granularity (it prints one decimal). */
+function sameDetailProgress(a?: InstallProgress, b?: InstallProgress): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.state === b.state &&
+    a.message === b.message &&
+    a.speed === b.speed &&
+    Math.abs((a.percent || 0) - (b.percent || 0)) < 0.05
+  );
+}
+
 function DetailView({ appName, onBack }: { appName: string; onBack: () => void }) {
-  const { games, progress, dirs, defaultDir } = usePluginState();
+  // The detail page only shows its own download, so subscribe to that row
+  // instead of the whole state (audit 3.5).
+  const { games, dirs, defaultDir } = usePluginSelector(
+    (state) => ({ games: state.games, dirs: state.dirs, defaultDir: state.defaultDir }),
+    shallowEqual
+  );
+  const progress = usePluginSelector((state) => state.progress[appName], sameDetailProgress);
   const game = games.find((g) => g.app_name === appName);
   if (!game) {
     return (
@@ -715,7 +807,9 @@ function DetailView({ appName, onBack }: { appName: string; onBack: () => void }
       </div>
     );
   }
-  return <DetailBody game={game} progress={progress[appName]} dirs={dirs} defaultDir={defaultDir} onBack={onBack} />;
+  // onBack 不再往 DetailBody 传：详情页里的「← 游戏库」按钮已删（审计 V4），
+  // 返回统一由顶栏「返回」/ B 处理，DetailBody 内部不需要它。
+  return <DetailBody game={game} progress={progress} dirs={dirs} defaultDir={defaultDir} />;
 }
 
 function DetailBody({
@@ -723,13 +817,11 @@ function DetailBody({
   progress,
   dirs,
   defaultDir,
-  onBack,
 }: {
   game: Game;
   progress?: InstallProgress;
   dirs: { path: string; label: string; free: number }[];
   defaultDir: string;
-  onBack: () => void;
 }) {
   const [busy, setBusy] = useState<string>("");
   const [inSteam, setInSteam] = useState<boolean>(game.in_steam);
@@ -782,6 +874,22 @@ function DetailBody({
     };
   }, [game.app_name]);
 
+  // 离开详情页（按 B / 切标签 / 换游戏）时把没来得及保存的参数补一次。
+  // 之前 cleanup 只 clearTimeout，900ms 内的输入直接消失，界面也没有"未保存"
+  // 提示（审计 2.4）。这个 effect 只在"离开"时跑，不会每敲一个字就发请求。
+  const argsDirtyRef = useRef(argsDirty);
+  argsDirtyRef.current = argsDirty;
+  const argsRef = useRef(args);
+  argsRef.current = args;
+  useEffect(
+    () => () => {
+      if (argsDirtyRef.current) {
+        void setLaunchArgs(game.app_name, argsRef.current);
+      }
+    },
+    [game.app_name]
+  );
+
   useEffect(() => {
     if (!argsDirty) return;
     const timer = setTimeout(async () => {
@@ -833,10 +941,20 @@ function DetailBody({
   }, [game.app_name, installed]);
 
   const doCloudSync = async (mode: "sync" | "upload" | "download") => {
+    // Downloading (and two-way sync) can overwrite newer local saves, so both
+    // require an explicit yes. Upload is additive and needs no prompt.
+    if (mode !== "upload") {
+      const ok = await confirmAction(
+        mode === "download" ? t("下载云端存档？") : t("双向同步存档？"),
+        t("本地存档会先备份，然后被云端版本覆盖。"),
+        t("继续")
+      );
+      if (!ok) return;
+    }
     setCloudBusy(mode);
-    const r = await syncCloudSaves(game.app_name, mode);
-    setCloudBusy("");
-    if (r.ok) {
+    try {
+      const r = await syncCloudSaves(game.app_name, mode);
+      if (r.ok) {
       toaster.toast({
         title: t("云存档已同步"),
         body:
@@ -846,8 +964,13 @@ function DetailBody({
             ? t("云端存档已下载")
             : t("双向同步完成"),
       });
-    } else {
-      toaster.toast({ title: t("云存档同步失败"), body: r.error ?? "" });
+      } else {
+        toaster.toast({ title: t("云存档同步失败"), body: r.error ?? "" });
+      }
+    } catch (err) {
+      toaster.toast({ title: t("云存档同步失败"), body: String(err).slice(0, 140) });
+    } finally {
+      setCloudBusy("");
     }
   };
 
@@ -880,87 +1003,132 @@ function DetailBody({
     };
   }, [game.app_name, game.download_size, game.disk_size, game.is_installed, game.installed_size]);
 
-  // Steam's Focusable can report one press through both onActivate and onClick;
-  // for actions that toggle state (Steam shortcut, install) that would run twice.
-  const guardRef = useRef(0);
-  const once = (fn: () => void) => () => {
-    const now = Date.now();
-    if (now - guardRef.current < 300) return;
-    guardRef.current = now;
-    fn();
-  };
+  // 这页上的按钮全部走 `ActionButton`：它已经把 onActivate + onClick 合成一次
+  // 并做 300ms 去重，所以这里不再需要自己的 once() 守卫（审计 3.6）。
 
   const doInstall = async () => {
     setBusy("install");
-    const r = await actions.install(game.app_name, target);
-    setBusy("");
-    if (r.ok) toaster.toast({ title: t("开始下载"), body: game.title });
-    else toaster.toast({ title: t("安装失败"), body: r.error ?? "" });
+    try {
+      const r = await actions.install(game.app_name, target);
+      if (r.ok) toaster.toast({ title: t("开始下载"), body: game.title });
+      else toaster.toast({ title: t("安装失败"), body: r.error ?? "" });
+    } catch (err) {
+      toaster.toast({ title: t("安装失败"), body: String(err).slice(0, 140) });
+    } finally {
+      setBusy("");
+    }
   };
 
   const doLaunch = async () => {
     setBusy("launch");
-    const r = await actions.launch(game.app_name);
-    if (!r.ok) {
-      setBusy("");
-      toaster.toast({ title: t("启动失败"), body: r.error ?? "" });
-      return;
-    }
-    // Steam has to start the game: gamescope only switches away from the
-    // Steam UI when Steam itself believes a game is running. RunGame takes
-    // Steam's own GameID (not the appid) and a 4th argument of 100; see
-    // shortcutGameId() above for why the naive call silently does nothing.
-    //
-    // Keep the *object* and call the method on it. Pulling RunGame out into a
-    // local (`const f = apps.RunGame; f(...)`) loses `this` — it is a native
-    // method and throws, which then fell through to the direct-spawn fallback
-    // and produced sound with no picture.
-    const apps = (globalThis as any).SteamClient?.Apps;
-    if (r.appid && apps && typeof apps.RunGame === "function") {
-      try {
-        const gameId = await waitForShortcutGameId(r.appid);
-        await apps.RunGame(gameId, "", -1, 100);
-        setBusy("");
-        if (r.note) toaster.toast({ title: t("正在启动"), body: r.note });
-        return;
-      } catch (err) {
-        console.warn("SteamClient.Apps.RunGame failed, using direct launch", err);
+    try {
+      // Steam has to be the one that spawns the game — gamescope only switches
+      // away from the Steam UI when Steam believes a game is running — and it
+      // only does that for a shortcut it owns. Waiting for an entry that does
+      // not exist used to end in a background launch: sound, no picture.
+      if (!inSteam) {
         toaster.toast({
-          title: t("Steam 启动失败，已改用后台启动"),
-          body: String(err).slice(0, 120),
+          title: t("正在添加到 Steam"),
+          body: t("首次启动前需要先建立 Steam 条目"),
         });
+        const added = await actions.addToSteam(game.app_name);
+        if (!added.ok) {
+          toaster.toast({ title: t("添加到 Steam 失败"), body: added.error ?? "" });
+          return;
+        }
+        setInSteam(true);
       }
+
+      const r = await actions.launch(game.app_name);
+      if (!r.ok) {
+        toaster.toast({ title: t("启动失败"), body: r.error ?? "" });
+        return;
+      }
+      // RunGame takes Steam's own GameID (not the appid) and a 4th argument of
+      // 100; see shortcutGameId() above for why the naive call does nothing.
+      //
+      // Keep the *object* and call the method on it. Pulling RunGame out into a
+      // local (`const f = apps.RunGame; f(...)`) loses `this` — it is a native
+      // method and throws, which then fell through to the direct-spawn fallback
+      // and produced sound with no picture.
+      const apps = (globalThis as any).SteamClient?.Apps;
+      if (r.appid && apps && typeof apps.RunGame === "function") {
+        try {
+          const gameId = await waitForShortcutGameId(r.appid);
+          await apps.RunGame(gameId, "", -1, 100);
+          if (r.note) toaster.toast({ title: t("正在启动"), body: r.note });
+          return;
+        } catch (err) {
+          console.warn("SteamClient.Apps.RunGame failed, using direct launch", err);
+          toaster.toast({
+            title: t("Steam 启动失败，已改用后台启动"),
+            body: String(err).slice(0, 120),
+          });
+        }
+      }
+      const fallback = await actions.launch(game.app_name, true);
+      if (!fallback.ok) toaster.toast({ title: t("启动失败"), body: fallback.error ?? "" });
+      else if (fallback.note) toaster.toast({ title: t("正在启动"), body: fallback.note });
+    } catch (err) {
+      // A rejected callable used to leave `busy="launch"` forever.
+      toaster.toast({ title: t("启动失败"), body: String(err).slice(0, 140) });
+    } finally {
+      setBusy("");
     }
-    const fallback = await actions.launch(game.app_name, true);
-    setBusy("");
-    if (!fallback.ok) toaster.toast({ title: t("启动失败"), body: fallback.error ?? "" });
-    else if (fallback.note) toaster.toast({ title: t("正在启动"), body: fallback.note });
   };
 
   const doUninstall = async () => {
+    const ok = await confirmAction(
+      t("卸载游戏？"),
+      t("会删除游戏文件（存档保留）。想保留游戏请先取消。"),
+      t("卸载")
+    );
+    if (!ok) return;
     setBusy("uninstall");
-    const r = await actions.uninstall(game.app_name);
-    setBusy("");
-    if (r.ok) {
-      setInstalled(false);
-      toaster.toast({ title: t("已卸载"), body: game.title });
-    } else {
-      toaster.toast({ title: t("卸载失败"), body: r.error ?? "" });
+    try {
+      const r = await actions.uninstall(game.app_name);
+      if (r.ok) {
+        setInstalled(false);
+        toaster.toast({ title: t("已卸载"), body: game.title });
+      } else {
+        toaster.toast({ title: t("卸载失败"), body: r.error ?? "" });
+      }
+    } catch (err) {
+      toaster.toast({ title: t("卸载失败"), body: String(err).slice(0, 140) });
+    } finally {
+      setBusy("");
     }
+  };
+
+  const doCancel = async () => {
+    const ok = await confirmAction(
+      t("取消下载？"),
+      t("会删除已下载的进度，下次需要重新下载。只想暂时停下请用「暂停」。"),
+      t("取消下载")
+    );
+    if (!ok) return;
+    await actions.cancel(game.app_name);
   };
 
   const doToggleSteam = async () => {
     setBusy("steam");
-    const r = inSteam ? await actions.removeFromSteam(game.app_name) : await actions.addToSteam(game.app_name);
-    setBusy("");
-    if (r.ok) {
-      setInSteam(!inSteam);
-      toaster.toast({
-        title: inSteam ? t("已从 Steam 移除") : t("已添加到 Steam"),
-        body: inSteam ? "" : t("重启 Steam 后生效"),
-      });
-    } else {
-      toaster.toast({ title: inSteam ? t("移除失败") : t("添加失败"), body: r.error ?? "" });
+    try {
+      const r = inSteam
+        ? await actions.removeFromSteam(game.app_name)
+        : await actions.addToSteam(game.app_name);
+      if (r.ok) {
+        setInSteam(!inSteam);
+        toaster.toast({
+          title: inSteam ? t("已从 Steam 移除") : t("已添加到 Steam"),
+          body: inSteam ? "" : t("重启 Steam 后生效"),
+        });
+      } else {
+        toaster.toast({ title: inSteam ? t("移除失败") : t("添加失败"), body: r.error ?? "" });
+      }
+    } catch (err) {
+      toaster.toast({ title: inSteam ? t("移除失败") : t("添加失败"), body: String(err).slice(0, 140) });
+    } finally {
+      setBusy("");
     }
   };
 
@@ -969,17 +1137,8 @@ function DetailBody({
 
   return (
     <div className="ed-fade" style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "14px" }}>
-        <Focusable
-          className="ed-chip"
-          onClick={onBack}
-          onActivate={onBack}
-          style={{ padding: "7px 14px", fontSize: "0.9em", display: "flex", alignItems: "center", gap: "6px" }}
-        >
-          <FaArrowLeft /> {t('游戏库')}
-        </Focusable>
-      </div>
-
+      {/* 「← 游戏库」chip 已删（第三轮审计 V4）：顶栏「返回」在详情里就是"先关详情"，
+          同一件事两个按钮还多占一行。onBack 仍由顶栏返回 / B 使用。 */}
       <Scroller contentStyle={{ paddingRight: "6px", paddingBottom: "2.5em" }}>
       <div style={{ display: "flex", gap: "1.6em", minHeight: 0 }}>
         {/* em, not px: the cover scales with the page's root font size, which
@@ -997,8 +1156,8 @@ function DetailBody({
               className="ed-chip"
               style={{
                 padding: "4px 10px",
-                fontSize: "0.78em",
-                color: installed ? "#7ee2a8" : "rgba(255,255,255,0.7)",
+                fontSize: "0.84em",
+                color: installed ? COLOR.success : "rgba(255,255,255,0.7)",
               }}
             >
               {installed ? t("已安装") : t("未安装")}
@@ -1006,7 +1165,7 @@ function DetailBody({
             {inSteam ? (
               <span
                 className="ed-chip"
-                style={{ padding: "4px 10px", fontSize: "0.78em", display: "flex", gap: "5px", alignItems: "center" }}
+                style={{ padding: "4px 10px", fontSize: "0.84em", display: "flex", gap: "5px", alignItems: "center" }}
               >
                 <FaSteamSymbol /> Steam
               </span>
@@ -1021,7 +1180,7 @@ function DetailBody({
                 }
                 style={{
                   padding: "4px 10px",
-                  fontSize: "0.78em",
+                  fontSize: "0.84em",
                   color: PROTONDB_COLOR[proton.tier] ?? "rgba(255,255,255,0.75)",
                 }}
               >
@@ -1076,7 +1235,7 @@ function DetailBody({
                 style={{
                   padding: "10px 14px",
                   fontSize: "0.85em",
-                  color: "#ffd27e",
+                  color: COLOR.warning,
                   lineHeight: 1.55,
                   maxWidth: "40em",
                 }}
@@ -1084,61 +1243,51 @@ function DetailBody({
                 {t("这个条目需要第三方启动器（EA App / Origin 等）才能安装，EpicDeck 暂不支持直接下载。")}
               </div>
             ) : installed ? (
-              <Focusable
-                className="ed-action"
-                data-primary="true"
+              <ActionButton
+                primary
+                disabled={!!busy}
                 style={{ padding: "12px 26px", fontSize: "1em" }}
-                onClick={busy ? undefined : once(doLaunch)}
-                onActivate={busy ? undefined : once(doLaunch)}
+                onClick={doLaunch}
               >
                 <FaPlay /> {busy === "launch" ? t("正在启动…") : t("启动游戏")}
-              </Focusable>
+              </ActionButton>
             ) : active ? (
-              <Focusable
-                className="ed-action"
-                data-danger="true"
+              <ActionButton
+                danger
+                disabled={!!busy}
                 style={{ padding: "12px 26px", fontSize: "1em" }}
-                onClick={once(() => {
-                  void actions.cancel(game.app_name);
-                })}
-                onActivate={once(() => {
-                  void actions.cancel(game.app_name);
-                })}
+                onClick={() => void doCancel()}
               >
                 <FaTrash /> {t('取消下载')}
-              </Focusable>
+              </ActionButton>
             ) : (
-              <Focusable
-                className="ed-action"
-                data-primary="true"
+              <ActionButton
+                primary
+                disabled={!!busy}
                 style={{ padding: "12px 26px", fontSize: "1em" }}
-                onClick={busy ? undefined : once(doInstall)}
-                onActivate={busy ? undefined : once(doInstall)}
+                onClick={doInstall}
               >
                 <FaDownload /> {busy === "install" ? t("正在准备…") : t("下载并安装")}
-              </Focusable>
+              </ActionButton>
             )}
 
-            <Focusable
-              className="ed-action"
+            <ActionButton
+              disabled={!!busy || !installed}
               style={{ padding: "12px 20px", fontSize: "0.95em" }}
-              onClick={busy || !installed ? undefined : once(doToggleSteam)}
-              onActivate={busy || !installed ? undefined : once(doToggleSteam)}
-              data-disabled={!installed ? "true" : "false"}
+              onClick={doToggleSteam}
             >
               <FaSteamSymbol /> {inSteam ? t("从 Steam 移除") : t("添加到 Steam")}
-            </Focusable>
+            </ActionButton>
 
             {installed ? (
-              <Focusable
-                className="ed-action"
-                data-danger="true"
+              <ActionButton
+                danger
+                disabled={!!busy}
                 style={{ padding: "12px 20px", fontSize: "0.95em" }}
-                onClick={busy ? undefined : once(doUninstall)}
-                onActivate={busy ? undefined : once(doUninstall)}
+                onClick={doUninstall}
               >
                 <FaTrash /> {t('卸载')}
-              </Focusable>
+              </ActionButton>
             ) : null}
           </NavRow>
 
@@ -1163,8 +1312,10 @@ function DetailBody({
                 setArgs(e.target.value);
                 setArgsDirty(true);
               }}
-              label={t("追加在 legendary launch 之后，如 -windowed；留空即不添加")}
             />
+            <div style={{ fontSize: "0.78em", opacity: 0.45, marginTop: "6px" }}>
+              {t("追加在 legendary launch 之后，如 -windowed；留空即不添加")}
+            </div>
           </Group>
 
           {lsfg.available ? (
@@ -1181,16 +1332,16 @@ function DetailBody({
               />
               <div
                 style={{
-                  fontSize: "0.78em",
+                  fontSize: "0.84em",
                   marginTop: "8px",
-                  color: lsfg.enabled ? "#7ee2a8" : "rgba(255,255,255,0.5)",
+                  color: lsfg.enabled ? COLOR.success : "rgba(255,255,255,0.5)",
                 }}
               >
                 {lsfg.enabled
                   ? t("已开启：启动时会经 ~/lsfg 包装插帧（可在启动日志里看到 [lsfg] 记录）")
                   : t("已关闭：启动时不加插帧层")}
               </div>
-              <div style={{ fontSize: "0.74em", marginTop: "6px", opacity: 0.5 }}>
+              <div style={{ fontSize: "0.82em", marginTop: "6px", opacity: 0.5 }}>
                 {t('插帧通过 ~/lsfg 包装实现，不会写入上方「启动参数」，所以启动参数里看不到。')}
               </div>
             </Group>
@@ -1229,7 +1380,7 @@ function DetailBody({
                   {cloudBusy === "sync" ? t("同步中…") : t("双向同步")}
                 </ActionButton>
               </NavRow>
-              <div style={{ fontSize: "0.74em", marginTop: "8px", opacity: 0.55 }}>
+              <div style={{ fontSize: "0.82em", marginTop: "8px", opacity: 0.55 }}>
                 {t('只在点按钮时同步；插件不会在启动时自动覆盖本地存档。')}
               </div>
             </Group>
@@ -1239,7 +1390,7 @@ function DetailBody({
               (the LSFG toggle), and a focused element is the only thing the
               navigator scrolls to. `.ed-info` gives the cursor a landing spot
               so the left stick can reach this line — and the LSFG hint above it. */}
-          <div tabIndex={0} className="ed-info" style={{ fontSize: "0.75em", opacity: 0.7 }}>
+          <div tabIndex={0} className="ed-info" style={{ fontSize: "0.82em", opacity: 0.7 }}>
             {game.app_name}
             {tf(" · 版本 {0}", game.version || t("未知"))}
           </div>
@@ -1275,9 +1426,20 @@ function DownloadsTab({ onOpenGame, onOpenSettings }: { onOpenGame: (appName: st
 
   if (items.length === 0) {
     return (
+      // 空态卡片以前贴在上半屏，下面 ~230px 全是空的；这里让它占满内容区并居中（审计 V13）。
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: "0 0 2em",
+        }}
+      >
       <div
         className="ed-group"
-        style={{ padding: "46px 24px", textAlign: "center", opacity: 0.65, lineHeight: 1.8 }}
+        style={{ padding: "46px 24px", textAlign: "center", opacity: 0.65, lineHeight: 1.8, maxWidth: "640px" }}
       >
         <div style={{ fontSize: "2em", marginBottom: "10px", opacity: 0.5 }}>
           <FaDownload />
@@ -1286,14 +1448,21 @@ function DownloadsTab({ onOpenGame, onOpenSettings }: { onOpenGame: (appName: st
         <div style={{ fontSize: "0.85em", opacity: 0.75, marginTop: "4px" }}>
           {t('在游戏库里选一个没安装的游戏，点「下载并安装」。')}
         </div>
-        <Focusable
-          className="ed-action"
-          style={{ padding: "8px 16px", fontSize: "0.85em", marginTop: "14px" }}
+        <ActionButton
+          style={{
+            padding: "8px 16px",
+            fontSize: "0.85em",
+            marginTop: "14px",
+            width: "fit-content",
+            // 父级是 text-align:center 的普通 div，alignSelf 不生效，得靠 auto margin 居中。
+            marginLeft: "auto",
+            marginRight: "auto",
+          }}
           onClick={onOpenSettings}
-          onActivate={onOpenSettings}
         >
           {t('下载设置（并发 / CDN / 清理缓存）')}
-        </Focusable>
+        </ActionButton>
+      </div>
       </div>
     );
   }
@@ -1302,14 +1471,12 @@ function DownloadsTab({ onOpenGame, onOpenSettings }: { onOpenGame: (appName: st
     <Scroller className="ed-fade" contentStyle={{ paddingRight: "6px", paddingBottom: "1.4em" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: "10px", maxWidth: "980px", paddingBottom: "1.4em" }}>
         <div style={{ display: "flex", justifyContent: "flex-end" }}>
-          <Focusable
-            className="ed-action"
+          <ActionButton
             style={{ padding: "6px 14px", fontSize: "0.82em", opacity: 0.85 }}
             onClick={onOpenSettings}
-            onActivate={onOpenSettings}
           >
             {t('下载设置')}
-          </Focusable>
+          </ActionButton>
         </div>
         {items.map(([appName, p]) => {
           const game = games.find((g) => g.app_name === appName);
@@ -1317,12 +1484,12 @@ function DownloadsTab({ onOpenGame, onOpenSettings }: { onOpenGame: (appName: st
           const paused = p.state === "paused";
           const tone =
             p.state === "error"
-              ? "#ff9b9b"
+              ? COLOR.dangerSoft
               : p.state === "cancelled"
                 ? "#c9c9c9"
                 : p.state === "paused"
-                  ? "#ffd27e"
-                  : "#9ecbff";
+                  ? COLOR.warning
+                  : COLOR.accentSoft;
           return (
             <div
               key={appName}
@@ -1342,69 +1509,43 @@ function DownloadsTab({ onOpenGame, onOpenSettings }: { onOpenGame: (appName: st
               <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
                 {running ? (
                   <>
-                    <Focusable
-                      className="ed-action"
+                    <ActionButton
                       style={{ padding: "8px 14px", fontSize: "0.85em" }}
-                      onClick={() => {
-                        void actions.pause(appName);
-                      }}
-                      onActivate={() => {
-                        void actions.pause(appName);
-                      }}
+                      onClick={() => void actions.pause(appName)}
                     >
                       {t('暂停')}
-                    </Focusable>
-                    <Focusable
-                      className="ed-action"
-                      data-danger="true"
+                    </ActionButton>
+                    <ActionButton
+                      danger
                       style={{ padding: "8px 14px", fontSize: "0.85em" }}
-                      onClick={() => {
-                        void actions.cancel(appName);
-                      }}
-                      onActivate={() => {
-                        void actions.cancel(appName);
-                      }}
+                      onClick={() => void actions.cancel(appName)}
                     >
                       {t('取消')}
-                    </Focusable>
+                    </ActionButton>
                   </>
                 ) : paused ? (
                   <>
-                    <Focusable
-                      className="ed-action"
+                    <ActionButton
                       style={{ padding: "8px 14px", fontSize: "0.85em" }}
-                      onClick={() => {
-                        void actions.resume(appName);
-                      }}
-                      onActivate={() => {
-                        void actions.resume(appName);
-                      }}
+                      onClick={() => void actions.resume(appName)}
                     >
                       {t('继续')}
-                    </Focusable>
-                    <Focusable
-                      className="ed-action"
-                      data-danger="true"
+                    </ActionButton>
+                    <ActionButton
+                      danger
                       style={{ padding: "8px 14px", fontSize: "0.85em" }}
-                      onClick={() => {
-                        void actions.cancel(appName);
-                      }}
-                      onActivate={() => {
-                        void actions.cancel(appName);
-                      }}
+                      onClick={() => void actions.cancel(appName)}
                     >
                       {t('取消')}
-                    </Focusable>
+                    </ActionButton>
                   </>
                 ) : (
-                  <Focusable
-                    className="ed-action"
+                  <ActionButton
                     style={{ padding: "8px 14px", fontSize: "0.85em" }}
                     onClick={() => onOpenGame(appName)}
-                    onActivate={() => onOpenGame(appName)}
                   >
                     {t('查看')}
-                  </Focusable>
+                  </ActionButton>
                 )}
               </div>
             </div>
@@ -1538,10 +1679,10 @@ function DataLocations() {
                 }}
               >
                 <span style={{ fontWeight: 600, fontSize: "0.9em" }}>{it.label}</span>
-                <span style={{ fontSize: "0.72em", opacity: 0.45, flexShrink: 0 }}>{t('按 A 复制')}</span>
+                <span style={{ fontSize: "0.8em", opacity: 0.45, flexShrink: 0 }}>{t('按 A 复制')}</span>
               </div>
               <div className="ed-loc-path">{it.path}</div>
-              <div style={{ fontSize: "0.74em", opacity: 0.5, marginTop: "3px" }}>{it.note}</div>
+              <div style={{ fontSize: "0.82em", opacity: 0.5, marginTop: "3px" }}>{it.note}</div>
             </Focusable>
           ))}
         </NavRow>
@@ -1550,7 +1691,7 @@ function DataLocations() {
   );
 }
 
-function SettingsTab() {
+function SettingsTab({ onGoLogin }: { onGoLogin: () => void }) {
   const { auth, games, progress } = usePluginState();
   // The plugin JS runs in Decky's 1×1 SharedJSContext, so the module-level
   // `document` belongs to that hidden window and never contains `.ed-surface`.
@@ -1595,6 +1736,13 @@ function SettingsTab() {
           }
           container = container.parentElement;
         }
+        // 只滚不落焦的话，光标还停在顶栏 chip 上，下一次按"下"又按 chip 的
+        // 几何位置选目标，页面被拉回顶部（审计 1.14）。
+        const landing = el.querySelector<HTMLElement>(".ed-action,[tabindex]");
+        if (landing) {
+          focusOwned(landing);
+          claimFocusRing(landing, root.ownerDocument.querySelector(".ed-surface") as HTMLElement || root);
+        }
       }, 120);
       return () => window.clearTimeout(timer);
     }
@@ -1619,6 +1767,15 @@ function SettingsTab() {
       const surface = (root.closest(".ed-surface") as HTMLElement | null) || root;
       const first = surface.querySelector<HTMLElement>(".ed-group .ed-action, .ed-action");
       if (!first) return;
+      // The later timers used to yank the cursor back even after the user had
+      // started navigating. Once focus is on something *inside* the page that
+      // is not our landing target, the user owns it.
+      const current = doc.activeElement as HTMLElement | null;
+      // 只有"用户自己已经把光标挪到页面里"才让位。从顶栏 chip 进来时
+      // activeElement 就是那个 chip（在 surface 内、也不是 first），旧判断会直接
+      // return：不滚顶、不落焦，于是上次停在"维护"这次还停在"维护"（审计 1.7）。
+      const onHeaderChip = !!current?.closest?.('[data-ed-level="header"]');
+      if (current && current !== first && surface.contains(current) && !onHeaderChip) return;
       const view = doc.defaultView;
       // Find the real vertical scroller by walking up from the account row.
       let container: HTMLElement | null = first.parentElement;
@@ -1635,7 +1792,8 @@ function SettingsTab() {
       claimFocusRing(first, surface);
     };
     const timers: number[] = [];
-    [40, 220, 420, 900].forEach((ms) => timers.push(window.setTimeout(settle, ms)));
+    // 40/220 only: the 420/900 ms repeats were what kept stealing focus.
+    [40, 220].forEach((ms) => timers.push(window.setTimeout(settle, ms)));
     return () => timers.forEach((t) => window.clearTimeout(t));
   }, []);
 
@@ -1683,18 +1841,17 @@ function SettingsTab() {
   const update = async (key: string, value: any) => {
     setSettings((s) => ({ ...s, [key]: value }));
     await setSetting(key, value);
-    // The Steam menu reads this flag on every render, so flipping it here is
-    // enough — the entry appears/disappears next time the menu opens.
-    if (key === "show_menu_entry") setSteamMenuEntryEnabled(value !== false);
     if (
       key === "title_locale" ||
       key === "third_party_titles" ||
       key === "ui_language" ||
-      key === "auto_fetch_size" ||
-      key === "use_proton"
+      key === "auto_fetch_size"
     ) {
+      // Re-render from the backend snapshot; no entitlement refetch.
       window.dispatchEvent(new CustomEvent("epicdeck:library-changed"));
     }
+    // use_proton needs no library reload at all: the backend rewrites the
+    // launcher wrappers when the setting is saved.
   };
 
   const applyCustomPath = async () => {
@@ -1768,38 +1925,66 @@ function SettingsTab() {
               </div>
             </div>
             <div style={{ display: "flex", gap: "10px", flexShrink: 0 }}>
-              <ActionButton
-                style={{ padding: "10px 18px", fontSize: "0.9em" }}
-                onClick={async () => {
-                  const r = await switchAccount();
-                  if (r.ok) done(t("已切换账号"), t("下次登录会要求输入新账号"));
-                  else done(t("切换失败"), r.error ?? "");
-                }}
-              >
-                {t('切换账号')}
-              </ActionButton>
-              <ActionButton
-                style={{ padding: "10px 18px", fontSize: "0.9em" }}
-                onClick={async () => {
-                  const r = await signOut();
-                  if (r.ok) done(t("已登出"), t("下次登录会沿用当前账号"));
-                  else done(t("登出失败"), r.error ?? "");
-                }}
-              >
-                {t('登出')}
-              </ActionButton>
+              {auth?.logged_in ? (
+                <>
+                  <ActionButton
+                    style={{ padding: "10px 18px", fontSize: "0.9em" }}
+                    onClick={async () => {
+                      const ok = await confirmAction(
+                        t("切换 Epic 账号？"),
+                        t("会退出当前账号、清空本账号缓存，并清除 Steam 内置浏览器的网站数据（用于重新选择 Epic 账号）。"),
+                        t("切换账号")
+                      );
+                      if (!ok) return;
+                      const r = await switchAccount();
+                      if (r.ok) done(t("已切换账号"), t("下次登录会要求输入新账号"));
+                      else done(t("切换失败"), r.error ?? "");
+                    }}
+                  >
+                    {t('切换账号')}
+                  </ActionButton>
+                  <ActionButton
+                    style={{ padding: "10px 18px", fontSize: "0.9em" }}
+                    onClick={async () => {
+                      // Signing out deletes the credentials on disk, so the user
+                      // has to go through Epic's browser flow again. That is
+                      // destructive enough to deserve the same prompt as
+                      // "switch account" — 2026-11-09 a stray click did it.
+                      const ok = await confirmAction(
+                        t("登出 Epic 账号？"),
+                        t("会删除本机保存的登录凭据，下次需要重新登录。游戏文件与存档不受影响。"),
+                        t("登出")
+                      );
+                      if (!ok) return;
+                      const r = await signOut();
+                      if (r.ok) done(t("已登出"), t("下次登录会沿用当前账号"));
+                      else done(t("登出失败"), r.error ?? "");
+                    }}
+                  >
+                    {t('登出')}
+                  </ActionButton>
+                </>
+              ) : (
+                <ActionButton
+                  primary
+                  style={{ padding: "10px 18px", fontSize: "0.9em" }}
+                  onClick={onGoLogin}
+                >
+                  {t('去登录')}
+                </ActionButton>
+              )}
             </div>
           </div>
 
           <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: "12px", marginTop: "12px" }}>
             <StatBlock label={t("游戏总数")} value={stats.total} sub={t("Epic 库中拥有")} />
-            <StatBlock label={t("已安装")} value={stats.installed} sub={tf("占用 {0}", fmtSize(stats.size))} accent="#7ee2a8" />
+            <StatBlock label={t("已安装")} value={stats.installed} sub={tf("占用 {0}", fmtSize(stats.size))} accent={COLOR.success} />
             <StatBlock label={t("加入 Steam")} value={stats.steam} sub={t("非 Steam 快捷方式")} />
             <StatBlock
               label={t("下载任务")}
               value={stats.downloading}
               sub={stats.downloading > 0 ? t("正在下载") : t("空闲")}
-              accent={stats.downloading > 0 ? "#9ecbff" : undefined}
+              accent={stats.downloading > 0 ? COLOR.accentSoft : undefined}
             />
           </div>
         </div>
@@ -1880,6 +2065,12 @@ function SettingsTab() {
               <ActionButton
                 style={{ padding: "10px 16px", fontSize: "0.9em" }}
                 onClick={async () => {
+                  const ok = await confirmAction(
+                    t("重启 Steam？"),
+                    t("正在运行的游戏会被中断，未保存的进度可能丢失。"),
+                    t("重启")
+                  );
+                  if (!ok) return;
                   const r = await refreshSteam();
                   done(r.ok ? t("正在重启 Steam") : t("刷新失败"), r.ok ? r.note ?? "" : r.error ?? "");
                 }}
@@ -1907,7 +2098,7 @@ function SettingsTab() {
                   selectedOption={settings.proton_path || ""}
                   onChange={(e) => update("proton_path", e.data)}
                 />
-                <div style={{ fontSize: "0.78em", opacity: 0.5, marginTop: "6px" }}>
+                <div style={{ fontSize: "0.84em", opacity: 0.5, marginTop: "6px" }}>
                   {t("自动 = 优先 GE-Proton，其次 Steam 自带的最新正式版")}
                   {env.proton ? tf(" · 当前 {0}", env.proton ?? "") : ""}
                 </div>
@@ -1925,7 +2116,7 @@ function SettingsTab() {
                     await update("lsfg_default", v);
                   }}
                 />
-                <div style={{ fontSize: "0.74em", opacity: 0.5, marginTop: "6px" }}>
+                <div style={{ fontSize: "0.82em", opacity: 0.5, marginTop: "6px" }}>
                   {t('插帧通过 ~/lsfg 包装实现，不是启动参数，所以游戏启动参数里看不到相关内容。')}
                 </div>
               </div>
@@ -1952,7 +2143,7 @@ function SettingsTab() {
                 selectedOption={Number(settings.max_workers || 0)}
                 onChange={(e) => update("max_workers", Number(e.data))}
               />
-              <div style={{ fontSize: "0.78em", opacity: 0.5, marginTop: "6px" }}>
+              <div style={{ fontSize: "0.84em", opacity: 0.5, marginTop: "6px" }}>
                 {t('只能按档降速，做不到精确到 KB/s；数值是实测参考，实际受 CDN 和网络影响')}
               </div>
             </div>
@@ -1964,9 +2155,11 @@ function SettingsTab() {
               <TextField
                 value={settings.preferred_cdn || ""}
                 onChange={(e: any) => update("preferred_cdn", e.target.value)}
-                label={t("例如 epicgames-download1-1251447533.file.myqcloud.com")}
               />
-              <div style={{ fontSize: "0.78em", opacity: 0.5, marginTop: "6px" }}>
+              <div style={{ fontSize: "0.78em", opacity: 0.45, marginTop: "6px" }}>
+                {t("例如 epicgames-download1-1251447533.file.myqcloud.com")}
+              </div>
+              <div style={{ fontSize: "0.84em", opacity: 0.5, marginTop: "6px" }}>
                 {t('只填主机名（不含 http://）。国内机器 Epic 通常已自动分配腾讯云节点，一般无需改')}
               </div>
             </div>
@@ -1984,6 +2177,12 @@ function SettingsTab() {
               <ActionButton
                 style={{ padding: "10px 16px", fontSize: "0.9em" }}
                 onClick={async () => {
+                  const ok = await confirmAction(
+                    t("清理下载缓存？"),
+                    t("只删除 Legendary 的临时文件与断点记录；正在下载时请先暂停。"),
+                    t("清理")
+                  );
+                  if (!ok) return;
                   const r = await clearDownloadCache();
                   done(
                     r.ok ? t("缓存已清理") : t("清理失败"),
@@ -1993,7 +2192,7 @@ function SettingsTab() {
               >
                 {t('清理下载缓存')}
               </ActionButton>
-              <span style={{ fontSize: "0.78em", opacity: 0.5 }}>
+              <span style={{ fontSize: "0.84em", opacity: 0.5 }}>
                 {t('删除残留的断点续传状态与临时文件（不影响已装游戏）')}
               </span>
             </div>
@@ -2051,24 +2250,33 @@ function SettingsTab() {
               </div>
             </div>
 
-            <div style={{ marginTop: "14px", display: "flex", gap: "10px", alignItems: "flex-end" }}>
-              <div style={{ flex: 1, maxWidth: "520px" }}>
-                <div style={{ fontSize: "0.8em", opacity: 0.55, marginBottom: "8px" }}>
-                  {t('自定义路径（目录不存在会自动创建）')}
-                </div>
-                <TextField
-                  value={customPath}
-                  onChange={(e: any) => setCustomPath(e.target.value)}
-                  label={t("例如 /run/media/deck/MySD/EpicGames")}
-                />
+            <div style={{ marginTop: "14px", maxWidth: "640px" }}>
+              <div style={{ fontSize: "0.8em", opacity: 0.55, marginBottom: "8px" }}>
+                {t('自定义路径（目录不存在会自动创建）')}
               </div>
-              <ActionButton
-                style={{ padding: "10px 18px", fontSize: "0.9em", height: "fit-content" }}
-                onClick={applyCustomPath}
-                disabled={savingPath}
-              >
-                {t('保存路径')}
-              </ActionButton>
+              {/* 按钮要和输入框居中对齐：以前整行 `alignItems: flex-end`，而 TextField 会在
+                  输入框下方再画一行提示文字，结果按钮底部对齐的是提示文字、看起来比输入框低了
+                  一截。现在把提示文字移出行外，行内只有「输入框 + 按钮」，直接居中。 */}
+              <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+                <div style={{ flex: 1, maxWidth: "440px" }}>
+                  <TextField
+                    value={customPath}
+                    onChange={(e: any) => setCustomPath(e.target.value)}
+                  />
+                  {/* 示例不放 TextField 的 label：Steam 会把 label 转大写，
+                      Linux 路径大小写敏感，示例会被显示成 /RUN/MEDIA/...（审计 V6）。 */}
+                  <div style={{ fontSize: "0.78em", opacity: 0.45, marginTop: "6px" }}>
+                    {t("例如 /run/media/deck/MySD/EpicGames")}
+                  </div>
+                </div>
+                <ActionButton
+                  style={{ padding: "10px 18px", fontSize: "0.9em" }}
+                  onClick={applyCustomPath}
+                  disabled={savingPath}
+                >
+                  {t('保存路径')}
+                </ActionButton>
+              </div>
             </div>
 
             <div style={{ marginTop: "14px" }}>
@@ -2103,7 +2311,7 @@ function SettingsTab() {
                       strDescription={
                         <div>
                           <div style={{ fontSize: "0.85em", opacity: 0.7, marginBottom: "8px" }}>
-                            日志已导出到:{r.path || t("（写入失败）")}
+                            {t("日志已导出到:")}{r.path || t("（写入失败）")}
                           </div>
                           <div
                             style={{
@@ -2298,19 +2506,94 @@ function SetupScreen({ onDone }: { onDone: () => void }) {
 
 // -- page shell ---------------------------------------------------------
 
+/** Everything the shell renders — deliberately *not* the per-app progress map. */
+function shellSlice(state: PluginState) {
+  let activeDownloads = 0;
+  for (const key in state.progress) {
+    if (isActive(state.progress[key])) activeDownloads += 1;
+  }
+  return {
+    auth: state.auth,
+    authUnknown: state.authUnknown,
+    games: state.games,
+    error: state.error,
+    refreshing: state.refreshing,
+    firstRunDone: state.firstRunDone,
+    env: state.env,
+    booted: state.booted,
+    activeDownloads,
+  };
+}
+
 export function FullScreenPage() {
   useLangVersion();
-  const state = usePluginState();
+  // Select everything except `progress`: installing a game writes that map 1–2
+  // times a second, and re-rendering the header, the tabs and the whole tab body
+  // on every tick is what made the Deck drop frames during downloads (audit 3.5).
+  const state = usePluginSelector(shellSlice, shallowEqual);
   // Measured from the element, not the window: plugin code runs in Decky's
   // hidden 1×1 SharedJSContext, so `window.innerWidth` lies.
   const surfaceRef = useRef<HTMLDivElement>(null);
   const viewport = useViewport(surfaceRef);
   const [tab, setTab] = useState<TabId>(() => readFsUI().tab);
   const [detail, setDetail] = useState<string | null>(null);
+  /** App whose cover should get the cursor back once the grid is mounted again. */
+  const pendingFocusRef = useRef<string | null>(null);
+
+  /** Close the detail page and put the cursor back on its cover. */
+  const closeDetail = () => {
+    const closing = detail;
+    // The grid is not in the DOM while a detail page is open: it mounts again
+    // after the state change commits. A fixed timeout therefore raced the
+    // render (2026-11-09: at +80 ms `[data-ed-app]` was still empty, focus
+    // stayed on <body> and the page stopped receiving d-pad input). Record the
+    // app and let the effect below focus it once the grid actually exists.
+    pendingFocusRef.current = closing || null;
+    setDetail(null);
+  };
+
+  // Put the cursor back on the cover that was opened, after the grid is back.
+  // Retries briefly because the grid can mount a frame or two later.
+  useEffect(() => {
+    if (detail) return;
+    const app = pendingFocusRef.current;
+    if (!app) return;
+    const root = surfaceRef.current;
+    if (!root) {
+      pendingFocusRef.current = null;
+      return;
+    }
+    let tries = 0;
+    let timer = 0;
+    const tick = () => {
+      const tiles = root.querySelectorAll<HTMLElement>("[data-ed-app]");
+      for (const tile of Array.from(tiles)) {
+        if (tile.getAttribute("data-ed-app") === app) {
+          pendingFocusRef.current = null;
+          focusOwned(tile);
+          // Steam's own B handling runs right after ours and parks focus on
+          // <body>. A single focus() loses that race, so re-check a few frames.
+          reverifyFocus(tile, root, 12);
+          return;
+        }
+      }
+      if (++tries < 12) {
+        timer = window.setTimeout(tick, 100);
+      } else {
+        pendingFocusRef.current = null;
+      }
+    };
+    tick();
+    return () => window.clearTimeout(timer);
+  }, [detail]);
   const [booting, setBooting] = useState(!state.booted);
   // The library owns its paging state; it registers its pager here so L1/R1 can
   // flip pages while focus is inside the grid.
-  const gridBumperRef = useRef<((delta: number) => void) | null>(null);
+  const gridBumperRef = useRef<((delta: number) => boolean) | null>(null);
+  // 从工具栏进入网格时记下那个控件；网格里按"上"优先回到它。
+  // 几何模型下"下→上"不互逆（从"全部"下去，上来可能落在"已安装"，第 5 列上方
+  // 更是翻页键），用户的心智是"原路返回"（审计 1.8，只做这个最小改动）。
+  const gridEntryRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -2321,6 +2604,114 @@ export function FullScreenPage() {
       alive = false;
     };
   }, []);
+
+  // Safety net for lost focus.
+  //
+  // Steam's controller model can move focus to <body> after it handles a button
+  // we also handled (B closing a panel is the reproducible one). Body focus
+  // emits no focusin, so settleFocus cannot pull it back — and because the
+  // direction handlers live on the page root, a focus-less page simply stops
+  // responding. Put the last anchor back whenever focus drops to nothing,
+  // unless a Steam modal owns the input or we are being unmounted.
+  useEffect(() => {
+    const surface = surfaceRef.current;
+    const doc = surface?.ownerDocument;
+    if (!doc) return;
+    let last = 0;
+    let attempts = 0;
+    const restore = () => {
+      const root = surfaceRef.current;
+      if (!root || !root.isConnected) return;
+      // Only when focus is genuinely gone. A handled interaction that left focus
+      // on a real control must not be overridden.
+      if (doc.activeElement && doc.activeElement !== doc.body) return;
+      // Decky's confirm dialog renders outside the page and takes focus; do not
+      // fight it, or the dialog becomes unusable.
+      if (doc.querySelector('[class*="ModalOverlayContent"].active')) return;
+      const now = Date.now();
+      if (now - last > 600) attempts = 0;
+      else attempts += 1;
+      if (attempts > 4) return; // something keeps stealing: stop fighting it
+      last = now;
+      const anchor = peekAnchor();
+      // The anchor can be a button from a panel that just unmounted (a detail
+      // page); focusing a detached node does nothing, so fall back to whatever
+      // the current page offers first.
+      const target =
+        anchor && root.contains(anchor) && anchor.isConnected
+          ? anchor
+          : (root.querySelector<HTMLElement>("[data-ed-app]") ||
+             root.querySelector<HTMLElement>(".ed-chip") ||
+             root.querySelector<HTMLElement>("[tabindex]"));
+      if (!target) return;
+      window.setTimeout(() => {
+        if (doc.activeElement === doc.body && root.isConnected) {
+          try {
+            target.focus();
+          } catch {
+            /* element went away between the check and the focus */
+          }
+        }
+      }, 30);
+    };
+    const onFocusOut = (evt: FocusEvent) => {
+      const to = evt.relatedTarget as Node | null;
+      if (to && to !== doc.body) return; // a real move somewhere else
+      restore();
+    };
+    // `focusout` is not enough: when the focused element is removed (page flip,
+    // uninstall, tab switch) Chromium sometimes drops focus to <body> without
+    // firing it, and the page then ignores every direction key while looking
+    // perfectly alive. A pointer/mouse interaction is the moment to re-check.
+    const onPointerUp = () => window.setTimeout(restore, 30);
+    doc.addEventListener("focusout", onFocusOut, true);
+    doc.addEventListener("pointerup", onPointerUp, true);
+    return () => {
+      doc.removeEventListener("focusout", onFocusOut, true);
+      doc.removeEventListener("pointerup", onPointerUp, true);
+    };
+  }, []);
+
+  /** 翻页并在新页落焦。返回 false 表示"没换页"（已经到头了）。
+   *
+   * 三处调用共用：L1/R1、网格里按到左右边界。以前 L1/R1 只翻页不落焦，
+   * 新页的瓦片是整个重建的，被聚焦的那张随旧页卸载 → 焦点掉到 body，界面失联；
+   * 而边界那条又会在"根本没换页"时把光标丢到本页另一端（审计 1.3 / 1.4）。
+   */
+  const flipPageAndFocus = (delta: number, edge?: "first" | "last"): boolean => {
+    const root = surfaceRef.current;
+    const doc = root?.ownerDocument;
+    const from = doc?.activeElement as HTMLElement | null;
+    const grid = from?.closest?.('[data-ed-level="grid"]') as HTMLElement | null;
+    let col = 0;
+    if (grid && from) {
+      const tiles = Array.from(grid.querySelectorAll<HTMLElement>(".ed-tile"));
+      const index = tiles.indexOf(from);
+      if (index >= 0) col = index % Math.max(1, viewport.cols);
+    }
+    // 光标在工具栏（chip / 排序 / 翻页键）时翻页，焦点应当留在原控件上。
+    // 以前 col 会退回 0 并把光标拽进第 1 张封面（复审 4.3）。
+    const inGrid = !!grid && !!from && grid.contains(from);
+    const flipped = gridBumperRef.current ? gridBumperRef.current(delta) : false;
+    if (!flipped) return false;
+    if (!inGrid) return true;
+    // 两帧之后再落焦：第一帧 React 提交，第二帧布局稳定，几何位置才准。
+    window.setTimeout(() => window.setTimeout(() => {
+      const r = surfaceRef.current;
+      if (!r || !r.isConnected) return;
+      const tiles = Array.from(r.querySelectorAll<HTMLElement>(".ed-tile"));
+      if (tiles.length === 0) return;
+      const target = edge === "last"
+        ? tiles[tiles.length - 1]
+        : edge === "first"
+        ? tiles[0]
+        : tiles[Math.min(col, tiles.length - 1)];
+      focusOwned(target);
+      claimFocusRing(target, r);
+      target.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }, 0), 0);
+    return true;
+  };
 
   // Give the page a known starting point: the 返回 chip. Without this Steam may
   // keep its own idea of "focused" from the previous screen, and the first stick
@@ -2356,22 +2747,9 @@ export function FullScreenPage() {
     return () => window.clearTimeout(timer);
   }, [detail]);
 
-  // Landing on a tab is the same intent as picking it: switch the page.
-  useEffect(() => {
-    for (const item of TABS) {
-      setFocusAction(`tab:${item.id}`, () => {
-        setTab((prev) => {
-          if (prev === item.id) return prev;
-          setDetail(null);
-          writeFsUI({ tab: item.id });
-          return item.id;
-        });
-      });
-    }
-    return () => {
-      for (const item of TABS) setFocusAction(`tab:${item.id}`, null);
-    };
-  }, []);
+  // Tabs are activated with A (`showTab`), never by focus. Registry entries
+  // for `tab:*` are intentionally gone: they made merely passing over a tab
+  // mount its page, and Settings issues several backend calls on mount.
 
   // The navigator lives in the plugin window but must act on Big Picture's DOM.
   // Exposing it on the *page* window makes that explicit and gives us a way to
@@ -2388,7 +2766,23 @@ export function FullScreenPage() {
     };
     const onFocusIn = (ev: Event) => {
       const t = ev.target as HTMLElement | null;
-      if (!t || !root.contains(t)) return;
+      if (!t) return;
+      // 排查用：谁把焦点放到哪、有没有被拉回、有没有跑到页面外面去。
+      // 实机报「上没反应」时，只有这份记录能区分"我们的处理器没被调用"
+      // 和"调用了但焦点又被抢走"——前者在日志里会是一条 outside:true。
+      try {
+        const view = doc.defaultView as any;
+        if (view) {
+          const log = view.__epicdeckFocusLog || (view.__epicdeckFocusLog = []);
+          const label = (n: any) =>
+            (n?.innerText || n?.className || n?.tagName || "").trim().replace(/\s+/g, " ").slice(0, 14);
+          log.push({ t: Date.now(), to: label(t), outside: !root.contains(t) });
+          if (log.length > 40) log.shift();
+        }
+      } catch {
+        /* diagnostics only */
+      }
+      if (!root.contains(t)) return;
       // `settleFocus` decides who really owns focus: normally `t`, but when
       // Steam moved focus on its own right after one of our moves it returns
       // our anchor and puts focus back — that is what stops the cursor from
@@ -2407,21 +2801,62 @@ export function FullScreenPage() {
   // The navigator lives in the plugin window but must act on Big Picture's DOM.
   // Exposing it on the *page* window makes that explicit and gives us a way to
   // drive focus from devtools / CDP when debugging.
-  useEffect(() => {
-    const view = surfaceRef.current?.ownerDocument?.defaultView as any;
-    if (!view) return;
-    view.__epicdeckMoveFocus = moveFocus;
-    // Same path the stick takes: move, then run the landing element's action.
-    view.__epicdeckNav = (button: number) => {
+  // 调试/验收钩子：注册一次，函数体从 ref 取最新闭包。
+  // 以前这个 effect 没有依赖数组，每次渲染都先 delete 再重挂，CDP 恰好在这条缝里
+  // 调用会拿到 undefined（复审 4.6）。
+  // 显式标注类型：不写的话 TS 会把 `() => false` 推断成字面量 `false`，
+  // 后面赋一个返回 boolean 的实现就会报 TS2322（第三轮审计 3.1，CI 因此必红）。
+  type DebugHooks = {
+    nav: (button: number) => boolean;
+    navRC: (button: number) => boolean;
+    bump: (delta: number) => boolean;
+    tab: (delta: number) => void;
+  };
+  const hooksRef = useRef<DebugHooks>({
+    nav: () => false,
+    navRC: () => false,
+    bump: () => false,
+    tab: () => {},
+  });
+  hooksRef.current = {
+    nav: (b: number) => {
       const root = surfaceRef.current;
-      if (!root) return false;
-      if (!moveFocus(button, root)) return false;
-      runFocusAction(root.ownerDocument.activeElement as HTMLElement | null);
-      return true;
-    };
+      return root ? moveFocus(b, root) : false;
+    },
+    navRC: (b: number) => {
+      const root = surfaceRef.current;
+      return root ? moveFocusRowCol(b, root) : false;
+    },
+    bump: (d: number) => flipPageAndFocus(d),
+    tab: (d: number) => tabOffset(d),
+  };
+  useEffect(() => {
+    const root = surfaceRef.current;
+    const view = root?.ownerDocument?.defaultView as any;
+    if (!view || !root) return;
+    view.__epicdeckMoveFocus = moveFocus;
+    view.__epicdeckNav = (button: number) => hooksRef.current.nav(button);
+    // 设置/详情/顶栏这类**流式**布局走的是 moveFocusRowCol（行/列模型）。
+    view.__epicdeckNavRC = (button: number) => hooksRef.current.navRC(button);
+    // L1/R1 不能从 CDP 注入（键盘没有对应手柄键），所以把真实路径也挂出来。
+    view.__epicdeckBump = (delta: number) => hooksRef.current.bump(delta);
+    view.__epicdeckTab = (delta: number) => hooksRef.current.tab(delta);
+    view.__epicdeckDiag = () => ({
+      dirs: view.__epicdeckDirLog || [],
+      nav: view.__epicdeckNavLog || [],
+      focus: view.__epicdeckFocusLog || [],
+    });
+    // 记录真实的触摸/鼠标按下：settleFocus 用它区分"用户点的"和"Steam 插队"（4.8）。
+    const onPointer = () => notePointerDown();
+    root.ownerDocument.addEventListener("pointerdown", onPointer, true);
     return () => {
+      root.ownerDocument.removeEventListener("pointerdown", onPointer, true);
       delete view.__epicdeckMoveFocus;
       delete view.__epicdeckNav;
+      delete view.__epicdeckNavRC;
+      delete view.__epicdeckBump;
+      delete view.__epicdeckTab;
+      delete view.__epicdeckDiag;
     };
   }, []);
 
@@ -2449,9 +2884,9 @@ export function FullScreenPage() {
     // the content had already switched.
     const root = surfaceRef.current;
     if (!root) return;
-    const chip = root.querySelector(
-      `[data-ed-focus-action="tab:${nextId}"]`
-    ) as HTMLElement | null;
+    // `data-ed-focus-action` 已经没有任何写入方（"聚焦即切页"在 0.9.3 删掉了），
+    // 以前这里永远查不到 chip 就直接 return，切完标签光标留在原地（审计 1.5）。
+    const chip = root.querySelector(`[data-ed-tab="${nextId}"]`) as HTMLElement | null;
     if (!chip) return;
     // `focusOwned` anchors + stamps the move as ours, so the focusin it fires is
     // not mistaken for a stray Steam navigation.
@@ -2462,18 +2897,54 @@ export function FullScreenPage() {
   // cannot express "rows of rows" in a custom layout, so the stick used to walk
   // DOM order (down = right). See geomnav.ts.
   //
-  // Handled in `onGamepadDirection` only — that is the direction-specific event
-  // Steam offers and the one whose default navigation can be suppressed. Doing
-  // it in `onButtonDown` as well would move focus twice per press.
+  // 两条入口，同一个实现：
+  //   1) `onGamepadDirection`（React prop）——Steam 正常派发时会走到这里；
+  //   2) window 捕获阶段的 `vgp_ondirection` DOM 事件——**真机的主力路径**。
+  //
+  // 为什么必须补第 2 条（2026-11-10 实机定案）：页面里的 Steam 原生控件
+  // （ToggleField / Dropdown / ButtonItem）会自己消化这个事件，`onGamepadDirection`
+  // 就永远不被调用。用 DOM 事件日志抓到的现场是——焦点在「自动下载封面图」开关上，
+  // 按「上」派发了 `vgp_ondirection {button:9}`（target 就在开关内部），我们一条
+  // 记录都没有；同一位置按「左」却收到了 `{button:11}`。于是"设置页里按上没反应"
+  // 的真相是：事件根本没到我们手上，只有那些不拦方向的控件才碰巧能用。
+  // 捕获阶段先于控件执行，所以能拿到同一次按键并掐掉，Steam 的 DOM 顺序导航
+  // 也就插不进来了。
   const dirGuardRef = useRef({ button: 0, at: 0 });
   const okGuardRef = useRef({ at: 0 });
+  // 每次渲染把最新的处理器写进 ref：effect 只挂一次，但它要调用最新的闭包。
+  const dirHandlerRef = useRef<(evt: any) => void>(() => {});
   const onRootDirection = (evt: any) => {
     const button = Number(evt?.detail?.button || 0);
     const now = Date.now();
     const doc0 = surfaceRef.current?.ownerDocument;
     const focused0 = doc0?.activeElement as HTMLElement | null;
-    // 输入框里方向键要用来移动光标,不能吞
-    if (focused0 && /^(INPUT|TEXTAREA|SELECT)$/.test(focused0.tagName)) return;
+    // 到了就等于"处理器被调用"。实机报"某个方向没反应"时，这条记录决定
+    // 排查方向：没有它 → 事件根本没送到我们的 Focusable（Steam 自己吃了或
+    // 焦点不在本页面）；有它但没有对应的 moved 记录 → 是我们的行模型算空。
+    try {
+      const view = doc0?.defaultView as any;
+      if (view) {
+        const log = view.__epicdeckDirLog || (view.__epicdeckDirLog = []);
+        log.push({
+          t: now,
+          b: button,
+          focus: (focused0?.innerText || focused0?.className || focused0?.tagName || "")
+            .trim()
+            .replace(/\s+/g, " ")
+            .slice(0, 14),
+          inside: !!surfaceRef.current?.contains(focused0),
+        });
+        if (log.length > 20) log.shift();
+      }
+    } catch {
+      /* diagnostics only */
+    }
+    // 左右键留给输入框移动光标；**上下必须由我们接管**——放行给 Steam 会按它
+    // 自己的 DOM 顺序跳（搜索框里按"下"曾落到最右边的翻页键，审计 1.10）。
+    // moveFocus 从输入框本身出发，几何位置照样能算出正下方的控件。
+    if (focused0 && /^(INPUT|TEXTAREA|SELECT)$/.test(focused0.tagName)) {
+      if (button === DIR_LEFT || button === DIR_RIGHT) return;
+    }
 
     // One press can arrive twice (stick + d-pad synthesis); ignore the echo.
     if (dirGuardRef.current.button === button && now - dirGuardRef.current.at < 60) {
@@ -2498,29 +2969,32 @@ export function FullScreenPage() {
       // on the edges.
       moved = moveFocus(button, surfaceRef.current, grid);
       if (!moved) {
-        const bumper = gridBumperRef.current;
-        if (bumper) {
-          bumper(button === DIR_LEFT ? -1 : 1);
-          moved = true;
-          // The tiles unmount on a page flip, so focus would be lost; put it on
-          // the matching edge of the new page once React has re-rendered.
-          const root = surfaceRef.current;
-          const edge = button === DIR_LEFT ? "last" : "first";
-          window.setTimeout(() => window.setTimeout(() => {
-            if (!root || !root.isConnected) return;
-            const tiles = root.querySelectorAll<HTMLElement>(".ed-tile");
-            if (tiles.length === 0) return;
-            const target = edge === "last" ? tiles[tiles.length - 1] : tiles[0];
-            focusOwned(target);
-            claimFocusRing(target, root);
-            target.scrollIntoView({ block: "nearest", inline: "nearest" });
-          }, 0), 0);
-        }
+        // 到头了：只有**真的换页**才落焦。以前不管换没换页都把 moved 置 true
+        // 并把光标丢到本页另一端，第一页按左像"原地传送到最右"（审计 1.4）。
+        moved = flipPageAndFocus(
+          button === DIR_LEFT ? -1 : 1,
+          button === DIR_LEFT ? "last" : "first"
+        );
       }
     } else if (grid) {
-      // Grid vertical movement stays geometric but is allowed to cross levels
-      // (up → toolbar), the way it always did.
-      moved = moveFocus(button, surfaceRef.current);
+      // 网格纵向：向上时先试着回"来源控件"，其余情况仍走几何模型（可跨层到工具栏）。
+      const entry = gridEntryRef.current;
+      if (
+        button === DIR_UP &&
+        entry &&
+        entry.isConnected &&
+        !!surfaceRef.current &&
+        canFocus(entry, surfaceRef.current) &&
+        !grid.contains(entry)
+      ) {
+        const root = surfaceRef.current!;
+        focusOwned(entry);
+        claimFocusRing(entry, root);
+        entry.scrollIntoView({ block: "nearest", inline: "nearest" });
+        moved = true;
+      } else {
+        moved = moveFocus(button, surfaceRef.current);
+      }
     } else {
       // Flowing layouts (settings / detail / downloads / header / tabs) use the
       // row/column model: 上/下 switches rows, 左/右 moves between the buttons
@@ -2546,6 +3020,10 @@ export function FullScreenPage() {
           before: before,
           after: label(el),
           at: now,
+          // 没移动时才拍快照（快照要跑一次行聚类，不能每次都算）。它回答的是
+          // "为什么没动"：顶栏有没有进候选（pinned）、当前是不是已经在第 0 行
+          // （atRow）、DOM 焦点和锚点是不是同一条（anchored / domFocus）。
+          diag: moved ? undefined : describeRows(surfaceRef.current),
         });
         // 决定性的第二笔:移动瞬间 vs 下一帧。若两者不同,就是 Steam 在我们
         // 之后又挪了焦点(它的插队),而不是几何算法选错。
@@ -2562,9 +3040,31 @@ export function FullScreenPage() {
     } catch (e) {
       /* diagnostics must never break navigation */
     }
+    // 记住"从工具栏进入网格"的那一下，供 1.8 的"原路返回"用。
+    try {
+      const doc = surfaceRef.current?.ownerDocument;
+      const now2 = doc?.activeElement as HTMLElement | null;
+      const fromLevel = focused0?.closest?.("[data-ed-level]")?.getAttribute("data-ed-level") || "";
+      const toLevel = now2?.closest?.("[data-ed-level]")?.getAttribute("data-ed-level") || "";
+      if (moved && fromLevel === "toolbar" && toLevel === "grid" && focused0) {
+        gridEntryRef.current = focused0;
+      }
+    } catch {
+      /* 只影响手感，绝不能影响导航 */
+    }
     dirGuardRef.current = { button, at: now };
-    if (moved) {
-      runFocusAction(surfaceRef.current?.ownerDocument?.activeElement as HTMLElement | null);
+    // 左右键在"这一行没有第二个控件"时无处可去（开关、滑条、下拉框都是整行一个）。
+    // 这类 Steam 原生控件用左右改值：开关翻转、滑条加减。放行给它们比吞掉有用，
+    // 否则站在开关上按左右永远没反应——而这恰好是 Steam 用户的本能操作。
+    if (!moved && (button === DIR_LEFT || button === DIR_RIGHT)) {
+      const el = surfaceRef.current?.ownerDocument?.activeElement as HTMLElement | null;
+      if (
+        el &&
+        (el.matches?.('input[type="range"], select, [role="checkbox"], [role="switch"], [role="slider"]') ||
+          el.closest?.('input[type="range"], select, [role="checkbox"], [role="switch"], [role="slider"]'))
+      ) {
+        return;
+      }
     }
     // **Always** swallow a directional press on our surface, even when we hit a
     // boundary and did not move. We are the only navigator here; letting Steam
@@ -2574,6 +3074,40 @@ export function FullScreenPage() {
     evt?.preventDefault?.();
     evt?.stopPropagation?.();
   };
+  dirHandlerRef.current = onRootDirection;
+
+  // 真机方向键的主力入口：window 捕获阶段的 `vgp_ondirection`。
+  //
+  // 只接管"焦点在我们页面里"的按键——QAM、Steam 自己的界面、以及我们弹的
+  // ConfirmModal（Steam 的 Dialog 渲染在页面之外）都不受影响，否则整个大屏的
+  // 方向键都会被我们吃掉。
+  useEffect(() => {
+    const view = surfaceRef.current?.ownerDocument?.defaultView as any;
+    if (!view) return;
+    const onDomDirection = (ev: any) => {
+      const surface = surfaceRef.current;
+      const active = surface?.ownerDocument?.activeElement as HTMLElement | null;
+      if (!surface || !active || !surface.contains(active)) return;
+      const button = Number(ev?.detail?.button || 0);
+      if (
+        button !== DIR_LEFT &&
+        button !== DIR_RIGHT &&
+        button !== DIR_UP &&
+        button !== DIR_DOWN
+      ) {
+        return;
+      }
+      dirHandlerRef.current(ev);
+    };
+    view.addEventListener("vgp_ondirection", onDomDirection, true);
+    return () => {
+      try {
+        view.removeEventListener("vgp_ondirection", onDomDirection, true);
+      } catch {
+        /* window gone: nothing to detach */
+      }
+    };
+  }, []);
 
   const onRootButton = (evt: any) => {
     const button = evt?.detail?.button;
@@ -2594,8 +3128,14 @@ export function FullScreenPage() {
       if (!surfaceRef.current?.contains(el)) return;
       if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;
       if (el.closest(".DialogInput_Wrapper")) return;
+      // 只接管我们自己画的控件。Steam 的 Dropdown / ToggleField / ButtonItem 的
+      // 激活入口是它自己的 onActivate 路径，替它 click() 属于"靠巧合"（审计 1.11）。
+      // `data-ed-own` 目前**没有任何元素使用**，是给以后自绘的非 .ed-* 控件预留的
+      // 白名单钩子（审计 3.7 指出过）。保留但不参与当前逻辑。
+      if (!el.matches(".ed-chip,.ed-tile,.ed-action,.ed-pager,.ed-loc,[data-ed-own]")) return;
       const now = Date.now();
-      if (okGuardRef.current.at && now - okGuardRef.current.at < 250) {
+      // 250ms 会把"连按两下 A"的第二下吞掉；掌机上连按很常见（审计 1.11）。
+      if (okGuardRef.current.at && now - okGuardRef.current.at < 120) {
         evt?.preventDefault?.();
         evt?.stopPropagation?.();
         return;
@@ -2625,7 +3165,9 @@ export function FullScreenPage() {
     const level = focusLevel(evt);
     const bumper = tab === "library" ? gridBumperRef.current : null;
     if (bumper && (level === "grid" || level === "toolbar")) {
-      bumper(delta);
+      // 翻页后必须自己落焦：新页的瓦片以页码为 key 重新挂载，被聚焦的那张已经
+      // 卸载，焦点会掉到 body（界面失联）或回退到顶栏（审计 1.3）。
+      flipPageAndFocus(delta);
       evt?.preventDefault?.();
       evt?.stopPropagation?.();
       return;
@@ -2669,11 +3211,20 @@ export function FullScreenPage() {
     evt?.preventDefault?.();
     evt?.stopPropagation?.();
     if (detail) {
-      setDetail(null);
+      closeDetail();
     } else {
       goBack();
     }
     return true;
+  };
+
+  /** 顶栏"返回"和 B 用同一套语义：有详情就先关详情，而不是直接退出插件。 */
+  const backOrClose = () => {
+    if (detail) {
+      closeDetail();
+      return;
+    }
+    goBack();
   };
 
   // 顶栏就是唯一的导航层：返回 / 游戏库 / 下载 / 设置 / 刷新 排在同一行，
@@ -2692,8 +3243,8 @@ export function FullScreenPage() {
       <Focusable
         noFocusRing
         className="ed-chip"
-        onClick={goBack}
-        onActivate={goBack}
+        onClick={backOrClose}
+        onActivate={backOrClose}
         style={{
           padding: "0.45em 0.85em",
           fontSize: "0.9em",
@@ -2705,20 +3256,22 @@ export function FullScreenPage() {
       >
         <FaArrowLeft /> {t('返回')}
       </Focusable>
+      {/* Tabs switch on A, not on focus: focus-to-switch mounted/unmounted
+          pages (Settings alone fired six backend calls) while the cursor was
+          only passing over them. */}
       {TABS.map((item) => {
         const active = item.id === tab;
         const badge =
-          item.id === "downloads" ? Object.values(state.progress).filter((p) => isActive(p)).length : 0;
+          item.id === "downloads" ? state.activeDownloads : 0;
         return (
           <Focusable
             key={item.id}
+            data-ed-tab={item.id}
             noFocusRing
             className="ed-chip"
             data-active={active ? "true" : "false"}
             onClick={() => showTab(item.id)}
             onActivate={() => showTab(item.id)}
-            // 聚焦即切页：光标落到哪个标签，下面就显示哪个页面。
-            data-ed-focus-action={`tab:${item.id}`}
             style={{
               padding: "0.45em 0.95em",
               fontSize: "0.9em",
@@ -2734,10 +3287,10 @@ export function FullScreenPage() {
             {badge > 0 ? (
               <span
                 style={{
-                  background: "#4aa3ff",
+                  background: COLOR.accent,
                   color: "#04121f",
                   borderRadius: "999px",
-                  fontSize: "0.72em",
+                  fontSize: "0.8em",
                   padding: "0.08em 0.4em",
                   fontWeight: 800,
                 }}
@@ -2752,7 +3305,7 @@ export function FullScreenPage() {
       {viewport.compact ? null : (
         <div
           style={{
-            fontSize: "0.78em",
+            fontSize: "0.84em",
             opacity: 0.45,
             overflow: "hidden",
             textOverflow: "ellipsis",
@@ -2769,11 +3322,12 @@ export function FullScreenPage() {
       <Focusable
         noFocusRing
         className="ed-chip"
+        // 连点会发多个全量请求（每个 ~20s）；refreshing 期间直接忽略（审计 2.6）。
         onClick={() => {
-          void refreshLibrary(true);
+          if (!state.refreshing) void refreshLibrary(true);
         }}
         onActivate={() => {
-          void refreshLibrary(true);
+          if (!state.refreshing) void refreshLibrary(true);
         }}
         style={{
           padding: "0.45em 0.85em",
@@ -2800,8 +3354,9 @@ export function FullScreenPage() {
       onGamepadDirection={onRootDirection}
       actionDescriptionMap={{
         [GamepadButton.CANCEL]: t("返回"),
-        [GamepadButton.BUMPER_LEFT]: t("上一页 / 上一个标签"),
-        [GamepadButton.BUMPER_RIGHT]: t("下一页 / 下一个标签"),
+        // 详情页没有分页，L1/R1 只切标签；提示条要是还写「上一页」会误导（审计 V11）。
+        [GamepadButton.BUMPER_LEFT]: detail ? t("上一个标签") : t("上一页 / 上一个标签"),
+        [GamepadButton.BUMPER_RIGHT]: detail ? t("下一个标签") : t("下一页 / 下一个标签"),
       }}
       style={{
         display: "flex",
@@ -2842,7 +3397,7 @@ export function FullScreenPage() {
             <div className="ed-group" style={{ padding: "26px 28px", maxWidth: "640px" }}>
               <div style={{ fontSize: "1.3em", fontWeight: 700, marginBottom: "8px" }}>{t('缺少 Legendary')}</div>
               <div style={{ fontSize: "0.9em", opacity: 0.7, lineHeight: 1.6 }}>
-                {t('SteamOS 没有 pip，插件会直接从 GitHub Releases 下载官方独立二进制（约 3 MB）。')}
+                {t('SteamOS 没有 pip，插件会直接从 GitHub Releases 下载官方独立二进制（约 14 MB）。')}
               </div>
               <ActionButton
                 primary
@@ -2864,13 +3419,40 @@ export function FullScreenPage() {
           </div>
         ) : state.firstRunDone === false ? (
           <SetupScreen onDone={() => markFirstRunDone("")} />
-        ) : !state.auth?.logged_in ? (
+        ) : state.authUnknown && !state.auth?.logged_in ? (
+          // 后端没回答（超时）≠ 未登录。显示可重试的提示，别让用户以为掉登录了
+          // 又去输一次密码（复审 2.1 收尾）。
+          <Scroller>
+            <div style={{ padding: "28px 24px", maxWidth: "640px" }}>
+              <div style={{ fontSize: "1.12em", fontWeight: 700 }}>
+                {t("无法确认登录状态")}
+              </div>
+              <div style={{ marginTop: "8px", opacity: 0.7, lineHeight: 1.6 }}>
+                {t("账号状态读取超时，请稍后点「刷新」重试")}
+              </div>
+              <ActionButton
+                style={{ marginTop: "16px", padding: "10px 16px" }}
+                onClick={() => void refreshLibrary(true)}
+              >
+                {t("重试")}
+              </ActionButton>
+            </div>
+          </Scroller>
+        ) : !state.auth?.logged_in && tab !== "settings" ? (
+          // Settings stays reachable while signed out: signing in is exactly
+          // when the network, proxy, language or Legendary install is broken,
+          // and those live here. Everything else needs an account.
           <Scroller>
             <LoginPanel variant="screen" onLoggedIn={() => void onSignedIn()} />
           </Scroller>
         ) : tab === "library" ? (
+          !state.auth?.logged_in ? (
+            <Scroller>
+              <LoginPanel variant="screen" onLoggedIn={() => void onSignedIn()} />
+            </Scroller>
+          ) :
           detail ? (
-            <DetailView appName={detail} onBack={() => setDetail(null)} />
+            <DetailView appName={detail} onBack={closeDetail} />
           ) : (
             <LibraryTab
               viewport={viewport}
@@ -2909,7 +3491,7 @@ export function FullScreenPage() {
             onOpenSettings={() => showTab("settings", "download")}
           />
         ) : (
-          <SettingsTab />
+          <SettingsTab onGoLogin={() => showTab("library")} />
         )}
       </div>
     </Focusable>

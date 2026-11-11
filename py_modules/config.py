@@ -8,15 +8,24 @@ defaults, atomic writes, and safe reads (corrupt file -> fall back to
 defaults).
 """
 
+import copy
 import json
 import os
 import shutil
 import tempfile
+import threading
 
 
 DEFAULTS = {
     # Absolute path games are installed under. Empty means "not chosen yet";
     # the backend then falls back to py_modules.paths.default_games_dir().
+    # app_name -> the base directory its install started in. Pause/resume and
+    # "cancel + delete" must use this rather than the global default.
+    "install_targets": {},
+    # app_name -> folder legendary chose for the download ("Install path:").
+    "install_paths": {},
+    # app_name -> last paused/error row, so the Downloads tab survives a reload.
+    "install_snapshots": {},
     "install_dir": "",
     # Set once the first-run prompt (choose a download folder) is answered, so
     # it is shown exactly once per install.
@@ -86,6 +95,9 @@ DEFAULTS = {
     "update_check": {},
     # "auto" follows Steam's UI language; "zh"/"en" force one (HANDOFF 7.13.0a).
     "ui_language": "auto",
+    # Lookup-strategy version: bumped when the ProtonDB search changes so old
+    # negative results are discarded instead of hiding a working badge.
+    "protondb_scheme": 0,
     # Show a ProtonDB tier for installed games (HANDOFF 7.13.2).
     "auto_protondb": True,
     # app_name -> {"appid","tier","total","ts",...}; 7-day TTL.
@@ -96,10 +108,14 @@ DEFAULTS = {
 }
 
 
+#: Serialises `save()` so two writers cannot interleave on the temp file.
+_SAVE_LOCK = threading.RLock()
+
+
 class Config:
     def __init__(self, path: str):
         self.path = path
-        self._data = dict(DEFAULTS)
+        self._data = copy.deepcopy(DEFAULTS)
         self._corrupt = False
 
     def load(self):
@@ -144,10 +160,16 @@ class Config:
 
     def save(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        # Snapshot + lock: writes currently happen on the event loop, but five
+        # call sites already hop into an executor, and a concurrent `set()`
+        # during `json.dump` raises "dictionary changed size during iteration"
+        # (review #8). Two cheap guards now, no debugging later.
+        with _SAVE_LOCK:
+            snapshot = dict(self._data)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, indent=2)
+                json.dump(snapshot, f, indent=2)
             shutil.move(tmp, self.path)
         except OSError:
             try:

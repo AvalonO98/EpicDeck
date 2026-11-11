@@ -3,9 +3,8 @@
 
 // Route ids and layout constants that more than one module needs.
 //
-// These live here rather than in `fullscreen.tsx` so that `steammenu.tsx` can
-// add a Steam-menu item pointing at the page without importing the page itself
-// (and creating a cycle when the page needs the menu's preferences).
+// These live here rather than in `fullscreen.tsx` so other modules can point at
+// the page without importing it (and creating an import cycle).
 
 /** Full-screen page route, registered with `routerHook.addRoute`. */
 export const LIBRARY_ROUTE = "/epicdeck/library";
