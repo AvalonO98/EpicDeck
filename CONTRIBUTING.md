@@ -73,6 +73,9 @@ python scripts/regression.py --tmpdir <dir>   # .pyc 与三个套件的临时目
 | `build_icon.py` | 从 `assets/icon.png` 生成 Decky 需要的尺寸 |
 | `i18n_wrap.py` | 把新写的中文字面量包成 `t("…")` 的辅助脚本 |
 | `cdp_*.py` | 实机调试(见下表),只在 Deck 上跑 |
+| `cdp_wake.py` | 在 Deck 上发一次 XTest 按键把屏保唤醒(屏保期间注入的按键全部失效) |
+| `remote_eval.py` | 在开发机上跑:把一段 JS 通过 ssh 送进设备执行,免去三层引号;缺 `cdp_eval.py` 会自动上传 |
+| `install_deck_key.py` | 用密码登录一次设备,把公钥装进 `authorized_keys`(新机器第一步);`--probe` / `--run` 也能用 |
 | `probe_*.js` | 手动排查用的零散探针(几何/焦点/滚动),按需 `cdp_eval.py` 加载 |
 | `deploy_from_windows.{sh,ps1,bat}` | Windows → Deck 的部署入口 |
 

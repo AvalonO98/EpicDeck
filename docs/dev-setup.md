@@ -76,8 +76,13 @@ pnpm package                  # 产出 EpicDeck-v<版本>.zip（约 282 KB）
 
 ```bash
 pip install paramiko
-python .tools/dssh.py          # 用设备密码把公钥装进 authorized_keys（密码默认 steamdeck）
+python scripts/install_deck_key.py        # 生成密钥（若没有）并用密码装进 authorized_keys
+python scripts/install_deck_key.py --probe   # 只看 hostname / 系统 / IP
 ```
+
+密码走 `DECK_PASSWORD` 环境变量或 `--password`，不传就依次试 SteamOS 的两个已知默认值。
+设备地址默认 `steamdeck.local`（mDNS 时灵时不灵），可以 `--host 192.168.x.x` 或
+`DECK_HOST=…` 指定。
 
 之后：
 
@@ -110,8 +115,17 @@ Deck 上 Steam 自带 CEF 调试端口，`scripts/cdp_*.py` 就是通过它读 D
 这些脚本要在**设备上**跑：
 
 ```bash
+# 开发机上：把 JS 送进设备执行（会自动上传 cdp_eval.py）
+python scripts/remote_eval.py probe.js
+echo 'document.title' | python scripts/remote_eval.py -
+```
+
+`DECK_HOST` / `DECK_USER` / `DECK_KEY` 可覆盖默认的 `steamdeck.local` / `deck` /
+`~/.ssh/epicdeck_steamdeck`。其余 `cdp_*.py` 需要拷到设备上跑：
+
+```bash
 scp -i ~/.ssh/epicdeck_steamdeck scripts/cdp_*.py deck@<设备IP>:/tmp/
-ssh -i ~/.ssh/epicdeck_steamdeck deck@<设备IP> 'cd /tmp && python3 cdp_eval.py "document.title"'
+ssh -i ~/.ssh/epicdeck_steamdeck deck@<设备IP> 'cd /tmp && python3 cdp_key.py down 1'
 ```
 
 完整用法见 [CONTRIBUTING](../CONTRIBUTING.md) 的「实机调试」一节。三条必须记住的：
@@ -120,7 +134,8 @@ ssh -i ~/.ssh/epicdeck_steamdeck deck@<设备IP> 'cd /tmp && python3 cdp_eval.py
 2. **不要用 JS `.focus()` 造状态** —— DOM 焦点到了、Steam 的 `gpfocus` 没动，后续按键会被
    路由到旧节点。验收要用真实点击（`Input.dispatchMouseEvent`）或真实按键。
 3. **先查屏保** —— 屏保亮着时 CDP 注入的按键完全无效，现象和"导航坏了"一模一样。
-   用 `XTestFakeKeyEvent` 发一个 Shift 唤醒（`/tmp/xwake.py`，`ctypes` 调 libXtst）。
+   先看 `Screensaver_uid2` 页面的 `document.body.innerText`（有钟点就是还亮着），
+   再用 `scripts/cdp_wake.py` 唤醒（`XTestFakeKeyEvent` 发一个 Shift）。
 
 ---
 
