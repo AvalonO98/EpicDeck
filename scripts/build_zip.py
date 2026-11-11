@@ -34,12 +34,24 @@ def read_version() -> str:
 
 
 def run_build() -> None:
-    print("[1/4] 构建前端 (pnpm build)...")
-    if sys.platform == "win32":
-        cmd = ["pnpm.cmd", "build"]
+    """Build the bundle with whatever is actually installed here.
+
+    `pnpm build` is just `rollup -c`, but the old code shelled out to `pnpm`
+    unconditionally: on a machine without a global pnpm that is a bare
+    `FileNotFoundError: [WinError 2]` in the middle of packaging (hit while
+    cutting 0.9.5-beta.13). Prefer the rollup that `node_modules` already has —
+    the same entry `regression.py` uses — and only fall back to pnpm when the
+    dependency tree is not installed at all (CI does `pnpm install` first).
+    """
+    print("[1/4] 构建前端…")
+    rollup = os.path.join(ROOT, "node_modules", "rollup", "dist", "bin", "rollup")
+    if os.path.isfile(rollup):
+        cmd, shell = ["node", rollup, "-c"], False
+    elif sys.platform == "win32":
+        cmd, shell = "pnpm.cmd build", True
     else:
-        cmd = ["pnpm", "build"]
-    r = subprocess.run(cmd, cwd=ROOT)
+        cmd, shell = ["pnpm", "build"], False
+    r = subprocess.run(cmd, cwd=ROOT, shell=shell)
     if r.returncode != 0:
         sys.exit("构建失败,已中止打包")
 
