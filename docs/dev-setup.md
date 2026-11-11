@@ -53,6 +53,49 @@ pnpm install --frozen-lockfile --registry=https://registry.npmmirror.com
 
 ---
 
+### GitHub 22 端口被网络封掉时
+
+有的网络（部分公司网、校园网、某些家宽）会封 22 端口，现象是：
+
+```bash
+ssh -T git@github.com
+# ssh: connect to host github.com port 22: Connection refused
+```
+
+这不是密钥的问题。GitHub 官方支持把 SSH 走到 443，改 `~/.ssh/config` 即可：
+
+```sshconfig
+Host github.com
+  HostName ssh.github.com
+  Port 443
+  User git
+  IdentityFile ~/.ssh/id_ed25519_epicdeck
+  IdentitiesOnly yes
+```
+
+首次连接时核对主机指纹（GitHub 官方公布的是
+`SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`，ED25519）：
+
+```bash
+ssh-keyscan -p 443 -t ed25519 ssh.github.com >> ~/.ssh/known_hosts
+ssh-keygen -lf ~/.ssh/known_hosts | grep ssh.github.com
+```
+
+认证成功的标志：`Hi <owner>/<repo>! You've successfully authenticated` ——
+如果显示的是 `<owner>/<repo>` 而不是用户名，说明用的是**仓库级 deploy key**（需要勾选
+"Allow write access" 才能 push；也只能用于这一个仓库）。
+
+### 部署密钥（Deploy key）与账号密钥的区别
+
+| | 账号密钥（Authentication key） | Deploy key（仓库级） |
+|---|---|---|
+| 作用范围 | 账号下所有仓库 | 只有那一个仓库 |
+| 能否 push | 能 | 勾了 "Allow write access" 才能 |
+| 能否建 Release / 调 API | 能（配合 token） | **不能**，Release 需要在网页上建 |
+| 适用场景 | 个人开发机 | CI、单仓库只读/写入 |
+
+---
+
 ## 3. 验证环境是否真的可用
 
 ```bash
