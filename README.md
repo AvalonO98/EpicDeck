@@ -113,4 +113,4 @@ callable 与事件以 `main.py` 顶部和 `src/api.ts` 为准，不在文档里�
 
 “Epic”“Steam”“Steam Deck” 为各自权利人商标；本项目与上述公司无隶属关系。使用第三方客户端访问 Epic 服务可能违反其服务条款，请自行评估风险。
 
-相关文档：[CHANGELOG](./CHANGELOG.md) · [CONTRIBUTING](./CONTRIBUTING.md) · [SECURITY](./SECURITY.md) · [NOTICE](./NOTICE)
+相关文档：[CHANGELOG](./CHANGELOG.md) · [CONTRIBUTING](./CONTRIBUTING.md) · [开发环境搭建](./docs/dev-setup.md) · [SECURITY](./SECURITY.md) · [NOTICE](./NOTICE)

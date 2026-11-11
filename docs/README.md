@@ -1,6 +1,8 @@
 # docs
 
-历史审计与计划归档。**结论以 [CHANGELOG](../CHANGELOG.md) 为准**，这里的报告只记录当时的发现。
+开发文档与历史归档。**结论以 [CHANGELOG](../CHANGELOG.md) 为准**，审计报告只记录当时的发现。
+
+- [dev-setup.md](./dev-setup.md)：新电脑从零搭环境（Node/pnpm/Python、验证命令、部署、实机调试、检查清单）
 
 | 文件 | 时间 | 说明 |
 |---|---|---|
