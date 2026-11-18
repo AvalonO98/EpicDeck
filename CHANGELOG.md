@@ -202,6 +202,31 @@
   `__epicdeckNavLog`（每次按键结果，失败时附 `describeRows()` 行模型快照）、
   `__epicdeckFocusLog`（焦点争夺）。以后遇到"某个方向没反应"，先看第一份有没有那条记录。
 
+### 结构拆分（2026-11-18，第三轮审计 D8 / 3.8）
+
+`fullscreen.tsx` 从 **3513 行** 拆到现在的样子（每个模块只搬不改逻辑）：
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `shell/FullScreenPage.tsx` | 1119 | 路由参数、顶栏/Tab、方向键与按钮分发、焦点兜底、L1/R1 落焦、调试钩子、五个页面装配 |
+| `pages/Settings.tsx` | 892 | 账号卡、目录与语言、下载开关、Steam 集成、维护动作 |
+| `pages/Detail.tsx` | 705 | 详情页 + `shortcutGameId`（唯一调用方） |
+| `pages/Library.tsx` | 464 | 筛选/搜索/排序/翻页 + 封面网格 |
+| `pages/Downloads.tsx` | 170 | 下载任务列表与暂停/继续/取消 |
+| `pages/Setup.tsx` | 121 | 首次运行选目录 |
+| `ui/primitives.tsx` | 96 | Pager / SectionTitle / Group |
+| `shell/fsui.ts` | 54 | 跨卸载保留的 tab/filter/sort/page 状态 |
+| `ui/confirm.tsx` | 36 | 确认弹窗（四处破坏性操作共用） |
+| `shell/version.ts` | 12 | 构建期注入的版本号 |
+
+顺带：
+- `TAB_IDS` 成为 tab id 的唯一来源，外壳用 `Record<TabId, …>` 建 TABS，漏写一个标签就是类型错误。
+- 封面仍然各自订阅 `progress[app_name]`（审计 3.5 的选择器方案），memo 的比较函数与
+  `onOpen` 的稳定包装随页面一起搬走。
+- 删掉两处没人读的配置默认值（`refresh_token_managed`、`auto_protondb`）。
+
+验证：`tsc --noEmit` 无输出、rollup 无循环依赖警告、`regression.py` 10/10。
+
 ### 第三轮审计第二批（2026-11-11，0.9.5-beta.13）
 
 **代码质量**

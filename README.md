@@ -77,7 +77,7 @@ QAM / 大屏页 ──callable──▶ main.py ──子进程──▶ legenda
 Steam ──▶ launchers/<app>.sh ──legendary launch --wine──▶ proton/<app>.sh ──▶ Proton ──▶ 游戏
 ```
 
-- **前端** `src/`：`fullscreen.tsx` 大屏页、`qam.tsx` 面板、`store.ts` 状态与缓存、`api.ts` callable 封装、`geomnav.ts` 方向键导航、`i18n.ts` 多语言词条。
+- **前端** `src/`：`shell/FullScreenPage.tsx` 大屏外壳（顶栏/方向键/焦点兜底）、`pages/*.tsx` 五个子页面（库/详情/下载/设置/首次运行）、`ui/` 共享控件与确认框、`qam.tsx` 侧栏面板、`store.ts` 状态与缓存、`api.ts` callable 封装、`geomnav.ts` 方向键导航、`i18n.ts` 多语言词条。
 - **后端** `main.py` + `py_modules/`：`legendary.py` CLI 封装、`steam.py` 快捷方式、`proton.py` Proton 包装、`artwork.py` 封面、`title_sources.py` 中文名、`protondb.py` 兼容性评级、`update_check.py` 版本检查、`epic_api.py` 时长与元数据、`legendary_installer.py` 二进制安装、`launchshim.py` 两阶段启动（让 Steam 正确计时）。
 
 callable 与事件以 `main.py` 顶部和 `src/api.ts` 为准，不在文档里重复罗列。

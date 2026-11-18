@@ -418,7 +418,7 @@ export function moveFocus(
 
   // `remembered` is the single source of truth: it is seeded when the page opens
   // (返回), updated after every move, and re-synced on any real DOM focus change
-  // (see the focusin listener in fullscreen.tsx). Anything else is unreliable —
+  // (see the focusin listener in shell/FullScreenPage.tsx). Anything else is unreliable —
   // Steam's virtual focus can differ from DOM focus, and `gpfocus` marks linger
   // on elements that were focused earlier — which is how "down" used to start
   // from the wrong element and land on the far right of the toolbar.
