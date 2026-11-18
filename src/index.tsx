@@ -6,14 +6,15 @@
 //
 // Everything user-facing lives in two places:
 //   src/qam.tsx         – the Quick Access panel (launcher + live status)
-//   src/fullscreen.tsx  – the full-screen library/settings route
+//   src/shell/FullScreenPage.tsx – the full-screen route shell
+//   src/pages/*.tsx              – library / detail / downloads / settings / setup
 // Both read from src/store.ts, so state survives jumping between them.
 
 import { definePlugin, routerHook } from "@decky/api";
 import { ScrollPanel, ScrollPanelGroup, staticClasses } from "@decky/ui";
 import { FaGamepad } from "react-icons/fa";
 import { FocusStyles } from "./components";
-import { FullScreenPage, openFullScreen } from "./fullscreen";
+import { FullScreenPage, openFullScreen } from "./shell/FullScreenPage";
 import { QamPanel } from "./qam";
 import { LIBRARY_ROUTE } from "./routes";
 import { moveFocus } from "./geomnav";

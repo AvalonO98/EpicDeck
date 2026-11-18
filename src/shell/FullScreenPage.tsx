@@ -35,14 +35,14 @@ import {
 import {
   installLegendary,
   isActive,
-} from "./api";
+} from "../api";
 import {
   ActionButton,
   ErrorBlock,
   NavRow,
   Scroller,
   WarningBanner,
-} from "./components";
+} from "../components";
 import {
   canFocus,
   claimFocusRing,
@@ -59,8 +59,8 @@ import {
   rememberFocus,
   reverifyFocus,
   settleFocus,
-} from "./geomnav";
-import { LoginPanel } from "./login";
+} from "../geomnav";
+import { LoginPanel } from "../login";
 import {
   ensureBoot,
   type PluginState,
@@ -70,17 +70,17 @@ import {
   refreshLibrary,
   shallowEqual,
   usePluginSelector,
-} from "./store";
-import { STEAM_BOTTOM_INSET, STEAM_TOP_INSET, useViewport } from "./viewport";
-import { LIBRARY_ROUTE } from "./routes";
-import { readFsUI, TAB_IDS, writeFsUI, type TabId } from "./shell/fsui";
-import { COLOR } from "./tokens";
-import { DownloadsTab } from "./pages/Downloads";
-import { DetailView } from "./pages/Detail";
-import { LibraryTab } from "./pages/Library";
-import { SettingsTab } from "./pages/Settings";
-import { SetupScreen } from "./pages/Setup";
-import { t, tf, useLangVersion } from "./i18n";
+} from "../store";
+import { STEAM_BOTTOM_INSET, STEAM_TOP_INSET, useViewport } from "../viewport";
+import { LIBRARY_ROUTE } from "../routes";
+import { readFsUI, TAB_IDS, writeFsUI, type TabId } from "./fsui";
+import { COLOR } from "../tokens";
+import { DownloadsTab } from "../pages/Downloads";
+import { DetailView } from "../pages/Detail";
+import { LibraryTab } from "../pages/Library";
+import { SettingsTab } from "../pages/Settings";
+import { SetupScreen } from "../pages/Setup";
+import { t, tf, useLangVersion } from "../i18n";
 
 export { LIBRARY_ROUTE };
 

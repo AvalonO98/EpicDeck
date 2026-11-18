@@ -33,7 +33,7 @@ import {
   switchAccount,
   usePluginState,
 } from "./store";
-import { openFullScreen } from "./fullscreen";
+import { openFullScreen } from "./shell/FullScreenPage";
 import { t, tf, useLangVersion } from "./i18n";
 
 /** Legendary missing: SteamOS has no pip, so the plugin downloads the binary. */
