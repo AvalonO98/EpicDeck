@@ -53,16 +53,47 @@ pnpm install --frozen-lockfile --registry=https://registry.npmmirror.com
 
 ---
 
-### GitHub 22 端口被网络封掉时
+## 3. GitHub 推送配置
 
-有的网络（部分公司网、校园网、某些家宽）会封 22 端口，现象是：
+一次性配好，之后 `git push` 就是一条命令。四条东西：**密钥、公钥、`~/.ssh/config`、remote**。
+
+### 3.1 生成密钥（每台机器一把）
+
+```bash
+ssh-keygen -t ed25519 -N "" -C "epicdeck@$(hostname)" -f ~/.ssh/id_ed25519_epicdeck
+```
+
+不要复用其他项目的密钥：一把钥匙对应一台机器，泄露了只吊销一把。
+
+### 3.2 把公钥加到 GitHub
+
+```bash
+cat ~/.ssh/id_ed25519_epicdeck.pub
+```
+
+两种加法，能力不同——**按用途选，别默认选第一种**：
+
+| | 账号密钥（Settings → SSH and GPG keys） | 仓库级 Deploy key（Repo → Settings → Deploy keys） |
+|---|---|---|
+| 作用范围 | 账号下所有仓库 | 只有那一个仓库 |
+| 能否 push | 能 | **必须勾 "Allow write access"**，否则只能拉 |
+| 能否建 Release / 调 API | 能（另配 token） | **不能**，Release 只能在网页建 |
+| 适合 | 个人开发机 | CI、单仓库只读或写入 |
+
+判定方式：`ssh -T git@github.com` 回 `Hi <用户名>!` 是账号密钥，
+回 `Hi <owner>/<repo>!` 是 deploy key。
+
+### 3.3 `~/.ssh/config`（必需，22 端口经常被封）
+
+很多网络（公司网、校园网、部分家宽）直接封 `github.com:22`，现象是：
 
 ```bash
 ssh -T git@github.com
 # ssh: connect to host github.com port 22: Connection refused
 ```
 
-这不是密钥的问题。GitHub 官方支持把 SSH 走到 443，改 `~/.ssh/config` 即可：
+**这是端口不通，不是密钥错误**（密钥错是 `Permission denied (publickey)`）。
+GitHub 官方支持 SSH over 443：
 
 ```sshconfig
 Host github.com
@@ -73,30 +104,78 @@ Host github.com
   IdentitiesOnly yes
 ```
 
-首次连接时核对主机指纹（GitHub 官方公布的是
+`IdentitiesOnly yes` 很重要：不加的话 ssh 会把 agent 里所有钥匙挨个献给服务器，
+很容易撞上 "Too many authentication failures"。
+
+首次连接要核对主机指纹（GitHub 公布的是
 `SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`，ED25519）：
 
 ```bash
 ssh-keyscan -p 443 -t ed25519 ssh.github.com >> ~/.ssh/known_hosts
-ssh-keygen -lf ~/.ssh/known_hosts | grep ssh.github.com
+ssh-keygen -lf ~/.ssh/known_hosts | grep ssh.github.com     # 对上再继续
 ```
 
-认证成功的标志：`Hi <owner>/<repo>! You've successfully authenticated` ——
-如果显示的是 `<owner>/<repo>` 而不是用户名，说明用的是**仓库级 deploy key**（需要勾选
-"Allow write access" 才能 push；也只能用于这一个仓库）。
+### 3.4 验证
 
-### 部署密钥（Deploy key）与账号密钥的区别
+```bash
+ssh -T git@github.com
+# 期望：Hi <用户名>! You've successfully authenticated, but GitHub does not provide shell access.
+```
 
-| | 账号密钥（Authentication key） | Deploy key（仓库级） |
+看到 `Hi ...` 就通了（这条命令返回码是 1，属正常，别当失败）。
+
+### 3.5 绑定远端与提交身份
+
+```bash
+git remote add origin git@github.com:<owner>/<repo>.git
+git fetch origin main
+git branch --set-upstream-to=origin/main main    # 之后 git status 会显示领先/落后几个提交
+
+git config --global user.name  "<GitHub 用户名>"
+git config --global user.email "<GitHub 用户名>@users.noreply.github.com"
+```
+
+`user.email` 用 GitHub 提供的 noreply 地址，提交里就不会泄露真实邮箱。
+本仓库另外建议：
+
+```bash
+git config core.autocrlf false
+git config core.quotepath false      # 中文文件名不显示成 \344\277\256
+```
+
+### 3.6 日常推送
+
+```bash
+git status                      # 先看改了什么
+git add -A
+git commit -F msg.txt           # 多行信息写文件，避免 shell 把反引号/尖括号吃掉
+git push                        # 已设 upstream，不用再写 origin main
+```
+
+打版本标签并推送：
+
+```bash
+git tag -a v0.9.5 -m "EpicDeck 0.9.5"
+git push origin v0.9.5
+```
+
+> 提交信息里有反引号、`<TabId>` 这类字符时**一定用 `-F 文件`**。直接用
+> `git commit -m "…"` 会被 bash 当成命令替换，把信息改得面目全非（本项目踩过）。
+
+### 3.7 报错对照
+
+| 现象 | 含义 | 处理 |
 |---|---|---|
-| 作用范围 | 账号下所有仓库 | 只有那一个仓库 |
-| 能否 push | 能 | 勾了 "Allow write access" 才能 |
-| 能否建 Release / 调 API | 能（配合 token） | **不能**，Release 需要在网页上建 |
-| 适用场景 | 个人开发机 | CI、单仓库只读/写入 |
+| `Connection refused`（22 端口） | 网络封了端口 | 改用 3.3 的 443 配置 |
+| `Permission denied (publickey)` | 端口通，但公钥没被接受 | 公钥没加到 GitHub / `IdentityFile` 指错 / 用了别的 key |
+| `Host key verification failed` | 没记录过这个主机 | `ssh-keyscan` 写入 `known_hosts`，或先手动连一次确认指纹 |
+| `Repository not found` | 认证过了但没权限 | deploy key 没勾 write access，或仓库名写错 |
+| `Updates were rejected` | 远端有你没有的提交 | 先 `git pull --rebase`，别直接 `--force` |
+| `fatal: not a git repository` | 当前目录不是仓库根 | `cd` 到仓库根，或 `git init` |
 
 ---
 
-## 3. 验证环境是否真的可用
+## 4. 验证环境是否真的可用
 
 ```bash
 pnpm test                     # = python3 scripts/regression.py，期望 10/10
@@ -113,7 +192,7 @@ pnpm package                  # 产出 EpicDeck-v<版本>.zip（约 282 KB）
 
 ---
 
-## 4. 部署到 Steam Deck（可选）
+## 5. 部署到 Steam Deck（可选）
 
 需要在 `~/.ssh/` 下有一把已装进设备 `authorized_keys` 的私钥。没有的话：
 
@@ -152,7 +231,7 @@ ssh -i ~/.ssh/epicdeck_steamdeck deck@<设备IP> 'cd /tmp && python3 cdp_reload.
 
 ---
 
-## 5. 实机调试（CDP）
+## 6. 实机调试（CDP）
 
 Deck 上 Steam 自带 CEF 调试端口，`scripts/cdp_*.py` 就是通过它读 DOM、发按键、截图。
 这些脚本要在**设备上**跑：
@@ -182,7 +261,7 @@ ssh -i ~/.ssh/epicdeck_steamdeck deck@<设备IP> 'cd /tmp && python3 cdp_key.py 
 
 ---
 
-## 6. 新机器检查清单
+## 7. 新机器检查清单
 
 - [ ] `node -v` → v22.x
 - [ ] `pnpm -v` → 9.15.9（或 9.x）
@@ -198,7 +277,7 @@ ssh -i ~/.ssh/epicdeck_steamdeck deck@<设备IP> 'cd /tmp && python3 cdp_key.py 
 
 ---
 
-## 7. 这个仓库的特殊约定
+## 8. 这个仓库的特殊约定
 
 - **行尾**：`.gitattributes` 强制源码 LF。Windows 上若用 CRLF，`scripts/deploy.sh`
   到 Deck 上会报 `pipefail: invalid option name`。
