@@ -4087,7 +4087,7 @@ class Plugin:
             "install_dir", "first_run_done", "legendary_path", "auto_add_to_steam",
             "title_locale", "auto_fetch_size", "third_party_titles", "use_proton",
             "proton_path", "auto_cover", "max_workers", "preferred_cdn", "no_https",
-            "lsfg_default", "ui_language", "protondb_scheme", "auto_protondb",
+            "lsfg_default", "ui_language", "protondb_scheme",
         )
         add("[插件配置 (仅排障相关项)]")
         data = self.config._data if isinstance(self.config._data, dict) else {}

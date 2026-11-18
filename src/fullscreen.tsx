@@ -32,13 +32,10 @@ import {
   useMemo,
   useRef,
   useState,
-  type CSSProperties,
   type ReactNode,
 } from "react";
 import {
   FaArrowLeft,
-  FaChevronLeft,
-  FaChevronRight,
   FaClock,
   FaCog,
   FaDownload,
@@ -55,7 +52,6 @@ import {
   LOCALE_LABELS,
   LOCALE_OPTIONS,
   SORT_OPTIONS,
-  STATE_LABEL,
   checkEnvironment,
   checkUpdate,
   clearDownloadCache,
@@ -83,7 +79,6 @@ import {
   setSetting,
   syncCloudSaves,
   syncInstalledToSteam,
-  completeFirstRun,
   getInstallDirOptions,
   type DataLocation,
   type Game,
@@ -126,7 +121,6 @@ import {
   markFirstRunDone,
   onSignedIn,
   recheckEnv,
-  reloadDirs,
   refreshLibrary,
   signOut,
   shallowEqual,
@@ -136,13 +130,15 @@ import {
 } from "./store";
 import { STEAM_BOTTOM_INSET, STEAM_TOP_INSET, useViewport, type Viewport } from "./viewport";
 import { LIBRARY_ROUTE, PAGE_SIZE } from "./routes";
+import { readFsUI, TAB_IDS, writeFsUI, type TabId } from "./shell/fsui";
 import { COLOR } from "./tokens";
+import { DownloadsTab } from "./pages/Downloads";
+import { SetupScreen } from "./pages/Setup";
+import { Group, Pager, SectionTitle } from "./ui/primitives";
 import { getLang, t, tf, useLangVersion } from "./i18n";
 import { bootstrapLang } from "./langboot";
 
 export { LIBRARY_ROUTE };
-
-type TabId = "library" | "downloads" | "settings";
 
 // Replaced with the real number at build time (see rollup.config.js), so the
 // settings footer can never drift from package.json again.
@@ -178,11 +174,13 @@ async function waitForShortcutGameId(appid: number): Promise<string> {
 // Labels stay in the source language: this array is built at import time, long
 // before the backend tells us which language to use, so `t()` here would freeze
 // the tabs. Translate at render instead (`.label` is a t() key).
-const TABS: { id: TabId; label: string; icon: ReactNode }[] = [
-  { id: "library", label: "游戏库", icon: <FaThLarge /> },
-  { id: "downloads", label: "下载", icon: <FaDownload /> },
-  { id: "settings", label: "设置", icon: <FaCog /> },
-];
+const TAB_META: Record<TabId, { label: string; icon: ReactNode }> = {
+  library: { label: "游戏库", icon: <FaThLarge /> },
+  downloads: { label: "下载", icon: <FaDownload /> },
+  settings: { label: "设置", icon: <FaCog /> },
+};
+// `Record<TabId, …>` 保证漏写一个标签就是类型错误；顺序由 TAB_IDS 决定。
+const TABS = TAB_IDS.map((id) => ({ id, ...TAB_META[id] }));
 
 /**
  * Which interaction level currently has focus — read off the nearest ancestor
@@ -197,116 +195,6 @@ function focusLevel(evt?: any): string {
   } catch {
     return "";
   }
-}
-
-// Filter / sort / page survive a trip back to the QAM: the route page unmounts
-// on NavigateBack, and re-picking "已安装" every time gets old fast.
-const FS_UI_KEY = "__epicdeckFullScreenUI";
-
-interface FsUIState {
-  tab: TabId;
-  filter: InstallFilter;
-  sort: SortMode;
-  query: string;
-  page: number;
-  settingsSection?: string;
-}
-
-function readFsUI(): FsUIState {
-  const saved = (window as any)[FS_UI_KEY] ?? {};
-  return {
-    tab: TABS.some((item) => item.id === saved.tab) ? saved.tab : "library",
-    filter: INSTALL_FILTER_ORDER.includes(saved.filter) ? saved.filter : "all",
-    sort: SORT_OPTIONS.some((o) => o.data === saved.sort) ? saved.sort : "alpha",
-    query: typeof saved.query === "string" ? saved.query : "",
-    page: typeof saved.page === "number" && saved.page >= 1 ? saved.page : 1,
-    settingsSection: typeof saved.settingsSection === "string" ? saved.settingsSection : "",
-  };
-}
-
-function writeFsUI(patch: Partial<FsUIState>) {
-  (window as any)[FS_UI_KEY] = { ...readFsUI(), ...patch };
-}
-
-// -- shared bits --------------------------------------------------------
-
-function Pager({
-  page,
-  pageCount,
-  onPrev,
-  onNext,
-}: {
-  page: number;
-  pageCount: number;
-  onPrev: () => void;
-  onNext: () => void;
-}) {
-  const btn: CSSProperties = {
-    padding: "5px 10px",
-    borderRadius: "8px",
-    background: "rgba(255,255,255,0.07)",
-    border: "1px solid rgba(255,255,255,0.1)",
-    fontSize: "0.85em",
-    display: "flex",
-    alignItems: "center",
-    flexShrink: 0,
-  };
-  const dim = (disabled: boolean): CSSProperties => (disabled ? { opacity: 0.3 } : {});
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
-      {/* 到头了就不该能被聚焦：以前只是变淡，光标会停在"按了没反应"的死键上（审计 1.6）。 */}
-      <Focusable
-        className="ed-pager"
-        noFocusRing
-        tabIndex={page <= 1 ? -1 : 0}
-        aria-disabled={page <= 1 ? "true" : undefined}
-        style={{ ...btn, ...dim(page <= 1) }}
-        onClick={page <= 1 ? undefined : onPrev}
-        onActivate={page <= 1 ? undefined : onPrev}
-      >
-        <FaChevronLeft />
-      </Focusable>
-      <div
-        style={{
-          fontSize: "0.85em",
-          opacity: 0.8,
-          whiteSpace: "nowrap",
-          minWidth: "56px",
-          textAlign: "center",
-        }}
-      >
-        {page} / {pageCount}
-      </div>
-      <Focusable
-        className="ed-pager"
-        noFocusRing
-        tabIndex={page >= pageCount ? -1 : 0}
-        aria-disabled={page >= pageCount ? "true" : undefined}
-        style={{ ...btn, ...dim(page >= pageCount) }}
-        onClick={page >= pageCount ? undefined : onNext}
-        onActivate={page >= pageCount ? undefined : onNext}
-      >
-        <FaChevronRight />
-      </Focusable>
-    </div>
-  );
-}
-
-function SectionTitle({ children, hint }: { children: ReactNode; hint?: string }) {
-  return (
-    <div style={{ display: "flex", alignItems: "baseline", gap: "10px", margin: "0 0 10px 2px" }}>
-      <div style={{ fontSize: "1.02em", fontWeight: 700, letterSpacing: "0.01em" }}>{children}</div>
-      {hint ? <div style={{ fontSize: "0.8em", opacity: 0.5 }}>{hint}</div> : null}
-    </div>
-  );
-}
-
-function Group({ children, style }: { children: ReactNode; style?: CSSProperties }) {
-  return (
-    <div className="ed-group" style={{ padding: "16px 18px", ...style }}>
-      {children}
-    </div>
-  );
 }
 
 // -- library ------------------------------------------------------------
@@ -1401,161 +1289,6 @@ function DetailBody({
   );
 }
 
-// -- downloads ----------------------------------------------------------
-
-function DownloadsTab({ onOpenGame, onOpenSettings }: { onOpenGame: (appName: string) => void; onOpenSettings: () => void }) {
-  const { games, progress } = usePluginState();
-  const items = useMemo(() => {
-    return Object.entries(progress)
-      .filter(([, p]) => isActive(p) || p.state === "error" || p.state === "cancelled" || p.state === "paused")
-      .sort((a, b) => {
-        const aActive = isActive(a[1]) ? 1 : 0;
-        const bActive = isActive(b[1]) ? 1 : 0;
-        if (aActive !== bActive) return bActive - aActive;
-        return (b[1].state === "paused" ? 1 : 0) - (a[1].state === "paused" ? 1 : 0);
-      });
-  }, [progress]);
-
-  // `title` comes from the backend (it holds the library cache), so the list
-  // still names the game when our own payload has not landed yet — e.g. when a
-  // download is inherited right after a plugin reload.
-  const titleOf = (appName: string) =>
-    progress[appName]?.title ||
-    games.find((g) => g.app_name === appName)?.title ||
-    appName.slice(0, 12);
-
-  if (items.length === 0) {
-    return (
-      // 空态卡片以前贴在上半屏，下面 ~230px 全是空的；这里让它占满内容区并居中（审计 V13）。
-      <div
-        style={{
-          flex: 1,
-          minHeight: 0,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: "0 0 2em",
-        }}
-      >
-      <div
-        className="ed-group"
-        style={{ padding: "46px 24px", textAlign: "center", opacity: 0.65, lineHeight: 1.8, maxWidth: "640px" }}
-      >
-        <div style={{ fontSize: "2em", marginBottom: "10px", opacity: 0.5 }}>
-          <FaDownload />
-        </div>
-        <div>{t('当前没有下载任务。')}</div>
-        <div style={{ fontSize: "0.85em", opacity: 0.75, marginTop: "4px" }}>
-          {t('在游戏库里选一个没安装的游戏，点「下载并安装」。')}
-        </div>
-        <ActionButton
-          style={{
-            padding: "8px 16px",
-            fontSize: "0.85em",
-            marginTop: "14px",
-            width: "fit-content",
-            // 父级是 text-align:center 的普通 div，alignSelf 不生效，得靠 auto margin 居中。
-            marginLeft: "auto",
-            marginRight: "auto",
-          }}
-          onClick={onOpenSettings}
-        >
-          {t('下载设置（并发 / CDN / 清理缓存）')}
-        </ActionButton>
-      </div>
-      </div>
-    );
-  }
-
-  return (
-    <Scroller className="ed-fade" contentStyle={{ paddingRight: "6px", paddingBottom: "1.4em" }}>
-      <div style={{ display: "flex", flexDirection: "column", gap: "10px", maxWidth: "980px", paddingBottom: "1.4em" }}>
-        <div style={{ display: "flex", justifyContent: "flex-end" }}>
-          <ActionButton
-            style={{ padding: "6px 14px", fontSize: "0.82em", opacity: 0.85 }}
-            onClick={onOpenSettings}
-          >
-            {t('下载设置')}
-          </ActionButton>
-        </div>
-        {items.map(([appName, p]) => {
-          const game = games.find((g) => g.app_name === appName);
-          const running = isActive(p);
-          const paused = p.state === "paused";
-          const tone =
-            p.state === "error"
-              ? COLOR.dangerSoft
-              : p.state === "cancelled"
-                ? "#c9c9c9"
-                : p.state === "paused"
-                  ? COLOR.warning
-                  : COLOR.accentSoft;
-          return (
-            <div
-              key={appName}
-              className="ed-group"
-              style={{ padding: "14px 16px", display: "flex", gap: "14px", alignItems: "center" }}
-            >
-              <Cover url={game?.cover_url ?? ""} title={titleOf(appName)} width={44} height={62} />
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ display: "flex", alignItems: "baseline", gap: "10px" }}>
-                  <div style={{ fontWeight: 600, fontSize: "0.98em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {titleOf(appName)}
-                  </div>
-                  <div style={{ fontSize: "0.8em", color: tone }}>{t(STATE_LABEL[p.state] ?? "") || p.state}</div>
-                </div>
-                <ProgressInline progress={p} compact />
-              </div>
-              <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
-                {running ? (
-                  <>
-                    <ActionButton
-                      style={{ padding: "8px 14px", fontSize: "0.85em" }}
-                      onClick={() => void actions.pause(appName)}
-                    >
-                      {t('暂停')}
-                    </ActionButton>
-                    <ActionButton
-                      danger
-                      style={{ padding: "8px 14px", fontSize: "0.85em" }}
-                      onClick={() => void actions.cancel(appName)}
-                    >
-                      {t('取消')}
-                    </ActionButton>
-                  </>
-                ) : paused ? (
-                  <>
-                    <ActionButton
-                      style={{ padding: "8px 14px", fontSize: "0.85em" }}
-                      onClick={() => void actions.resume(appName)}
-                    >
-                      {t('继续')}
-                    </ActionButton>
-                    <ActionButton
-                      danger
-                      style={{ padding: "8px 14px", fontSize: "0.85em" }}
-                      onClick={() => void actions.cancel(appName)}
-                    >
-                      {t('取消')}
-                    </ActionButton>
-                  </>
-                ) : (
-                  <ActionButton
-                    style={{ padding: "8px 14px", fontSize: "0.85em" }}
-                    onClick={() => onOpenGame(appName)}
-                  >
-                    {t('查看')}
-                  </ActionButton>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </Scroller>
-  );
-}
-
 // -- settings & account -------------------------------------------------
 
 /**
@@ -2400,109 +2133,6 @@ function SettingsTab({ onGoLogin }: { onGoLogin: () => void }) {
 }
 
 // -- setup / dependency screens ----------------------------------------
-
-function SetupScreen({ onDone }: { onDone: () => void }) {
-  const { dirs } = usePluginState();
-  const [choice, setChoice] = useState<string>("");
-  const [custom, setCustom] = useState<string>("");
-  const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState("");
-
-  useEffect(() => {
-    if (!choice && dirs.length) setChoice(dirs[0].path);
-  }, [dirs, choice]);
-
-  const finish = async (path: string) => {
-    if (busy) return;
-    setBusy(true);
-    setNote("");
-    try {
-      const r = await completeFirstRun(path);
-      if (!r.ok) {
-        setNote(r.error ?? t("保存失败"));
-        return;
-      }
-      toaster.toast({ title: t("下载位置已设置"), body: r.install_dir ?? path });
-      onDone();
-    } catch (e) {
-      setNote(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const confirm = async () => {
-    const typed = custom.trim();
-    if (!typed) {
-      await finish(choice);
-      return;
-    }
-    if (busy) return;
-    setBusy(true);
-    try {
-      const v = await resolveInstallDir(typed);
-      if (!v.ok || !v.path) {
-        setNote(v.error ?? t("路径无效"));
-        return;
-      }
-      await finish(v.path);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div style={{ display: "flex", justifyContent: "center", padding: "20px 0" }}>
-      <div style={{ width: "100%", maxWidth: "640px" }}>
-        <div className="ed-group" style={{ padding: "26px 28px" }}>
-          <div style={{ fontSize: "1.4em", fontWeight: 800, marginBottom: "8px" }}>{t('先选个下载位置')}</div>
-          <div style={{ fontSize: "0.9em", opacity: 0.65, lineHeight: 1.6, marginBottom: "18px" }}>
-            {t('Epic 游戏体积很大，先确认装在哪里。之后可以在「设置 → 目录与语言」随时改，单个游戏也能单独指定。')}
-          </div>
-          <Dropdown
-            rgOptions={dirs.map((d) => ({ data: d.path, label: d.label }))}
-            selectedOption={choice}
-            onChange={(e) => setChoice(e.data)}
-          />
-          <div style={{ marginTop: "14px" }}>
-            <TextField
-              value={custom}
-              onChange={(e: any) => setCustom(e.target.value)}
-              label={t("自定义路径（可选，例如 /run/media/deck/MySD/EpicGames）")}
-            />
-          </div>
-          {note ? (
-            <div style={{ color: "#ff8a80", fontSize: "0.85em", marginTop: "10px" }}>{note}</div>
-          ) : null}
-          <NavRow level="setup-actions" style={{ gap: "10px", marginTop: "18px" }}>
-            <ActionButton
-              primary
-              style={{ padding: "11px 22px", fontSize: "0.95em" }}
-              onClick={confirm}
-              disabled={busy}
-            >
-              <FaDownload /> {t('使用此位置并继续')}
-            </ActionButton>
-            <ActionButton
-              style={{ padding: "11px 18px", fontSize: "0.95em" }}
-              onClick={() => finish("")}
-            >
-              {t('用默认位置（~/Games）')}
-            </ActionButton>
-            <ActionButton
-              style={{ padding: "11px 18px", fontSize: "0.95em" }}
-              onClick={async () => {
-                await reloadDirs();
-              }}
-            >
-              {t('刷新磁盘')}
-            </ActionButton>
-          </NavRow>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 // -- page shell ---------------------------------------------------------
 

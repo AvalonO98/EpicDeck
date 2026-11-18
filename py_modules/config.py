@@ -31,7 +31,6 @@ DEFAULTS = {
     # it is shown exactly once per install.
     "first_run_done": False,
     "legendary_path": "legendary",
-    "refresh_token_managed": True,
     # Add to Steam right after a successful install. On by default: a game the
     # user cannot see in their library looks like a failed install.
     "auto_add_to_steam": True,
@@ -99,7 +98,6 @@ DEFAULTS = {
     # negative results are discarded instead of hiding a working badge.
     "protondb_scheme": 0,
     # Show a ProtonDB tier for installed games (HANDOFF 7.13.2).
-    "auto_protondb": True,
     # app_name -> {"appid","tier","total","ts",...}; 7-day TTL.
     "protondb": {},
     # app_name -> Steam appid, for titles the store search gets wrong (sequels,
